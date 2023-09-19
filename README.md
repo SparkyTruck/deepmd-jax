@@ -1,5 +1,4 @@
 # Deepmd-JAX
-More than just a reimplementation of [Deepmd-kit](https://github.com/deepmodeling/deepmd-kit/tree/master)! 
 
 ## Setting up environment on Perlmutter:
 ```bash
