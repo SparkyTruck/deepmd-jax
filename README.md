@@ -11,3 +11,4 @@ pip install flax optax jax-md
 # Tips for Perlmutter
 Pip install gpustat to monitor GPU usage. Use "hostname" to check which login node you're at. Use nested ssh to jump to the desired node.
 VScode terminal sometimes does not load the "module" function. Use nested ssh to your node again to obtain a login shell.
+ 
