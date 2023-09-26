@@ -9,6 +9,7 @@ pip install --upgrade "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-re
 pip install flax optax jax-md
 pip install matplotlib
 ```
+Remember to activate the conda environment before submitting slurm jobs.
 
 ## Tips for working on Perlmutter
 - ```pip install gpustat``` to monitor GPU usage. Use ```hostname``` to check which login node you're at. Use nested ssh to jump to the desired node.
