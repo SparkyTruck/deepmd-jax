@@ -18,7 +18,7 @@ class DataSystem():
             self.data[l] = np.concatenate([self.data[l][:,:,self.type==i] for i in range(len(self.type_map))], axis=-1)
         self.data['box'] = self.data['box'].reshape(-1,3,3).transpose(0,2,1)
         self.data['coord'] = np.array(shift(self.data['coord'], self.data['box']))
-        print('Loaded data from \'%s\'' % path, 'with', self.nframes, 'frames and', self.natoms, 'atoms.')
+        print('Loaded data from \'%s\'' % path, 'with', self.nframes, 'frames of', self.natoms, 'atoms.')
     
     def compute_lattice_candidate(self, rcut): # computes candidate lattice vectors within rcut
         recp_norm = jnp.linalg.norm((jnp.linalg.inv(self.data['box'])), axis=1) # (nframes, 3)
