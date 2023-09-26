@@ -14,36 +14,50 @@ class DPModel(nn.Module):
         self.params['srmean'] = [jnp.mean(i[i>1e-15]) for i in sr_BnM]
         self.params['srstd'] = [jnp.std(i[i>1e-15]) for i in sr_BnM]
         self.params['xrsrstd'] = [jnp.std(i[jnp.abs(i)>1e-15]) for i in xrsr_B3nM]
-        self.params['normalizer'] = (sr_BNM > 0).sum(2).mean() + 1
+        self.params['avgneigh'] = (sr_BNM > 0).sum(2).mean()
+        self.params['normalizer'] = self.params['avgneigh'] + 1
+        self.params['e3norm'] = 1.
 
     @nn.compact
     def __call__(self, coord_3N, box_33, static_args):
-        N = coord_3N.shape[1]
         # compute relative coordinates and s(r)
         x_3NM, r_NM = get_relative_coord(coord_3N, box_33, static_args['lattice'])
         sr_NM = sr(r_NM, static_args['rcut'])
+        (N, M), C, T = r_NM.shape, self.params['embed_widths'][-1], len(static_args['type_index'])-1
         # prepare normalized s(r)
         sr_nM = slice_type(sr_NM, static_args['type_index'], 0)
+        srbiasnorm_NM = jnp.concatenate(list(map(lambda x,y:x/y, sr_nM, self.params['srstd'])))
         srnorm_nM = list(map(lambda x,y,z:(x-y)/z, sr_nM, self.params['srmean'], self.params['srstd']))
-        srnorm_NM = jnp.concatenate(srnorm_nM, axis=0)
         srnorm_nm = [slice_type(s,static_args['ntype_index'],1) for s in srnorm_nM]
         # compute embedding net features
         embed_nmC = [[embedding_net(self.params['embed_widths'])(j[:,:,None]) for j in i] for i in srnorm_nm]
         embed_NMC = jnp.concatenate([jnp.concatenate(i, axis=1) for i in embed_nmC], axis=0)
+        # nnei_NM1, nnei = sr_NM[:,:,None]<1e-14, self.params['nneigh']
+        # embed_NMC -= (embed_NMC.sum(1)/nnei - (embed_NMC*nnei_NM1).sum(1)/nnei_NM1.sum(1)*(M/nnei - 1))[:,None]
         # compute distance matrix R = (R0, R1) of M*4 for each atom
         rsr_nM = list(map(lambda x,y:x/y, slice_type(sr_NM/r_NM,static_args['type_index'],0), self.params['xrsrstd']))
-        R_4NM = jnp.concatenate([srnorm_NM[None], x_3NM * (jnp.concatenate(rsr_nM)[None] + 1e-15)], axis=0)
+        R_4NM = jnp.concatenate([srbiasnorm_NM[None], x_3NM * (jnp.concatenate(rsr_nM)[None] + 1e-15)], axis=0)
         # compute feature matrix G = E @ R and Feat = GG^T
         G_N4C = R_4NM.transpose(1,0,2) @ embed_NMC / self.params['normalizer']
+        # G_n4C = slice_type(G_N4C, static_args['type_index'], 0)
+        # Gbias = [self.param('Gbias_%d'%i, lambda x,y: -G_n4C[i][:,0].mean(0),(C,)) for i in range(T)]
+        # Gbias = [self.param('Gbias_%d'%i, nn.initializers.normal(stddev=0.1),(C,)) for i in range(T)]
+        # G_n1C = list(map(lambda x,y:x+y, slice_type(G_N4C[:,:1], static_args['type_index'], 0), Gbias))
+        # G_N4C = jnp.concatenate([jnp.concatenate(G_n1C), G_N4C[:,1:]], axis=1)
+        # Gbias = self.param('Gbias',lambda x,y: -G_N4C[:,0].mean(0), (C,))
+        Gbias = self.param('Gbias',nn.initializers.normal(stddev=0.01),(C,))
+        G_N4C = jnp.concatenate([G_N4C[:,:1] + Gbias, self.params['e3norm'] * G_N4C[:,1:]], axis=1)
         Feat_NX = (G_N4C[:,:,:self.params['axis_neuron']].transpose(0,2,1) @ G_N4C).reshape(N,-1)
         # compute fitting net output and energy 
         fit_n1 = [fitting_net(self.params['fit_widths'])(i) for i in slice_type(Feat_NX,static_args['type_index'],0)]
         energy = sum(list(map(lambda x,y:(x+y).sum(), fit_n1, self.params['Ebias'])))
-        return energy
+        # debug info
+        debug = (r_NM, embed_nmC, R_4NM, G_N4C, Feat_NX, fit_n1)
+        return energy, debug
 
     def energy_and_force(self, variables, coord_3N, box_33, static_args):
-        v, g = value_and_grad(self.apply, argnums=1)(variables, coord_3N, box_33, static_args)
-        return v, -g
+        (energy, debug), g = value_and_grad(self.apply, argnums=1, has_aux=True)(variables, coord_3N, box_33, static_args)
+        return energy, -g
     
     def get_loss_ef_fn(self):
         vmap_energy_and_force = vmap(self.energy_and_force, (None, 0, 0, None))
@@ -51,6 +65,6 @@ class DPModel(nn.Module):
             e, f = vmap_energy_and_force(variables, batch_data['coord'], batch_data['box'], static_args)
             le = ((batch_data['energy'] - e)**2).mean()
             lf = ((batch_data['force'] - f)**2).mean()
-            return pref['e']*le + pref['f']*lf, (le, lf)
+            return pref['e']*le / f.shape[2] + pref['f']*lf, (le, lf)
         loss_ef_and_grad = value_and_grad(loss_ef, has_aux=True)
         return loss_ef, loss_ef_and_grad
