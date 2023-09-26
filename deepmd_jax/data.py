@@ -3,11 +3,12 @@ import jax.numpy as jnp
 from glob import glob
 from .utils import shift
 
-class DataSystem():
-    def __init__(self, path, labels):
-        self.type = np.genfromtxt(path + '/type.raw', dtype=int)
-        self.type_map = np.genfromtxt(path + '/type_map.raw', dtype=str)
-        self.data = {l: np.concatenate([np.load(set+l+'.npy') for set in glob(path+'/set.*/')]) for l in labels}
+class SingleDataSystem():
+    def __init__(self, paths, labels):
+        self.type = np.genfromtxt(paths[0] + '/type.raw', dtype=int)
+        self.type_map = np.genfromtxt(paths[0] + '/type_map.raw', dtype=str)
+        self.data = {l: np.concatenate(sum([[np.load(set+l+'.npy') for set in glob(path+'/set.*/')]
+                                             for path in paths], [])) for l in labels}
         self.natoms = len(self.type)
         self.nframes = len(self.data['coord'])
         self.pointer = self.nframes
@@ -18,7 +19,8 @@ class DataSystem():
             self.data[l] = np.concatenate([self.data[l][:,:,self.type==i] for i in range(len(self.type_map))], axis=-1)
         self.data['box'] = self.data['box'].reshape(-1,3,3).transpose(0,2,1)
         self.data['coord'] = np.array(shift(self.data['coord'], self.data['box']))
-        print('Loaded data from \'%s\'' % path, 'with', self.nframes, 'frames of', self.natoms, 'atoms.')
+        print('Data loaded from: \n', ''.join(['\'%s\'\n' % path for path in paths]),
+              'with', self.nframes, 'frames and', self.natoms, 'atoms per frame.')
     
     def compute_lattice_candidate(self, rcut): # computes candidate lattice vectors within rcut
         recp_norm = jnp.linalg.norm((jnp.linalg.inv(self.data['box'])), axis=1) # (nframes, 3)

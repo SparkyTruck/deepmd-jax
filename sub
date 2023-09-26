@@ -8,4 +8,4 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1
 
-python -u train.py > train.out
+python -u train.py > log.out
