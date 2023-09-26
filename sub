@@ -1,0 +1,11 @@
+#!/bin/bash
+#SBATCH --job-name=deepmd-jax
+#SBATCH -A m3538_g
+#SBATCH -C gpu
+#SBATCH -q debug
+#SBATCH -t 00:30:00
+#SBATCH -N 1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-task=1
+
+python -u train.py > train.out
