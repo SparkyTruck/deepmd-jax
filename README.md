@@ -7,6 +7,7 @@ pip install ipykernel
 python -m ipykernel install --user --name deepmd-jax
 pip install --upgrade "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 pip install flax optax jax-md
+pip install matplotlib
 ```
 
 ## Tips for working on Perlmutter
