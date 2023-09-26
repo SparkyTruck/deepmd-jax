@@ -59,7 +59,7 @@ class fitting_net(nn.Module):
             x_prev = x
             x = nn.tanh(nn.Dense(self.widths[i],
                                 kernel_init = nn.initializers.variance_scaling(0.5, "fan_avg", "normal"),
-                                 bias_init=nn.initializers.normal(1))(x))
+                                bias_init=nn.initializers.normal(1))(x))
             if i > 0 and self.widths[i] == self.widths[i-1]:
                 dt = self.param('dt'+str(i), lambda k, s: 0.1 + nn.initializers.normal(0.001)(k, s), (self.widths[i],))
                 x = x * dt + x_prev 

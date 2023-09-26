@@ -1,6 +1,5 @@
-import jax.numpy as jnp
 import numpy as np
-from jax import jit, grad, random, tree_util
+from jax import jit, random, tree_util
 import jax, optax
 import flax.linen as nn
 from deepmd_jax.data import SingleDataSystem
@@ -18,9 +17,9 @@ if precision == '64':
     jax.config.update('jax_enable_x64', True)
 
 # DP config parameters
-save_name      = 'model_polaron.pkl'
+save_name      = 'model_polaron.pkl' # trained model will be saved to this file
 train_data     = SingleDataSystem(['polaron_data'], ['coord', 'box', 'force', 'energy'])
-use_val_data   = True
+use_val_data   = True # if False, you can set val_data = None 
 val_data       = SingleDataSystem(['polaron_data'], ['coord', 'box', 'force', 'energy'])
 orthorhombic   = True
 rcut           = 6.0
@@ -37,6 +36,7 @@ l_pref_f       = 100
 total_steps    = 400000
 decay_steps    = 4000
 decay_rate     = 0.95
+print_every    = 1000
 
 # parameters you usually don't need to change
 RANDOM_SEED    = np.random.randint(1000)
@@ -90,7 +90,7 @@ tic = time()
 for iteration in range(total_steps):
     batch, _ = train_data.get_batch(batch_size)
     variables, opt_state, state_args = train_step(batch, variables, opt_state, state_args, static_args)
-    if iteration % 1000 == 0:
+    if iteration % print_every == 0:
         if use_val_data:
             val_batch, _ = val_data.get_batch(val_batch_size)
             loss_val_e, loss_val_f = val_step(val_batch, variables, static_args)

@@ -19,7 +19,7 @@ class SingleDataSystem():
             self.data[l] = np.concatenate([self.data[l][:,:,self.type==i] for i in range(len(self.type_map))], axis=-1)
         self.data['box'] = self.data['box'].reshape(-1,3,3).transpose(0,2,1)
         self.data['coord'] = np.array(shift(self.data['coord'], self.data['box']))
-        print('Data loaded from: \n', ''.join(['\'%s\'\n' % path for path in paths]),
+        print('SingleDataSystem loaded from: \n', ''.join(['\'%s\'\n' % path for path in paths]),
               'with', self.nframes, 'frames and', self.natoms, 'atoms per frame.')
     
     def compute_lattice_candidate(self, rcut): # computes candidate lattice vectors within rcut
