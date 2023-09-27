@@ -2,6 +2,8 @@ import numpy as np
 from jax import jit, random, tree_util
 import jax, optax
 import flax.linen as nn
+import sys, os
+sys.path.append(os.path.abspath('../'))
 from deepmd_jax.data import SingleDataSystem
 from deepmd_jax.model import DPModel
 import pickle
@@ -19,7 +21,7 @@ if precision == '64':
 # DP config parameters
 save_name      = 'model_polaron.pkl' # trained model will be saved to this file
 train_data     = SingleDataSystem(['polaron_data'], ['coord', 'box', 'force', 'energy'])
-use_val_data   = True # if False, you can set val_data = None 
+use_val_data   = True # if False, comment next line
 val_data       = SingleDataSystem(['polaron_data'], ['coord', 'box', 'force', 'energy'])
 orthorhombic   = True
 rcut           = 6.0

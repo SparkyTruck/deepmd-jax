@@ -34,10 +34,11 @@ class DPModel(nn.Module):
         embed_NMC = jnp.concatenate([jnp.concatenate(i, axis=1) for i in embed_nmC], axis=0)
         # compute distance matrix R = (R0, R1) of M*4 for each atom
         rsr_nM = list(map(lambda x,y:x/y, slice_type(sr_NM/r_NM,static_args['type_index'],0), self.params['xrsrstd']))
-        R_4NM = jnp.concatenate([srbiasnorm_NM[None], x_3NM * (jnp.concatenate(rsr_nM)[None] + 1e-15)], axis=0)
+        R_4NM = jnp.concatenate([srbiasnorm_NM[None], self.params['e3norm']*x_3NM*(jnp.concatenate(rsr_nM)[None]+1e-15)], axis=0)
         # compute feature matrix G = E @ R and Feat = GG^T
         G_N4C = R_4NM.transpose(1,0,2) @ embed_NMC / self.params['normalizer']
         Gbias = self.param('Gbias',nn.initializers.normal(stddev=0.01),(C,))
+        G_N4C = G_N4C + jnp.concatenate([Gbias[None], jnp.zeros((3,C))])
         G_N4C = jnp.concatenate([G_N4C[:,:1] + Gbias, self.params['e3norm'] * G_N4C[:,1:]], axis=1)
         Feat_NX = (G_N4C[:,:,:self.params['axis_neuron']].transpose(0,2,1) @ G_N4C).reshape(N,-1)
         # compute fitting net output and energy 
