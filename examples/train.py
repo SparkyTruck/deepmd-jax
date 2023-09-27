@@ -12,9 +12,9 @@ from time import time
 print('Starting program on device', jax.devices())
 TIC = time()
 
-# Default to use 32 bit, you can change to 16 or 64 bit (not recommended)
-precision      = '32'
-if precision != '16':
+# Default to use 32 bit, you can change to 16 (for mixed 16/32bit) or 64 bit (not recommended)
+precision      = '32' # '16' '32' '64'
+if precision == '32':
     jax.config.update('jax_default_matmul_precision', 'float32')
 if precision == '64':
     jax.config.update('jax_enable_x64', True)
