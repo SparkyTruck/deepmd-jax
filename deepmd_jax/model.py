@@ -32,20 +32,20 @@ class DPModel(nn.Module):
         # compute embedding net features
         embed_nmC = [[embedding_net(self.params['embed_widths'])(j[:,:,None]) for j in i] for i in srnorm_nm]
         embed_NMC = jnp.concatenate([jnp.concatenate(i, axis=1) for i in embed_nmC], axis=0)
-        # compute distance matrix R = (R0, R1) of M*4 for each atom
+        # compute distance matrix R = (inv:srbiasnorm_NM, equiv:R_3NM)
         rsr_nM = list(map(lambda x,y:x/y, slice_type(sr_NM/r_NM,static_args['type_index'],0), self.params['xrsrstd']))
-        R_4NM = jnp.concatenate([srbiasnorm_NM[None], self.params['e3norm']*x_3NM*(jnp.concatenate(rsr_nM)[None]+1e-15)], axis=0)
+        R_3NM = self.params['e3norm']*(jnp.concatenate(rsr_nM)[None]+1e-15)*x_3NM
         # compute feature matrix G = E @ R and Feat = GG^T
-        G_N4C = R_4NM.transpose(1,0,2) @ embed_NMC / self.params['normalizer']
+        Ginv_NC = (srbiasnorm_NM[:,:,None] * embed_NMC).sum(1) / self.params['normalizer']
+        Geqv_3NC = (R_3NM[:,:,:,None] * embed_NMC).sum(2) / self.params['normalizer']
         Gbias = self.param('Gbias',nn.initializers.normal(stddev=0.01),(C,))
-        G_N4C = G_N4C + jnp.concatenate([Gbias[None], jnp.zeros((3,C))])
-        G_N4C = jnp.concatenate([G_N4C[:,:1] + Gbias, self.params['e3norm'] * G_N4C[:,1:]], axis=1)
-        Feat_NX = (G_N4C[:,:,:self.params['axis_neuron']].transpose(0,2,1) @ G_N4C).reshape(N,-1)
+        G_4NC = jnp.concatenate([(Ginv_NC + Gbias)[None], Geqv_3NC])
+        Feat_NX = (G_4NC[:,:,None,:] * G_4NC[:,:,:self.params['axis_neuron'],None]).sum(0).reshape(N,-1)
         # compute fitting net output and energy 
         fit_n1 = [fitting_net(self.params['fit_widths'])(i) for i in slice_type(Feat_NX,static_args['type_index'],0)]
         energy = sum(list(map(lambda x,y:(x+y).sum(), fit_n1, self.params['Ebias'])))
         # debug info
-        debug = (r_NM, embed_nmC, R_4NM, G_N4C, Feat_NX, fit_n1)
+        debug = (r_NM, embed_nmC, R_3NM, G_4NC, Feat_NX, fit_n1)
         return energy, debug
 
     def energy_and_force(self, variables, coord_3N, box_33, static_args):
