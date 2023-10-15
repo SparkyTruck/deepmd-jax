@@ -42,10 +42,10 @@ class DPMPModel(nn.Module):
         rsr_nM = list(map(lambda x,y:x/y, slice_type(sr_NM/r_NM,static_args['type_index'],0), self.params['xrsrstd']))
         R_3NM = self.params['e3norm']*(jnp.concatenate(rsr_nM)[None]+1e-15)*x_3NM
         # compute feature matrix G = embed @ R
-        GIinv_NC = ((srbiasnorm_NM[:,:,None] * embedI_NMC).sum(1) / self.params['normalizer'])
-                    # + self.param('GIbias',nn.initializers.normal(stddev=0.01),(C,)))
-        GJinv_NC = ((srbiasnorm_NM[:,:,None] * embedJ_NMC).sum(1) / self.params['normalizer'])
-                    # + self.param('GJbias',nn.initializers.normal(stddev=0.01),(C,)))
+        GIinv_NC = (((srbiasnorm_NM[:,:,None] * embedI_NMC).sum(1) / self.params['normalizer'])
+                    + self.param('GIbias',nn.initializers.normal(stddev=0.01),(C,)))
+        GJinv_NC = (((srbiasnorm_NM[:,:,None] * embedJ_NMC).sum(1) / self.params['normalizer'])
+                    + self.param('GJbias',nn.initializers.normal(stddev=0.01),(C,)))
         GJinv_MC = (GJinv_NC[:,None] * jnp.ones((M//N,1))).reshape(M,C)
         Ginv_NC = (((srbiasnorm_NM[:,:,None] * embed_NMC).sum(1) / self.params['normalizer'])
                     + self.param('GGbias',nn.initializers.normal(stddev=0.01),(C,)))
@@ -58,22 +58,37 @@ class DPMPModel(nn.Module):
         FJ_NMC = (GJeqv_3MC[:,None] * R_3NM[...,None]).sum(0)
         # FII_NME = ((GIeqv_3NC[:,:,None] * GIeqv_3NC[:,:,:2,None]).sum(0)).reshape(N,1,-1) * srbiasnorm_NM[:,:,None] #* jnp.ones((M,1))
         Geqv_4NC = jnp.concatenate([Ginv_NC[None], Geqv_3NC])
-        Geqv_4MC = (Geqv_4NC[:,:,None] * jnp.ones((M//N,1))).reshape(4,M,-1)
+        # Geqv_4MC = (Geqv_4NC[:,:,None] * jnp.ones((M//N,1))).reshape(4,M,-1)
         FII_NME = ((Geqv_4NC[:,:,None] * Geqv_4NC[:,:,:2,None]).sum(0)).reshape(N,1,-1) * jnp.ones((M,1))
         GJeqv_4MC = jnp.concatenate([GJinv_MC[None], GJeqv_3MC])
-        # FJJ_NME = ((GJeqv_4MC[:,:,None] * GJeqv_4MC[:,:,:2,None]).sum(0)).reshape(M,-1) * jnp.ones((N,1,1))
-        FJJ_NME = ((Geqv_4MC[:,:,None] * Geqv_4MC[:,:,:2,None]).sum(0)).reshape(1,M,-1) * jnp.ones((N,1,1))
+        FJJ_NME = ((GJeqv_4MC[:,:,None] * GJeqv_4MC[:,:,:2,None]).sum(0)).reshape(M,-1) * jnp.ones((N,1,1))
+        # FJJ_NME = ((Geqv_4MC[:,:,None] * Geqv_4MC[:,:,:2,None]).sum(0)).reshape(1,M,-1) * jnp.ones((N,1,1))
         Rnorm_NM = jnp.linalg.norm(R_3NM + 1e-15, axis=0)
         R0_3NM = x_3NM / r_NM
         FIT_NMC = jnp.linalg.norm(GIeqv_3NC, axis=0)[:,None] * Rnorm_NM[:,:,None]
         FJT_NMC = jnp.linalg.norm(GJeqv_3MC, axis=0) * Rnorm_NM[:,:,None]
         # Fi_NMC = GIinv_NC[:,None] * jnp.ones((M,C))
-        Fi_NMC = GIinv_NC[:,None] * sr_NM[:,:,None]
+        # Fi_NMC = GIinv_NC[:,None] * sr_NM[:,:,None]
         # Fj_NMC = GJinv_MC * jnp.ones((N,1,C))
-        Fj_NMC = GJinv_MC * sr_NM[:,:,None]
+        # Fj_NMC = GJinv_MC * sr_NM[:,:,None]
         FIJ_NMC = (GIeqv_3NC[:,:,None] * GJeqv_3MC[:,None]).sum(0) * sr_NM[:,:,None]
         Fij_NMC = (jnp.cross(GIeqv_3NC[:,:,None], R_3NM[...,None], axisa=0, axisb=0, axisc=0) * GJeqv_3MC[:,None]).sum(0)
-        F_NMX = jnp.concatenate([embed2_NMD, FI_NMC, FJ_NMC, FII_NME, FJJ_NME], axis=-1)
+        R_4NM = jnp.concatenate([srbiasnorm_NM[None], R_3NM])
+        GI_4NC = jnp.concatenate([GIinv_NC[None], GIeqv_3NC])
+        GTI_NMC = (GI_4NC[:,:,None] * R_4NM[...,None]).sum(0)
+        GJ_4MC = (jnp.concatenate([GIinv_NC[None], GIeqv_3NC])[:,:,None] * jnp.ones((M//N,1))).reshape(4,M,C)
+        GTJ_NMC = (GJ_4MC[:,None] * R_4NM[...,None]).sum(0)
+        FTI_NMC0 = (GTI_NMC[:,:,None] * GTJ_NMC[:,:,:2,None]).reshape(N,M,-1) / 5
+        FTJ_NMC0 = (GTJ_NMC[:,:,None] * GTI_NMC[:,:,:2,None]).reshape(M,N,-1) / 5
+        r_3NM = x_3NM * sr_NM
+        DD = r_3NM[:,None]*r_3NM[None]-(r_3NM**2).sum(0)*(jnp.eye(3)/3)[:,:,None,None]
+        Geqv_33NC = ((r_3NM[:,None]*r_3NM[None]-(r_3NM**2).sum(0)*(jnp.eye(3)/3)[:,:,None,None])[...,None]
+                       * embed_NMC).sum(-2) / self.params['normalizer']
+        Geqv_33MC = (Geqv_33NC[:,:,:,None] * jnp.ones((M//N,1))).reshape(3,3,M,C)
+        F2I_NMC = ((Geqv_33NC[:,:,:,None] * R_3NM[...,None]).sum(1) * R_3NM[...,None]).sum(0)
+        F2J_NMC = ((Geqv_33MC[:,:,None] * R_3NM[...,None]).sum(1) * R_3NM[...,None]).sum(0)
+        F_NMX = jnp.concatenate([embed2_NMD, FI_NMC, FJ_NMC, FII_NME, FJJ_NME, F2I_NMC, F2J_NMC], axis=-1)
+        # F_NMX = jnp.concatenate([embed2_NMD, FI_NMC, FJ_NMC, FII_NME], axis=-1)
         # F_NMX += self.param('Fbias',nn.initializers.normal(stddev=0.01),(F_NMX.shape[-1],))
         F_nmX = [slice_type(f,static_args['ntype_index'],1) for f in slice_type(F_NMX,static_args['type_index'],0)]
         embedMP_nmB = [[embedding_net_mp(self.params['embedMP_widths'])(j) for j in i] for i in F_nmX]
@@ -88,7 +103,8 @@ class DPMPModel(nn.Module):
         fit_n1 = [fitting_net(self.params['fit_widths'])(i) for i in slice_type(Feat_NX,static_args['type_index'],0)]
         energy = sum(list(map(lambda x,y:(x+y).sum(), fit_n1, self.params['Ebias'])))
         # debug info
-        debug = (r_NM, embedI_NMC, embed2_NMD, Fi_NMC, Fj_NMC, FI_NMC, FJ_NMC, FII_NME, FIJ_NMC, Fij_NMC, embedMP_NMB, R_3NM, G_4NB, Feat_NX, fit_n1)
+        debug = None
+        debug = (r_NM, embedI_NMC, embed2_NMD, DD, F2I_NMC, FI_NMC, FJ_NMC, FII_NME, FIJ_NMC, Fij_NMC, GI_4NC, GTI_NMC, FTI_NMC0, embedMP_NMB, R_3NM, G_4NB, Feat_NX, fit_n1)
         return energy, debug
 
     def energy_and_force(self, variables, coord_3N, box_33, static_args):

@@ -41,6 +41,7 @@ he_init = nn.initializers.he_normal()
 vs_init = nn.initializers.variance_scaling(0.5, "fan_avg", "normal")
 std_init = nn.initializers.normal(1)
 dt_init = lambda k, s: 0.1 + nn.initializers.normal(0.001)(k, s)
+zero_init = nn.initializers.zeros_init()
 
 class embedding_net(nn.Module):
     widths: list
@@ -52,6 +53,7 @@ class embedding_net(nn.Module):
             else:
                 K = self.widths[i] / self.widths[i-1]
                 x_prev = (x[...,None] * jnp.ones((int(K),))).reshape((x.shape[:-1]) + (-1,))
+                # x_prev = (x[...,None,:] * jnp.ones((int(K),1))).reshape((x.shape[:-1]) + (-1,))
                 x = nn.tanh(nn.Dense(self.widths[i], kernel_init=he_init, bias_init=std_init)(x))
                 if K.is_integer():
                     x += x_prev

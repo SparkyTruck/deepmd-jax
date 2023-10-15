@@ -7,15 +7,15 @@ from .utils import shift
 
 class SingleDataSystem():
     def __init__(self, paths, labels):
-        self.type = np.genfromtxt(paths[0] + '/type.raw', dtype=int)
-        self.type_map = np.genfromtxt(paths[0] + '/type_map.raw', dtype=str)
+        self.type = np.genfromtxt(paths[0] + '/type.raw').astype(int)
+        self.type_map = np.genfromtxt(paths[0] + '/type_map.raw', dtype=str).reshape(-1)
         self.data = {l: np.concatenate(sum([[np.load(set+l+'.npy') for set in glob(path+'/set.*/')]
                                              for path in paths], [])) for l in labels}
         self.natoms = len(self.type)
         self.nframes = len(self.data['coord'])
         self.pointer = self.nframes
         self.type_count = np.array([(self.type == i).sum() for i in range(len(self.type_map))])
-        self.type_index = np.cumsum([0] + list(self.type_count))
+        self.type_idx = np.cumsum([0] + list(self.type_count))
         for l in ['coord', 'force']:
             self.data[l] = self.data[l].reshape(-1,self.natoms,3).transpose(0,2,1)
             self.data[l] = np.concatenate([self.data[l][:,:,self.type==i] for i in range(len(self.type_map))], axis=-1)

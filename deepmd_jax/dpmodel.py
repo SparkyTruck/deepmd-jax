@@ -29,23 +29,35 @@ class DPModel(nn.Module):
         srbiasnorm_NM = jnp.concatenate(list(map(lambda x,y:x/y, sr_nM, self.params['srstd'])))
         srnorm_nM = list(map(lambda x,y,z:(x-y)/z, sr_nM, self.params['srmean'], self.params['srstd']))
         srnorm_nm = [slice_type(s,static_args['ntype_index'],1) for s in srnorm_nM]
-        # compute embedding net features
-        embed_nmC = [[embedding_net(self.params['embed_widths'])(j[:,:,None]) for j in i] for i in srnorm_nm]
-        embed_NMC = jnp.concatenate([jnp.concatenate(i, axis=1) for i in embed_nmC], axis=0)
         # compute distance matrix R = (inv:srbiasnorm_NM, equiv:R_3NM)
         rsr_nM = list(map(lambda x,y:x/y, slice_type(sr_NM/r_NM,static_args['type_index'],0), self.params['xrsrstd']))
         R_3NM = self.params['e3norm']*(jnp.concatenate(rsr_nM)[None]+1e-15)*x_3NM
+        # alternative implementation
+        # R_4NM = jnp.concatenate([srbiasnorm_NM[None], R_3NM])
+        # R_4nm = [slice_type(r,static_args['ntype_index'],2) for r in slice_type(R_4NM,static_args['type_index'],1)]
+        # R_4nM = slice_type(R_4NM,static_args['type_index'],1)
+        # G_bias = self.param('Gbias',nn.initializers.normal(stddev=0.01),(C,))
+        # G_4nC = [(jnp.concatenate([embedding_net(self.params['embed_widths'])(i[:,:,None])
+        #                           for i in j], axis=1) * r[...,None]).sum(2) + G_bias for j, r in zip(srnorm_nm, R_4nM)]
+        # G_4nC = [sum([(embedding_net(self.params['embed_widths'])(i[:,:,None])*j[...,None]).sum(2)
+        #                for i,j in J]) for J in map(zip, srnorm_nm, R_4nm)]
+        # G_4NC = jnp.concatenate(G_4nC, axis=1) + self.param('Gbias',nn.initializers.normal(stddev=0.01),(C,))
+        # Feat_nX = [(g[:,:,None,:] * g[:,:,:self.params['axis_neuron'],None]).sum(0).reshape(g.shape[1],-1) for g in G_4nC]
+        # fit_n1 = [fitting_net(self.params['fit_widths'])(i) for i in Feat_nX]
         # compute feature matrix G = E @ R and Feat = GG^T
+        embed_nmC = [[embedding_net(self.params['embed_widths'])(j[:,:,None]) for j in i] for i in srnorm_nm]
+        embed_NMC = jnp.concatenate([jnp.concatenate(i, axis=1) for i in embed_nmC], axis=0)
         Ginv_NC = (srbiasnorm_NM[:,:,None] * embed_NMC).sum(1) / self.params['normalizer']
-        Geqv_3NC = (R_3NM[:,:,:,None] * embed_NMC).sum(2) / self.params['normalizer']
-        Gbias = self.param('Gbias',nn.initializers.normal(stddev=0.01),(C,))
+        Geqv_3NC = (R_3NM[...,None] * embed_NMC).sum(2) / self.params['normalizer']
+        Gbias = self.param('Gbias', nn.initializers.zeros_init(), (C,))
         G_4NC = jnp.concatenate([(Ginv_NC + Gbias)[None], Geqv_3NC])
+        # G_4NC = jnp.concatenate([Ginv_NC[None], Geqv_3NC])
         Feat_NX = (G_4NC[:,:,None,:] * G_4NC[:,:,:self.params['axis_neuron'],None]).sum(0).reshape(N,-1)
         # compute fitting net output and energy 
         fit_n1 = [fitting_net(self.params['fit_widths'])(i) for i in slice_type(Feat_NX,static_args['type_index'],0)]
         energy = sum(list(map(lambda x,y:(x+y).sum(), fit_n1, self.params['Ebias'])))
         # debug info
-        debug = (r_NM, embed_nmC, R_3NM, G_4NC, Feat_NX, fit_n1)
+        debug = (r_NM, R_3NM, G_4NC, Feat_NX, fit_n1)
         return energy, debug
 
     def energy_and_force(self, variables, coord_3N, box_33, static_args):
