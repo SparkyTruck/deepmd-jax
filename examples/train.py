@@ -1,4 +1,3 @@
-import jax.numpy as jnp
 import numpy as np
 from jax import jit, random, tree_util
 import jax, optax
@@ -6,7 +5,8 @@ import flax.linen as nn
 import sys, os
 sys.path.append(os.path.abspath('../'))
 from deepmd_jax.data import SingleDataSystem
-from deepmd_jax.model import DPModel
+from deepmd_jax.dpmodel import DPModel
+# from deepmd_jax.dpmodel import DPMPModel as DPModel
 import pickle
 from time import time
 print('Starting program on device', jax.devices())
@@ -20,24 +20,31 @@ if precision == '64':
     jax.config.update('jax_enable_x64', True)
 
 # DP config parameters
-save_name      = 'model_polaron.pkl' # model save name
-train_data     = SingleDataSystem(['../data_example/water_test_data/6'], ['coord', 'box', 'force', 'energy'])
-# train_data     = SingleDataSystem(['../data_example/polaron_data'], ['coord', 'box', 'force', 'energy'])
-use_val_data   = False # if False, comment next line
-# val_data       = SingleDataSystem(['data_example/polaron_data'], ['coord', 'box', 'force', 'energy'])
+save_name      = 'model_water_new_2.pkl' # model save name
+# train_data     = SingleDataSystem(['data/polaron_train/'], ['coord', 'box', 'force', 'energy'])
+train_data     = SingleDataSystem(['/pscratch/sd/r/ruiqig/polaron_cp2k/aimd/aimd-water/water_128'], ['coord', 'box', 'force', 'energy'])
+# train_data     = SingleDataSystem(['data/mdsim/lips/train/'], ['coord', 'box', 'force', 'energy'])
+# train_data     = SingleDataSystem(['data/icewater/lw_pimd/'], ['coord', 'box', 'force', 'energy'])
+# train_data     = SingleDataSystem(['data/water_chunyi/jax_data_sub'], ['coord', 'box', 'force', 'energy'])
+# train_data     = SingleDataSystem(['data/Cu-dpgen/32'], ['coord', 'box', 'force', 'energy'])
+use_val_data   = True # if False, comment next line
+# val_data       = SingleDataSystem(['data/polaron_val/'], ['coord', 'box', 'force', 'energy'])
+val_data       = SingleDataSystem(['/pscratch/sd/r/ruiqig/polaron_cp2k/aimd/aimd-water/water_128_val'], ['coord', 'box', 'force', 'energy'])
+# val_data       = SingleDataSystem(['data/mdsim/lips/val/'], ['coord', 'box', 'force', 'energy'])
 rcut           = 6.0
+use_2nd_tensor = False
 embed_widths   = [24, 48, 96]
-fit_widths     = [240, 240, 240]
-axis_neuron    = 12
+fit_widths     = [128, 128, 128]
+axis_neurons   = 12
 batch_size     = 1
 val_batch_size = 8
-lr             = 0.002 
+lr             = 0.002
 s_pref_e       = 0.02
 l_pref_e       = 1
 s_pref_f       = 1000
-l_pref_f       = 100
-total_steps    = 400000
-decay_steps    = 4000
+l_pref_f       = 10
+total_steps    = 500000
+decay_steps    = 5000
 decay_rate     = 0.95
 print_every    = 1000
 
@@ -52,13 +59,14 @@ if use_val_data:
     val_data.compute_lattice_candidate(rcut)
 model = DPModel({'embed_widths':embed_widths,
                  'fit_widths':fit_widths,
-                 'axis_neuron':axis_neuron,
-                 'Ebias':train_data.compute_Ebias()})
+                 'axis':axis_neurons,
+                 'Ebias':train_data.compute_Ebias(),
+                 'rcut':rcut,
+                 'use_2nd':use_2nd_tensor,})
 batch, lattice_args = train_data.get_batch(getstat_bs)
 static_args = nn.FrozenDict({'lattice': lattice_args,
-                            'rcut':rcut,
-                            'type_index':tuple(train_data.type_index),
-                            'ntype_index':tuple(lattice_args['lattice_max']*train_data.type_index)})
+                            'type_idx':tuple(train_data.type_idx),
+                            'ntype_idx':tuple(lattice_args['lattice_max']*train_data.type_idx)})
 model.get_stats(batch['coord'], batch['box'], static_args)
 print('Model statistics computed.')
 variables = model.init(random.PRNGKey(RANDOM_SEED), batch['coord'][0], batch['box'][0], static_args)
@@ -68,15 +76,14 @@ lr_scheduler = optax.exponential_decay(init_value=lr, transition_steps=decay_ste
 optimizer = optax.adam(learning_rate=lr_scheduler, b2=beta2)
 opt_state = optimizer.init(variables)
 loss, loss_and_grad = model.get_loss_ef_fn()
-print('Optimizer initialized. Training started.')
-
+print('Optimizer initialized. Starting training...')
 
 state_args = {'le_avg':0., 'lf_avg':0., 'loss_avg':0., 'iteration':0}
 def train_step(batch, variables, opt_state, state_args, static_args):
     r = lr_scheduler(state_args['iteration']) / lr
     pref = {'e': s_pref_e*r + l_pref_e*(1-r), 'f': s_pref_f*r + l_pref_f*(1-r)}
     (loss_total, (loss_e, loss_f)), grads = loss_and_grad(variables, batch, pref, static_args)
-    updates, opt_state = optimizer.update(grads, opt_state)
+    updates, opt_state = optimizer.update(grads, opt_state, variables)
     variables = optax.apply_updates(variables, updates)
     state_args['loss_avg'] = state_args['loss_avg'] * (1-1/l_smoothing) + loss_total
     state_args['le_avg'] = state_args['le_avg'] * (1-1/l_smoothing) + loss_e
@@ -89,8 +96,7 @@ def val_step(batch, variables, static_args):
     pref = {'e': 1, 'f': 1}
     _, (loss_e, loss_f) = loss(variables, batch, pref, static_args)
     return loss_e, loss_f
-if use_val_data:
-    val_step = jit(val_step, static_argnums=(2,))
+val_step = jit(val_step, static_argnums=(2,))
 
 tic = time()
 for iteration in range(total_steps):

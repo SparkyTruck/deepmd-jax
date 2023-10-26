@@ -1,110 +1,76 @@
 import jax.numpy as jnp
 from jax import vmap, value_and_grad
 import flax.linen as nn
-from .utils import sr, embedding_net, fitting_net, get_relative_coord, slice_type
+from .utils import sr, embedding_net, fitting_net, get_relative_coord, slice_type, linear_init, ones_init, zeros_init
     
 class DPMPModel(nn.Module):
     params: dict
     def get_stats(self, coord_B3N, box_B33, static_args):
-        x_B3NM, r_BNM = vmap(get_relative_coord,(0,0,None))(coord_B3N, box_B33, static_args['lattice'])
-        sr_BNM = sr(r_BNM, static_args['rcut'])
-        sr_BnM = slice_type(sr_BNM, static_args['type_index'], 1)
-        xrsr_B3nM = slice_type(x_B3NM*(sr_BNM/r_BNM)[:,None], static_args['type_index'], 2)
-        self.params['srmean'] = [jnp.mean(i[i>1e-15]) for i in sr_BnM]
-        self.params['srstd'] = [jnp.std(i[i>1e-15]) for i in sr_BnM]
-        self.params['xrsrstd'] = [jnp.std(i[jnp.abs(i)>1e-15]) for i in xrsr_B3nM]
-        self.params['avgneigh'] = (sr_BNM > 0).sum(2).mean()
-        self.params['normalizer'] = self.params['avgneigh'] + 1
-        self.params['e3norm'] = 1.
+        r_BNM = vmap(get_relative_coord,(0,0,None))(coord_B3N, box_B33, static_args['lattice'])[1]
+        sr_BNM = sr(r_BNM, self.params['rcut'])
+        sr_BnM = slice_type(sr_BNM, static_args['type_idx'], 1)
+        self.params['sr_mean'] = [jnp.mean(i[i>1e-15]) for i in sr_BnM]
+        self.params['sr_std'] = [jnp.std(i[i>1e-15]) for i in sr_BnM]
+        self.params['norm'] = (sr_BNM > 0).sum(2).mean() + 1
 
     @nn.compact
     def __call__(self, coord_3N, box_33, static_args):
-        # compute relative coordinates and s(r)
+        # compute relative coordinates x, relative distance r, and s(r)
         x_3NM, r_NM = get_relative_coord(coord_3N, box_33, static_args['lattice'])
-        sr_NM = sr(r_NM, static_args['rcut'])
         (N, M) = r_NM.shape
-        C, B = self.params['embedIJ_widths'][-1], self.params['embedMP_widths'][-1]
+        E, B = self.params['embedMP_widths'][0], self.params['embedMP_widths'][-1]
         # prepare normalized s(r)
-        sr_nM = slice_type(sr_NM, static_args['type_index'], 0)
-        srbiasnorm_NM = jnp.concatenate(list(map(lambda x,y:x/y, sr_nM, self.params['srstd'])))
-        srnorm_nM = list(map(lambda x,y,z:(x-y)/z, sr_nM, self.params['srmean'], self.params['srstd']))
-        srnorm_nm = [slice_type(s,static_args['ntype_index'],1) for s in srnorm_nM]
+        sr_nM = slice_type(sr(r_NM, self.params['rcut']), static_args['type_idx'], 0)
+        sr_norm_NM = jnp.concatenate(list(map(lambda x,y:x/y, sr_nM, self.params['sr_std'])))
+        sr_centernorm_nm = [slice_type(s,static_args['ntype_idx'],1) for s in
+                map(lambda x,y,z:(x-y)/z,sr_nM,self.params['sr_mean'],self.params['sr_std'])]
+        x_norm_3NM = x_3NM / (r_NM+1e-16) * (r_NM > 2e-15)
+        R2diag_3NM = 9**0.5 * sr_norm_NM * ((x_norm_3NM)**2 - (x_norm_3NM**2).mean(0))
+        R2offd_3NM = 18**0.5 * sr_norm_NM * (x_norm_3NM*jnp.stack([x_norm_3NM[1],x_norm_3NM[2],x_norm_3NM[0]]))
+        R_3NM = 3**0.5 * sr_norm_NM * x_norm_3NM
+        R_4NM = jnp.concatenate([sr_norm_NM[None],R_3NM])
+        R_6NM = jnp.concatenate([R2diag_3NM,R2offd_3NM])
+        R_9NM = jnp.concatenate([R_3NM,R_6NM])
+        R_XNM = jnp.concatenate([sr_norm_NM[None],R_9NM])
+        R_3nm = [slice_type(r,static_args['ntype_idx'],2) for r in slice_type(R_3NM,static_args['type_idx'],1)]
         # compute embedding net features
-        embedI_nmC = [[embedding_net(self.params['embedIJ_widths'])(j[:,:,None]) for j in i] for i in srnorm_nm]
-        embedI_NMC = jnp.concatenate([jnp.concatenate(i, axis=1) for i in embedI_nmC], axis=0)
-        embedJ_nmC = [[embedding_net(self.params['embedIJ_widths'])(j[:,:,None]) for j in i] for i in srnorm_nm]
-        embedJ_NMC = jnp.concatenate([jnp.concatenate(i, axis=1) for i in embedJ_nmC], axis=0)
-        embed_nmC = [[embedding_net(self.params['embedIJ_widths'])(j[:,:,None]) for j in i] for i in srnorm_nm]
-        embed_NMC = jnp.concatenate([jnp.concatenate(i, axis=1) for i in embed_nmC], axis=0)
-        embed2_nmD = [[embedding_net(self.params['embed2_widths'])(j[:,:,None]) for j in i] for i in srnorm_nm]
-        embed2_NMD = jnp.concatenate([jnp.concatenate(i, axis=1) for i in embed2_nmD], axis=0)
-        # compute distance matrix R = (inv:srbiasnorm_NM, equiv:R_3NM)
-        rsr_nM = list(map(lambda x,y:x/y, slice_type(sr_NM/r_NM,static_args['type_index'],0), self.params['xrsrstd']))
-        R_3NM = self.params['e3norm']*(jnp.concatenate(rsr_nM)[None]+1e-15)*x_3NM
-        # compute feature matrix G = embed @ R
-        GIinv_NC = (((srbiasnorm_NM[:,:,None] * embedI_NMC).sum(1) / self.params['normalizer'])
-                    + self.param('GIbias',nn.initializers.normal(stddev=0.01),(C,)))
-        GJinv_NC = (((srbiasnorm_NM[:,:,None] * embedJ_NMC).sum(1) / self.params['normalizer'])
-                    + self.param('GJbias',nn.initializers.normal(stddev=0.01),(C,)))
-        GJinv_MC = (GJinv_NC[:,None] * jnp.ones((M//N,1))).reshape(M,C)
-        Ginv_NC = (((srbiasnorm_NM[:,:,None] * embed_NMC).sum(1) / self.params['normalizer'])
-                    + self.param('GGbias',nn.initializers.normal(stddev=0.01),(C,)))
-        GIeqv_3NC = (R_3NM[...,None] * embedI_NMC).sum(2) / self.params['normalizer']
-        Geqv_3NC = (R_3NM[...,None] * embed_NMC).sum(2) / self.params['normalizer']
-        GJeqv_3NC = (R_3NM[...,None] * embedJ_NMC).sum(2) / self.params['normalizer']
-        GJeqv_3MC = (GJeqv_3NC[:,:,None]*jnp.ones((M//N,1))).reshape(3,M,C)
-        # Features: (embed2, FI=GIeqv@R3, FJ=GJeqv@R3, FII=GIeqv@GIeqv) #GIinv, GJinv, 
-        FI_NMC = (GIeqv_3NC[:,:,None] * R_3NM[...,None]).sum(0)
-        FJ_NMC = (GJeqv_3MC[:,None] * R_3NM[...,None]).sum(0)
-        # FII_NME = ((GIeqv_3NC[:,:,None] * GIeqv_3NC[:,:,:2,None]).sum(0)).reshape(N,1,-1) * srbiasnorm_NM[:,:,None] #* jnp.ones((M,1))
-        Geqv_4NC = jnp.concatenate([Ginv_NC[None], Geqv_3NC])
-        # Geqv_4MC = (Geqv_4NC[:,:,None] * jnp.ones((M//N,1))).reshape(4,M,-1)
-        FII_NME = ((Geqv_4NC[:,:,None] * Geqv_4NC[:,:,:2,None]).sum(0)).reshape(N,1,-1) * jnp.ones((M,1))
-        GJeqv_4MC = jnp.concatenate([GJinv_MC[None], GJeqv_3MC])
-        FJJ_NME = ((GJeqv_4MC[:,:,None] * GJeqv_4MC[:,:,:2,None]).sum(0)).reshape(M,-1) * jnp.ones((N,1,1))
-        # FJJ_NME = ((Geqv_4MC[:,:,None] * Geqv_4MC[:,:,:2,None]).sum(0)).reshape(1,M,-1) * jnp.ones((N,1,1))
-        Rnorm_NM = jnp.linalg.norm(R_3NM + 1e-15, axis=0)
-        R0_3NM = x_3NM / r_NM
-        FIT_NMC = jnp.linalg.norm(GIeqv_3NC, axis=0)[:,None] * Rnorm_NM[:,:,None]
-        FJT_NMC = jnp.linalg.norm(GJeqv_3MC, axis=0) * Rnorm_NM[:,:,None]
-        # Fi_NMC = GIinv_NC[:,None] * jnp.ones((M,C))
-        # Fi_NMC = GIinv_NC[:,None] * sr_NM[:,:,None]
-        # Fj_NMC = GJinv_MC * jnp.ones((N,1,C))
-        # Fj_NMC = GJinv_MC * sr_NM[:,:,None]
-        FIJ_NMC = (GIeqv_3NC[:,:,None] * GJeqv_3MC[:,None]).sum(0) * sr_NM[:,:,None]
-        Fij_NMC = (jnp.cross(GIeqv_3NC[:,:,None], R_3NM[...,None], axisa=0, axisb=0, axisc=0) * GJeqv_3MC[:,None]).sum(0)
-        R_4NM = jnp.concatenate([srbiasnorm_NM[None], R_3NM])
-        GI_4NC = jnp.concatenate([GIinv_NC[None], GIeqv_3NC])
-        GTI_NMC = (GI_4NC[:,:,None] * R_4NM[...,None]).sum(0)
-        GJ_4MC = (jnp.concatenate([GIinv_NC[None], GIeqv_3NC])[:,:,None] * jnp.ones((M//N,1))).reshape(4,M,C)
-        GTJ_NMC = (GJ_4MC[:,None] * R_4NM[...,None]).sum(0)
-        FTI_NMC0 = (GTI_NMC[:,:,None] * GTJ_NMC[:,:,:2,None]).reshape(N,M,-1) / 5
-        FTJ_NMC0 = (GTJ_NMC[:,:,None] * GTI_NMC[:,:,:2,None]).reshape(M,N,-1) / 5
-        r_3NM = x_3NM * sr_NM
-        DD = r_3NM[:,None]*r_3NM[None]-(r_3NM**2).sum(0)*(jnp.eye(3)/3)[:,:,None,None]
-        Geqv_33NC = ((r_3NM[:,None]*r_3NM[None]-(r_3NM**2).sum(0)*(jnp.eye(3)/3)[:,:,None,None])[...,None]
-                       * embed_NMC).sum(-2) / self.params['normalizer']
-        Geqv_33MC = (Geqv_33NC[:,:,:,None] * jnp.ones((M//N,1))).reshape(3,3,M,C)
-        F2I_NMC = ((Geqv_33NC[:,:,:,None] * R_3NM[...,None]).sum(1) * R_3NM[...,None]).sum(0)
-        F2J_NMC = ((Geqv_33MC[:,:,None] * R_3NM[...,None]).sum(1) * R_3NM[...,None]).sum(0)
-        F_NMX = jnp.concatenate([embed2_NMD, FI_NMC, FJ_NMC, FII_NME, FJJ_NME, F2I_NMC, F2J_NMC], axis=-1)
-        # F_NMX = jnp.concatenate([embed2_NMD, FI_NMC, FJ_NMC, FII_NME], axis=-1)
-        # F_NMX += self.param('Fbias',nn.initializers.normal(stddev=0.01),(F_NMX.shape[-1],))
-        F_nmX = [slice_type(f,static_args['ntype_index'],1) for f in slice_type(F_NMX,static_args['type_index'],0)]
-        embedMP_nmB = [[embedding_net_mp(self.params['embedMP_widths'])(j) for j in i] for i in F_nmX]
+        embedR_nmE = [[embedding_net(self.params['embedIJ_widths']+(E,), out_linear_only=True)(j[:,:,None]) for j in i] for i in sr_centernorm_nm]
+        embed_NMB = jnp.concatenate([jnp.concatenate([jnp.concatenate([embedding_net(self.params['embedIJ_widths'])(
+                        j[:,:,None]) for _ in range(2)], axis=-1) for j in i], axis=1) for i in sr_centernorm_nm])
+        # Beginning MP, Compute atomic features T, linear transform into F, K = number of atom types, D = 4C
+        B, C = embed_NMB.shape[-1], embed_NMB.shape[-1]//2
+        T_N4B = (R_4NM.transpose(1,0,2) @ embed_NMB) / self.params['norm']
+        T_NB, T_N3B = T_N4B[:,0], T_N4B[:,1:]
+        T_23NC, T_2NC = T_N3B.reshape(N,3,2,-1).transpose(2,1,0,3), T_NB.reshape(N,2,-1).transpose(1,0,2)
+        T_2ND = (T_2NC[:,:,None] * T_2NC[:,:,:4,None] + (T_23NC[:,:,:,None] * T_23NC[...,:4,None]).sum(1)).reshape(2,N,-1)
+        F_2KnE = [T[:,None] @ (self.param('linear1_%d_%d'%(mp_iter,i),linear_init,(2,len(R_3nm),4*C,E)) * (self.param('norm_1_%d'%i,ones_init,(2,len(R_3nm),1,1)))**2) for i,T in enumerate(slice_type(T_2ND,static_args['type_idx'],1))]
+        F_2K3nE = [T[:,None] @ (self.param('linear3_%d_%d'%(mp_iter,i),linear_init,(2,len(R_3nm),1,C,E)) * (self.param('norm_2_%d'%i,ones_init,(2,len(R_3nm),1,1,1)))**2) for i,T in enumerate(slice_type(T_23NC,static_args['type_idx'],2))]
+        # add all features for each type pair (n,m)
+        FI_n1E = [f[0,:,:,None] for f in F_2KnE]
+        FJ_1mE = [[(f[1,i,:,None]*jnp.ones((M//N,1))).reshape(1,-1,E) for f in F_2KnE] for i in range(len(R_3nm))]
+        FI3_nmE = [[R[j].transpose(1,2,0) @ F[0,j].transpose(1,0,2) for j in range(len(R_3nm))] for F,R in zip(F_2K3nE,R_3nm)]
+        FJ3_nmE = [[(r.transpose(2,1,0) @ (F[1,i,:,:,None]*jnp.ones((M//N,1))).reshape(3,-1,E).transpose(1,0,2)).transpose(1,0,2)
+                    for F,r in zip(F_2K3nE,R)] for i,R in enumerate(R_3nm)]
+        F_nmE = [[sum(f) for f in zip(*F)] for F in zip(FI_n1E, FJ_1mE, FI3_nmE, FJ3_nmE, embedR_nmE)]
+        embedMP_nmB = [[embedding_net(self.params['embedMP_widths'], in_bias_only=True, dt_layers=range(2,len(self.params['embedMP_widths'])))(f) for f in F] for F in F_nmE]
         embedMP_NMB = jnp.concatenate([jnp.concatenate(i, axis=1) for i in embedMP_nmB])
-        # compute feature matrix G = E @ R and Feat = GG^T
-        Ginv_NB = (srbiasnorm_NM[:,:,None] * embedMP_NMB).sum(1) / self.params['normalizer']
-        Geqv_3NB = (R_3NM[...,None] * embedMP_NMB).sum(2) / self.params['normalizer']
-        Gbias = self.param('Gbias',nn.initializers.normal(stddev=0.01),(B,))
-        G_4NB = jnp.concatenate([(Ginv_NB + Gbias)[None], Geqv_3NB])
-        Feat_NX = (G_4NB[:,:,None,:] * G_4NB[:,:,:self.params['axis_neuron'],None]).sum(0).reshape(N,-1)
-        # compute fitting net output and energy 
-        fit_n1 = [fitting_net(self.params['fit_widths'])(i) for i in slice_type(Feat_NX,static_args['type_index'],0)]
+        # Begin fitting, Compute atomic features T, fitting net input G = T @ T_sub; A for any axis dimension
+        R_XNM = jnp.concatenate([sr_norm_NM[None],R_3NM] + ([R_6NM] if self.params['use_2nd'] else []))
+        T_NXC = (R_XNM.transpose(1,0,2) @ embedMP_NMB) / self.params['norm']
+        T_NC, T_N3C, T_N6C = T_NXC[:,0]+self.param('Tbias',zeros_init,(1,B)), T_NXC[:,1:4], T_NXC[:,4:]  
+        G00_NAC = (T_NC[:,None] * T_NC[:,:self.params['axis'][0],None])
+        G11_NAC = (T_N3C[:,:,None] * T_N3C[:,:,self.params['axis'][0]:sum(self.params['axis'][:2]),None]).sum(1)
+        if self.params['use_2nd']:
+            G1_axis_N3A = T_N3C[:,:,sum(self.params['axis'][:2]):sum(self.params['axis'][:3])]
+            G11_axis_N6A = jnp.concatenate([G1_axis_N3A**2, 2**0.5 * G1_axis_N3A*jnp.stack([
+                        G1_axis_N3A[:,1],G1_axis_N3A[:,2],G1_axis_N3A[:,0]], axis=1)], axis=1)
+            G2_axis_N6A = T_N6C[:,:,sum(self.params['axis'][:3]):sum(self.params['axis'])]
+            G121_NAC = (G11_axis_N6A[...,None] * T_N6C[:,:,None]).sum(1)
+            G22_NAC = (G2_axis_N6A[...,None] * T_N6C[:,:,None]).sum(1)
+        G_ND = jnp.concatenate([G00_NAC,G11_NAC]+([G121_NAC,G22_NAC] if self.params['use_2nd'] else []), axis=1).reshape(N,-1)
+        fit_n1 = [fitting_net(self.params['fit_widths'])(i) for i in slice_type(G_ND,static_args['type_idx'],0)]
         energy = sum(list(map(lambda x,y:(x+y).sum(), fit_n1, self.params['Ebias'])))
-        # debug info
-        debug = None
-        debug = (r_NM, embedI_NMC, embed2_NMD, DD, F2I_NMC, FI_NMC, FJ_NMC, FII_NME, FIJ_NMC, Fij_NMC, GI_4NC, GTI_NMC, FTI_NMC0, embedMP_NMB, R_3NM, G_4NB, Feat_NX, fit_n1)
+        debug = (r_NM, FI3_nmE, FJ3_nmE, FI_n1E, FJ_1mE, F_nmE, fit_n1)
         return energy, debug
 
     def energy_and_force(self, variables, coord_3N, box_33, static_args):
@@ -122,26 +88,3 @@ class DPMPModel(nn.Module):
         return loss_ef, loss_ef_and_grad
 
 
-he_init = nn.initializers.he_normal()
-vs_init = nn.initializers.variance_scaling(0.5, "fan_avg", "normal")
-std_init = nn.initializers.normal(1)
-dt_init = lambda k, s: 0.5 + nn.initializers.normal(0.01)(k, s)
-zero_init = nn.initializers.zeros_init()
-class embedding_net_mp(nn.Module): # embedding net for message passing
-    widths: list
-    @nn.compact
-    def __call__(self, x):
-        for i in range(len(self.widths)):
-            if i == 0:
-                x = nn.tanh(nn.Dense(self.widths[i], kernel_init=he_init, bias_init=zero_init)(x))
-            else:
-                K = self.widths[i] / self.widths[i-1]
-                x_prev = (x[...,None] * jnp.ones((int(K),))).reshape((x.shape[:-1]) + (-1,))
-                x = nn.tanh(nn.Dense(self.widths[i], kernel_init=he_init, bias_init=std_init)(x))
-                if K.is_integer():
-                    if i > 1:
-                        dt = self.param('dt'+str(i), dt_init, (self.widths[i],))
-                        x = x * dt + x_prev 
-                    else:
-                        x = x + x_prev
-        return x

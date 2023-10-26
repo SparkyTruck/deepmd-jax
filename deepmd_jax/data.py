@@ -46,7 +46,7 @@ class SingleDataSystem():
         return batch, {'lattice_cand': tuple(map(tuple, self.lattice_cand)), 'lattice_max': self.lattice_max, 'ortho': self.ortho}
     
     def compute_Ebias(self):
-        return np.linalg.lstsq(self.type_count[None], [self.data['energy'].mean()], rcond=1e-3)[0]
+        return np.linalg.lstsq(self.type_count[None], [self.data['energy'].mean()], rcond=1e-3)[0].astype(np.float32)
         
 
 
