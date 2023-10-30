@@ -1,7 +1,10 @@
 import jax.numpy as jnp
+import jax
 from jax import vmap, value_and_grad
 import flax.linen as nn
-from .utils import sr, embedding_net, fitting_net, get_relative_coord, slice_type, linear_init, ones_init, zeros_init
+from .utils import sr, embedding_net, fitting_net, get_relative_coord, slice_t, concat_t, linear_init, ones_init, zeros_init, reorder_by_device
+from jax.experimental import mesh_utils
+from jax.sharding import PositionalSharding
 
 class DPModel(nn.Module):
     params: dict
@@ -13,20 +16,25 @@ class DPModel(nn.Module):
         self.params['sr_std'] = [jnp.std(i[i>1e-15]) for i in sr_BnM]
         self.params['norm'] = (sr_BNM > 0).sum(2).mean() + 1
 
+    def get_idx(self, static_args, nbrs_lists, coord):
+        if nbrs_lists is not None:
+            K, type_idx, ntype_idx, type_idx_new = static_args['K'], static_args['type_idx'], [0], [0]
+            coord = reorder_by_device(coord.T, tuple(type_idx), K).T
+            [ntype_idx.append(ntype_idx[-1]+nbrs.idx.shape[1]) for nbrs in nbrs_lists]
+            [type_idx_new.append(type_idx_new[-1]-(-type_idx[i+1]+type_idx[i])//K) for i in range(len(type_idx)-1)]
+            nbrs_idx = jnp.concatenate([nbrs.idx for nbrs in nbrs_lists], axis=1)
+            return type_idx_new, ntype_idx, nbrs_idx, K, coord
+        else:
+            return static_args['type_idx'], static_args['ntype_idx'], None, 1, coord
+            
     @nn.compact
     def __call__(self, coord_3N, box_33, static_args, nbrs_lists=None):
-        if nbrs_lists is not None:
-            type_idx, ntype_idx = static_args['type_idx'], [0]
-            [ntype_idx.append(ntype_idx[-1]+nbrs.idx.shape[1]) for nbrs in nbrs_lists]
-            nbrs_idx = jnp.concatenate([nbrs.idx for nbrs in nbrs_lists], axis=1)
-        else:
-            type_idx, ntype_idx, nbrs_idx = static_args['type_idx'], static_args['ntype_idx'], None
+        type_idx, ntype_idx, nbrs_idx, K, coord_3N = self.get_idx(static_args, nbrs_lists, coord_3N)
         # compute relative coordinates x_3NM, distance r_NM, s(r) and normalized s(r)
         x_3NM, r_NM = get_relative_coord(coord_3N, box_33, static_args['lattice'] if nbrs_idx is None else nbrs_idx)
-        sr_nM = slice_type(sr(r_NM, self.params['rcut']), type_idx, 0)
-        sr_norm_NM = jnp.concatenate(list(map(lambda x,y:x/y, sr_nM, self.params['sr_std'])))
-        sr_centernorm_nm = [slice_type(s,ntype_idx,1) for s in
-                map(lambda x,y,z:(x-y)/z,sr_nM,self.params['sr_mean'],self.params['sr_std'])]
+        sr_nM = slice_t(sr(r_NM, self.params['rcut']), type_idx, 0, K=K)
+        sr_norm_NM = concat_t([x/y for x,y in zip(sr_nM, self.params['sr_std'])], K=K)
+        sr_centernorm_nm = [slice_t((x-y)/z,ntype_idx,1) for x,y,z in zip(sr_nM,self.params['sr_mean'],self.params['sr_std'])]
         # environment matrix: sr_norm_NM(0th-order), R_3NM(1st-order), R2_6NM(2nd-order))
         (N, M), C = r_NM.shape, self.params['embed_widths'][-1]
         x_norm_3NM = x_3NM / (r_NM+1e-16) 
@@ -35,8 +43,8 @@ class DPModel(nn.Module):
         R2offd_3NM = 18**0.5 * sr_norm_NM * (x_norm_3NM*jnp.stack([x_norm_3NM[1],x_norm_3NM[2],x_norm_3NM[0]]))
         R_XNM = jnp.concatenate([sr_norm_NM[None],R_3NM] + ([R2diag_3NM,R2offd_3NM] if self.params['use_2nd'] else []))
         # compute embedding feature and atomic features T for 0,1,2 order
-        embed_NMC = jnp.concatenate([jnp.concatenate([embedding_net(self.params['embed_widths'])(
-                        sr[:,:,None]) for sr in SR], axis=1) for SR in sr_centernorm_nm])
+        embed_NMC = concat_t([concat_t([embedding_net(self.params['embed_widths'])(
+                        sr[:,:,None]) for sr in SR], axis=1) for SR in sr_centernorm_nm], K=K)
         T_NXC = (R_XNM.transpose(1,0,2) @ embed_NMC) / self.params['norm']
         # compute fitting net with input G = T @ T_sub; energy is sum of output; A for any axis dimension
         T_NC, T_N3C, T_N6C = T_NXC[:,0]+self.param('Tbias',zeros_init,(1,C)), T_NXC[:,1:4], T_NXC[:,4:]  
@@ -47,7 +55,7 @@ class DPModel(nn.Module):
                         G1_axis_N3A[:,1],G1_axis_N3A[:,2],G1_axis_N3A[:,0]], axis=1)], axis=1)
             G2_axis_N6A = G11_axis_N6A + T_N6C[:,:,self.params['axis']:2*self.params['axis']]
             G_NAC += (G2_axis_N6A[...,None] * T_N6C[:,:,None]).sum(1)
-        fit_n1 = [fitting_net(self.params['fit_widths'])(i) for i in slice_type(G_NAC.reshape(N,-1),type_idx,0)]
+        fit_n1 = [fitting_net(self.params['fit_widths'])(i) for i in slice_t(G_NAC.reshape(N,-1),type_idx,0,K=K)]
         energy = sum([(f+Eb).sum() for f,Eb in zip(fit_n1, self.params['Ebias'])])
         debug = (r_NM, T_NXC, fit_n1)
         return energy, debug

@@ -3,6 +3,7 @@ import jax
 from jax import lax
 import numpy as np
 import flax.linen as nn
+from functools import partial
 
 def shift(coord, box, ortho=False): # shift coordinates to the parallelepiped around the origin
     if ortho:
@@ -17,9 +18,24 @@ def sr(r, rcut): # 1/r with smooth cutoff at rcut
     t = r / rcut
     return (r>1e-14) * (t<1) / (r+1e-15) * (1-3*t**2+2*t**3)
 
-def slice_type(array, type_idx, axis): # slice array by atom type into list of subarrays
-    return [lax.slice_in_dim(array, type_idx[i], type_idx[i+1], axis=axis)
-            for i in range(len(type_idx)-1)]
+def get_mask_by_device(type_idx, K):
+    return jnp.concatenate([jnp.concatenate([c, jnp.zeros((-c.shape[0]%K,),dtype=bool)]).reshape(K,-1)
+                            for c in slice_t(jnp.ones((type_idx[-1],),dtype=bool),type_idx,0)], axis=1).reshape(-1)
+
+@partial(jax.jit, static_argnums=(1,2))
+def reorder_by_device(coord, type_idx, K): # Fill coord with zeros to make Natoms divisible by device count K
+    return jnp.concatenate([jnp.concatenate([c, jnp.zeros((-c.shape[0]%K,3),dtype=c.dtype)]).reshape(K,-1,3)
+                            for c in slice_t(coord,type_idx,0)], axis=1).reshape(-1, 3)
+
+def slice_t(array, type_idx, axis, K=1): # slice array by atom type into list of subarrays
+    axis = axis if axis >= 0 else len(array.shape) + axis
+    return [lax.slice_in_dim(array.reshape(array.shape[:axis]+(K,-1)+array.shape[axis+1:]), type_idx[i], type_idx[i+1], 
+            axis=axis+1).reshape(array.shape[:axis]+(-1,)+array.shape[axis+1:]) for i in range(len(type_idx)-1)]
+
+def concat_t(array_list, axis=0, K=1): # concatenate array by atom type into list of subarrays
+    axis = axis if axis >= 0 else len(array_list[0].shape) + axis
+    return jnp.concatenate([array.reshape(array.shape[:axis]+(K,-1)+array.shape[axis+1:]) for array in array_list],
+                           axis=axis+1).reshape(array_list[0].shape[:axis]+(-1,)+array_list[0].shape[axis+1:])
 
 def get_relative_coord(coord_3N, box_33, lattice_args_or_neighbor_idx):
     if type(lattice_args_or_neighbor_idx) == nn.FrozenDict:
