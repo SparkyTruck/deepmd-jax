@@ -1,24 +1,24 @@
+import os
+os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION']='.90'
 import jax.numpy as jnp
 import numpy as np
 from jax import jit, random, grad, vmap
 import flax.linen as nn
-import jax, sys, os, pickle, warnings
+import jax, sys, pickle, warnings
 from time import time
 from jax_md import space, quantity, simulate
 from jax.experimental import mesh_utils
-from jax.sharding import PositionalSharding
 sys.path.append(os.path.abspath('../'))
 from deepmd_jax.data import SingleDataSystem
 from deepmd_jax.dpmodel import DPModel
-from deepmd_jax.simulation_utils import NeighborListLoader
+from deepmd_jax.simulation_utils import NeighborListLoader, reorder_by_device
 K = jax.device_count() # Number of GPUs
-shard_each = PositionalSharding(mesh_utils.create_device_mesh((K,)))
+shard_each = jax.sharding.PositionalSharding(mesh_utils.create_device_mesh((K,)))
 shard_all = shard_each.replicate(axis=0, keepdims=True)
-np.set_printoptions(precision=4, suppress=True)
 print('Starting program on %d device(s):' % K, jax.devices())
 warnings.simplefilter(action='ignore', category=FutureWarning)
 warnings.simplefilter(action='ignore', category=UserWarning)
-
+np.set_printoptions(precision=4, suppress=True)
 precision        = '32' # '16' '32' '64'
 if precision == '32':
     jax.config.update('jax_default_matmul_precision', 'float32')
@@ -36,7 +36,7 @@ mass             = np.concatenate([15.9994 * np.ones(128), 1.00784 * np.ones(256
 use_neighborlist = True    # Do not use neighborlist if (1) box not orthorhombic or (2) rcut + rcut_buffer larger than box/2
 buffer_size      = 1.2     # For neighborlist, smaller is faster, but triggers more reallocations
 update_every     = 8      # Frequency of neighbor list update, it'll be automatically lowered if rcut_buffer overflows
-rcut_buffer      = [0.3, 0.6] # Within update_every steps, atoms(by type) should not move more than rcut_buffer
+rcut_buffer      = [0.2, 0.5] # Within update_every steps, atoms(by type) should not move more than rcut_buffer
 print_every      = 200 
 total_steps      = 1000000
 dataset          = SingleDataSystem(['/pscratch/sd/r/ruiqig/polaron_cp2k/aimd/aimd-water/water_128/'], ['coord', 'box', 'force', 'energy'])
@@ -45,7 +45,7 @@ chain_length     = 1     # Nose-Hoover chain length
 tau              = 2000  # Nose-Hoover relaxation time
 # prepare initial config numpy array in whatever way you like: coord (N,3), box (3,3) 
 coord, box, force = dataset.data['coord'][0].T, dataset.data['box'][0].T.astype(jnp.float32), dataset.data['force'][0].T
-L, M, N = 11, 11, 11
+L, M, N = 10, 10, 10
 coord = np.concatenate([(coord + i*box[0])[:,None] for i in range(L)], axis=1).reshape(-1,3)
 coord = np.concatenate([(coord + i*box[1])[:,None] for i in range(M)], axis=1).reshape(-1,3)
 coord = np.concatenate([(coord + i*box[2])[:,None] for i in range(N)], axis=1).reshape(-1,3)
@@ -55,19 +55,20 @@ box[0,0], box[1,1], box[2,2] = box[0,0]*L, box[1,1]*M, box[2,2]*N
 type_idx = dataset.type_idx * (L*M*N)
 # end
 coord = jax.device_put(coord, shard_all)
+box = jax.device_put(box, shard_all)
 displace, shift = space.periodic(np.diag(box) if dataset.ortho else box)
 
 with open(model_path, 'rb') as f:
     m = pickle.load(f)
-model, variables = m['model'], m['variables']
+model, variables = m['model'], jax.device_put(m['variables'], shard_all)
 model.params['Ebias'] = model.params['Ebias'].astype(jnp.float32)
 dataset.compute_lattice_candidate(model.params['rcut'])
+model_list, variables_list = [model], [variables]
 if use_model_devi:
-    model_list, variables_list = [model], [variables]
     for path in model_devi_paths:
         with open(path, 'rb') as f:
             m = pickle.load(f)
-            model_list.append(['model']), variables_list.append(['variables'])
+            model_list.append(['model']), variables_list.append(jax.device_put(m['variables'],shard_all))
 nbrs_list = None
 if use_neighborlist:
     rcut_all = model.params['rcut'] + np.array(rcut_buffer)
@@ -80,22 +81,24 @@ static_args = nn.FrozenDict({'lattice':dataset.get_batch(1)[1],
                              'type_idx':tuple(type_idx),
                              'ntype_idx':tuple(dataset.lattice_max*type_idx),
                              'K': K})
-@jit
-def energy_fn(coord, nbrs_list):
-    return model.apply(variables, coord.T, box.T, static_args, nbrs_list)[0]
+def get_energy_fn(model, variables):
+    def energy_fn(coord, nbrs_list):
+        coord = jax.device_put(reorder_by_device(coord, tuple(type_idx), K), shard_all)
+        return model.apply(variables, coord.T, box.T, static_args, nbrs_list)[0]
+    return jit(energy_fn)
+energy_fn = get_energy_fn(model, variables)
+energy_fns = [get_energy_fn(model, variables) for model, variables in zip(model_list, variables_list)]
 @jit
 def compute_model_devi(state, nbrs_list):
-    energy_fns = [lambda coord, nbrs_list: model.apply(variables, coord.T, box.T, static_args, nbrs_list)[0]
-                  for model, variables in zip(model_list, variables_list)]
     all_forces = jnp.array([-grad(energy_fn)(state.position, nbrs_list) for energy_fn in energy_fns])
     return jnp.std(all_forces, axis=0).max()
 print('Sanity check: NAtoms = ', len(coord), 'Energy = ', energy_fn(coord, nbrs_list),
       'Force error = ', ((force + jit(grad(energy_fn))(coord, nbrs_list))**2).mean()**0.5)
-
 init_fn, apply_fn = simulate.nvt_nose_hoover(energy_fn, shift, dt, temp, chain_length=chain_length, tau=tau) 
-state = init_fn(random.PRNGKey(0), coord, mass=mass, nbrs_list=nbrs_list)                          
+state = init_fn(random.PRNGKey(0), coord, mass=mass, nbrs_list=nbrs_list)  
 # init_fn, apply_fn = simulate.nve(energy, shift, dt)                                  # NVE
 # state = init_fn(random.PRNGKey(0), coord, mass=mass, kT=temp, nbrs_list=nbrs_list)   # NVE
+state_shard, nbrs_shard = jax.tree_util.tree_map(lambda x: x.sharding, state), jax.tree_util.tree_map(lambda x: x.sharding, nbrs_list)
 def step_fn(states, i):
     state, nbrs_list = states
     state = apply_fn(state, nbrs_list=nbrs_list)
@@ -127,6 +130,7 @@ while i < total_steps:
         (state, _), (pos, vel) = jax.lax.scan(step_fn, (state,None), None, print_every)
         i += print_every
     else:
+        state, nbrs_list = jax.device_put(state, state_shard), jax.device_put(nbrs_list, nbrs_shard)
         (state_new, nbrs_list_new), (pos, vel, rcut_overflow) = jax.lax.scan(multi_step_fn, (state,nbrs_list), None, print_every//update_every)
         if rcut_overflow.any():
             if update_every == 1:
@@ -138,6 +142,7 @@ while i < total_steps:
                 continue
         if any([nbrs.did_buffer_overflow for nbrs in nbrs_list_new]):
             nbrs_list = neighborlist.allocate(state.position)
+            nbrs_shard = jax.tree_util.tree_map(lambda x: x.sharding, nbrs_list)
             print('Warning: Neighbor list overflow; Reallocated with size', [nbrs.idx.shape[1] for nbrs in nbrs_list])
             continue
         state, nbrs_list = state_new, nbrs_list_new

@@ -22,8 +22,7 @@ class SingleDataSystem():
         self.data['box'] = self.data['box'].reshape(-1,3,3).transpose(0,2,1)
         self.ortho = not (self.data['box'] - vmap(jnp.diag)(vmap(jnp.diag)(self.data['box']))).any()
         self.data['coord'] = np.array(vmap(shift,(0,0,None))(self.data['coord'], self.data['box'], self.ortho))
-        print('SingleDataSystem loaded from: \n', ''.join(['\'%s\'\n' % abspath(path) for path in paths]),
-              'with', self.nframes, 'frames and', self.natoms, 'atoms per frame.')
+        print('Dataset loaded: %d frames/%d atoms. Path:'%(self.nframes,self.natoms), ''.join(['\n\t\'%s\'' % abspath(path) for path in paths]))
     
     def compute_lattice_candidate(self, rcut): # computes candidate lattice vectors within rcut for neighbor images
         recp_norm = jnp.linalg.norm((jnp.linalg.inv(self.data['box'])), axis=1) # (nframes, 3)
@@ -34,7 +33,7 @@ class SingleDataSystem():
         cand = self.data['box'] @ lattice_cand[None] # (nframes, 3, -1)
         self.lattice_cand = np.array(lattice_cand[:,(jnp.linalg.norm(cand[...,None]-self.data['coord'][:,:,None],axis=1).min(2)<rcut).any(0)]) # (3, -1)
         self.lattice_max = (jnp.linalg.norm(cand[...,None]-self.data['coord'][:,:,None],axis=1) < rcut).sum(1).max().item()
-        print('Lattice vectors computed with %d neighbor image condidates and max %d images.' % (self.lattice_cand.shape[1], self.lattice_max))
+        print('Lattice vectors for neighbor images: Max %d out of %d condidates.' % (self.lattice_max, self.lattice_cand.shape[1]))
 
     def get_batch(self, batch_size):
         if self.pointer + batch_size > self.nframes:
