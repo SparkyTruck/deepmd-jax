@@ -16,7 +16,7 @@ if precision == '64':
     jax.config.update('jax_enable_x64', True)
 
 # DP config parameters
-save_name      = 'trained_models/model_water_final_2.pkl' # model save name
+save_name      = 'trained_models/dpmp_water_1.pkl' # model save name
 # train_data     = SingleDataSystem(['data/polaron_train/'], ['coord', 'box', 'force', 'energy'])
 train_data     = SingleDataSystem(['/pscratch/sd/r/ruiqig/polaron_cp2k/aimd/aimd-water/water_128/'], ['coord', 'box', 'force', 'energy'])
 use_val_data   = True # if False, comment next line

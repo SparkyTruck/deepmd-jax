@@ -1,5 +1,5 @@
 import os
-os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION']='.90'
+# os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION']='90'
 import jax.numpy as jnp
 import numpy as np
 from jax import jit, random, grad, vmap
@@ -7,14 +7,14 @@ import flax.linen as nn
 import jax, sys, pickle, warnings
 from time import time
 from jax_md import space, quantity, simulate
-from jax.experimental import mesh_utils
 sys.path.append(os.path.abspath('../'))
 from deepmd_jax.data import SingleDataSystem
 from deepmd_jax.dpmodel import DPModel
-from deepmd_jax.simulation_utils import NeighborListLoader, reorder_by_device
+from deepmd_jax.utils import reorder_by_device
+from deepmd_jax.simulation_utils import NeighborListLoader
 K = jax.device_count() # Number of GPUs
-shard_each = jax.sharding.PositionalSharding(mesh_utils.create_device_mesh((K,)))
-shard_all = shard_each.replicate(axis=0, keepdims=True)
+shard_each = jax.sharding.PositionalSharding(jax.devices())
+shard_all = shard_each.replicate()
 print('Starting program on %d device(s):' % K, jax.devices())
 warnings.simplefilter(action='ignore', category=FutureWarning)
 warnings.simplefilter(action='ignore', category=UserWarning)
@@ -26,26 +26,26 @@ if precision == '64':
     jax.config.update('jax_enable_x64', True)
 
 # units in Angstrom, eV, fs
-model_path       = 'model_water_new.pkl'
+model_path       = 'trained_models/model_water_mp_final_1.pkl'
 save_prefix      = 'outdir/water_sim'
 use_model_devi   = False    # compute model deviation of different models
-model_devi_paths = ['model_water_new_2.pkl', 'model_water_new_3.pkl']  # All models must share the same rcut when using neighbor list
+model_devi_paths = ['model_water_new_2.pkl', 'model_water_new_3.pkl']
 dt               = 0.48
 temp             = 350 * 1.380649e-23 / 1.602176634e-19
 mass             = np.concatenate([15.9994 * np.ones(128), 1.00784 * np.ones(256)]) * 1.66053907e-27 * 1e10 / 1.602176634e-19
-use_neighborlist = True    # Do not use neighborlist if (1) box not orthorhombic or (2) rcut + rcut_buffer larger than box/2
-buffer_size      = 1.2     # For neighborlist, smaller is faster, but triggers more reallocations
+use_neighborlist = True   # Do not use neighborlist if (1) box not orthorhombic or (2) max(rcut) over all models + max(rcut_buffer) larger than box/2
+buffer_size      = 1.2    # Buffer for neighbor list (>1), increase it if there are frequent reallocations
 update_every     = 8      # Frequency of neighbor list update, it'll be automatically lowered if rcut_buffer overflows
-rcut_buffer      = [0.2, 0.5] # Within update_every steps, atoms(by type) should not move more than rcut_buffer
-print_every      = 200 
+rcut_buffer      = [0.3, 0.7] # Within update_every steps, atoms(by type) should not move more than rcut_buffer/2
+print_every      = 200    # Frequency of printing, as well as frequency of calculating model deviation
 total_steps      = 1000000
 dataset          = SingleDataSystem(['/pscratch/sd/r/ruiqig/polaron_cp2k/aimd/aimd-water/water_128/'], ['coord', 'box', 'force', 'energy'])
 save_every       = 1       
-chain_length     = 1     # Nose-Hoover chain length
-tau              = 2000  # Nose-Hoover relaxation time
+chain_length     = 1           # Nose-Hoover chain length
+tau              = 2000 * dt   # Nose-Hoover relaxation time
 # prepare initial config numpy array in whatever way you like: coord (N,3), box (3,3) 
 coord, box, force = dataset.data['coord'][0].T, dataset.data['box'][0].T.astype(jnp.float32), dataset.data['force'][0].T
-L, M, N = 10, 10, 10
+L, M, N = 8, 8, 8
 coord = np.concatenate([(coord + i*box[0])[:,None] for i in range(L)], axis=1).reshape(-1,3)
 coord = np.concatenate([(coord + i*box[1])[:,None] for i in range(M)], axis=1).reshape(-1,3)
 coord = np.concatenate([(coord + i*box[2])[:,None] for i in range(N)], axis=1).reshape(-1,3)
@@ -68,10 +68,10 @@ if use_model_devi:
     for path in model_devi_paths:
         with open(path, 'rb') as f:
             m = pickle.load(f)
-            model_list.append(['model']), variables_list.append(jax.device_put(m['variables'],shard_all))
+            model_list.append(m['model']), variables_list.append(jax.device_put(m['variables'],shard_all))
 nbrs_list = None
 if use_neighborlist:
-    rcut_all = model.params['rcut'] + np.array(rcut_buffer)
+    rcut_all = max([m.params['rcut'] for m in model_list]) + np.array(rcut_buffer)
     rbuffer_array = jnp.concatenate([np.ones(type_idx[i+1]-type_idx[i],dtype=np.float32)*rcut_buffer[i] for i in range(len(rcut_buffer))])
     neighborlist = NeighborListLoader(np.diag(box), type_idx, rcut_all, buffer_size, K)
     coord = coord % np.diag(box)

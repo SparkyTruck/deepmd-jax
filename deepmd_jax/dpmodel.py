@@ -67,9 +67,10 @@ class DPModel(nn.Module):
                             + jnp.tile(linear_norm(E)(T_3NC_n2[j][1]),(M//N,1))[:,None])).sum(0)
                             + embedR_nmE[i][j]    for j in range(Y)] for i in range(Y)]
             else: # message passing requires broadcasting over devices
-                nbrs_mn = [split(nbrs-type_idx[i]*K,type_idx,0,K=K) for i,nbrs in enumerate(nbrs_lists)]
-                shard = jax.sharding.PositionalSharding(jax.devices()).replicate()
-                T_ND_n2, T_3NC_n2 = lax.with_sharding_constraint([T_ND_n2, T_3NC_n2], shard)
+                nbrs_mn = [split(nbrs%type_idx[-1] + (nbrs//type_idx[-1])*(type_idx[i+1]-type_idx[i]) - type_idx[i],
+                                 type_idx, 0, K=K) for i, nbrs in enumerate(nbrs_lists)]
+                sharding = jax.sharding.PositionalSharding(jax.devices()).replicate()
+                T_ND_n2, T_3NC_n2 = lax.with_sharding_constraint([T_ND_n2, T_3NC_n2], sharding)
                 F_nmE = [[linear_norm(E)(T_ND_n2[i][0])[:,None]
                     + linear_norm(E)(T_ND_n2[j][1])[nbrs_mn[j][i]]
                     + (R_3nm[i][j][...,None] * (linear_norm(E)(T_3NC_n2[i][0])[:,:,None,]

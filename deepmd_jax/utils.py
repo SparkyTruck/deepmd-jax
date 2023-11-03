@@ -83,15 +83,15 @@ class embedding_net(nn.Module):
             else:
                 Z = self.widths[i] / self.widths[i-1]
                 assert Z.is_integer()
+                x_prev = jnp.repeat(x, int(Z), axis=-1)
                 if self.out_linear_only and i == len(self.widths) - 1:
-                    x = jnp.tile(nn.Dense(self.widths[i-1], kernel_init=linear_init, use_bias=False)(x), int(Z))
+                    x = jnp.repeat(nn.Dense(self.widths[i-1], kernel_init=linear_init, use_bias=False)(x), int(Z), axis=-1)
                 else:
-                    x_prev = x
                     x = nn.tanh(nn.Dense(self.widths[i], kernel_init=he_init, bias_init=std_init)(x))
                     if i in self.dt_layers:
-                        x = x * self.param('dt'+str(i), embed_dt_init, (self.widths[i],)) + jnp.tile(x_prev, int(Z))
+                        x = x * self.param('dt'+str(i), embed_dt_init, (self.widths[i],)) + x_prev
                     else:
-                        x += jnp.tile(x_prev, int(Z))
+                        x += x_prev
         return x
 
 class fitting_net(nn.Module):
