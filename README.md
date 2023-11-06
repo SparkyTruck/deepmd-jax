@@ -18,7 +18,7 @@ pip install ipykernel
 python -m ipykernel install --user --name deepmd-jax
 ```
 
-## Example scripts:
+## Example scripts
 - `examples/train.py`: train a model
 - `examples/evaluate.ipynb`: evaluate model predictions (These scripts should execute in seconds on GPUs)
 - `examples/simulate.py`: simulate a system in NVT/NVE ensemble with trained models
