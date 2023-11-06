@@ -20,8 +20,7 @@ def sr(r, rcut): # 1/r with smooth cutoff at rcut
 
 def split(array, type_idx, axis=0, K=1): # split array by idx into list of subarrays with device count K
     if K == 1:
-        return [lax.slice_in_dim(array, type_idx[i], type_idx[i+1], axis=axis) for i in range(len(type_idx)-1)]
-        # return jnp.split(array, type_idx[1:-1], axis)
+        return jnp.split(array, type_idx[1:-1], axis)
     if axis < 0:
         axis += len(array.shape)
     array = array.reshape(array.shape[:axis] + (K,-1) + array.shape[axis+1:])
@@ -82,8 +81,8 @@ class embedding_net(nn.Module):
                 x = nn.tanh(nn.Dense(self.widths[i], kernel_init=he_init, bias_init=std_init)(x))
             else:
                 Z = self.widths[i] / self.widths[i-1]
-                assert Z.is_integer()
-                x_prev = jnp.repeat(x, int(Z), axis=-1)
+                assert Z.is_integer() or (1/Z).is_integer()
+                x_prev = jnp.repeat(x, int(Z), axis=-1) if Z.is_integer() else x.reshape(x.shape[:-1]+(int(1/Z),-1)).mean(-2)
                 if self.out_linear_only and i == len(self.widths) - 1:
                     x = jnp.repeat(nn.Dense(self.widths[i-1], kernel_init=linear_init, use_bias=False)(x), int(Z), axis=-1)
                 else:
@@ -96,6 +95,7 @@ class embedding_net(nn.Module):
 
 class fitting_net(nn.Module):
     widths: list
+    use_final: bool = True
     @nn.compact
     def __call__(self, x):
         for i in range(len(self.widths)):
@@ -104,7 +104,8 @@ class fitting_net(nn.Module):
             if i > 0 and self.widths[i] == self.widths[i-1]:
                 dt = self.param('dt'+str(i), fit_dt_init, (self.widths[i],))
                 x = x * dt + x_prev 
-        x = nn.Dense(1, bias_init=zeros_init)(x)
+        if self.use_final:
+            x = nn.Dense(1, bias_init=zeros_init)(x)
         return x
 
 class linear_norm(nn.Module):

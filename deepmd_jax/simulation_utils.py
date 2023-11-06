@@ -11,7 +11,7 @@ class NeighborListLoader():
         self.type_idx, self.K, self.nbrlists = type_idx, K, []
         displace, _ = space.periodic(box)
         Kmask = get_mask_by_device(type_idx, K)
-        atom_count = (type_idx[1:] - type_idx[:-1])
+        atom_count = (np.array(type_idx[1:]) - np.array(type_idx[:-1]))
         type_idx_filled_each = np.cumsum(np.concatenate([[0], -(-atom_count//K)]))
         N_each = type_idx_filled_each[-1]
         for i in range(len(self.type_idx) - 1):

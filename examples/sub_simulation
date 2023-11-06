@@ -7,11 +7,7 @@
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=4
-#SBATCH --mail-type=begin        # send email when job begins
-#SBATCH --mail-type=end          # send email when job ends
-#SBATCH --mail-type=fail          # send email when job fails
-#SBATCH --mail-user=ruiqigao@princeton.edu
 
 module load python
 conda activate deepmd-jax
-python -u simulation_nvt.py > log_nvt
+python -u simulate.py > log

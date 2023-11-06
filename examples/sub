@@ -3,16 +3,12 @@
 #SBATCH -A m3538_g
 #SBATCH -C gpu
 #SBATCH -q shared
-#SBATCH -t 04:00:00
+#SBATCH -t 02:00:00
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1
-#SBATCH --mail-type=begin        # send email when job begins
-#SBATCH --mail-type=end          # send email when job ends
-#SBATCH --mail-type=fail          # send email when job fails
-#SBATCH --mail-user=ruiqigao@princeton.edu
 
 module load python
 conda activate deepmd-jax
-python -u train.py > outdir/log_dpmp_water_2.out
-# python -u train.py > outdir/log_dpmp_polaron_1.out
+python -u train.py > outdir/log_dpmp_water_1.out
+# python -u train2.py > outdir/log_dpmp_water_2.out
