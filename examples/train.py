@@ -4,7 +4,7 @@ import jax, optax, sys, os, pickle, datetime
 import flax.linen as nn
 from time import time
 from functools import partial
-# Path to deepmd_jax; change if you're running this script from a different directory
+# Path to deepmd_jax; change it if you're running this script from a different directory
 sys.path.append(os.path.abspath('../'))
 from deepmd_jax.data import DPDataset
 from deepmd_jax.dpmodel import DPModel

@@ -7,6 +7,7 @@ import flax.linen as nn
 import jax, sys, pickle, warnings
 from time import time
 from jax_md import space, quantity, simulate
+# Path to deepmd_jax; change it if you're running this script from a different directory
 sys.path.append(os.path.abspath('../'))
 from deepmd_jax.data import compute_lattice_candidate
 from deepmd_jax.dpmodel import DPModel
