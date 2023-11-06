@@ -1,6 +1,6 @@
 # Deepmd-JAX
 
-## Setting up environment:
+## Setting up environment
 ```bash
 conda create --name deepmd-jax python=3.10
 conda activate deepmd-jax 
@@ -8,6 +8,7 @@ pip install --upgrade "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-re
 pip install flax optax jax-md jaxopt matplotlib
 ```
 Please download the package and run the scripts in `examples/` folder. No installation is needed. Note that the package is still under development and the API can change in the future.
+
 To run in Jupyter notebooks, create a kernel by
 ```
 conda activate deepmd-jax 
@@ -15,7 +16,7 @@ pip install ipykernel
 python -m ipykernel install --user --name deepmd-jax
 ```
 
-Example scripts:
+## Example scripts:
 - `examples/train.py`: train a model
 - `examples/evaluate.ipynb`: evaluate model predictions (These scripts should execute in seconds on GPUs)
 - `examples/simulate.py`: simulate a system in NVT/NVE ensemble with trained models
