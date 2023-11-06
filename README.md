@@ -1,6 +1,6 @@
 # Deepmd-JAX
 
-Currently supports Deep Potential and Deep Wannier models.  Also, try the Deep Potential Message Passing (DP-MP) for more accuracy. The package is still under development and the API can change in the future.
+Currently supports Deep Potential and Deep Wannier models.  Also, try the Deep Potential Message Passing (DP-MP) model for more accuracy. The package is still under development and the API can change in the future.
 
 ## Setting up environment
 ```bash
