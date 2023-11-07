@@ -18,7 +18,7 @@ print('# Starting program on %d device(s):' % jax.device_count(), jax.devices())
 warnings.simplefilter(action='ignore', category=FutureWarning)
 warnings.simplefilter(action='ignore', category=UserWarning)
 np.set_printoptions(precision=4, suppress=True)
-precision        = '64' # '16' '32' '64', set precision here
+precision        = '32' # '16' '32' '64', set precision here
 if precision == '32':
     jax.config.update('jax_default_matmul_precision', 'float32')
 if precision == '64':
@@ -54,7 +54,7 @@ box = np.load(path + 'set.001/box.npy')[0].reshape(3, 3)
 type_list = np.genfromtxt(path + 'type.raw').astype(int)
 coord = np.concatenate([coord[type_list==i] for i in range(len(type_idx) - 1)])
 force = np.concatenate([force[type_list==i] for i in range(len(type_idx) - 1)])
-repeat = [1,1,1] # number of repeats in each direction x,y,z
+repeat = [3,3,3] # number of repeats in each direction x,y,z
 for k in range(3):
     coord = np.concatenate([(coord + i*box[k])[:,None] for i in range(repeat[k])], axis=1).reshape(-1,3)
 force = np.repeat(force, np.prod(repeat), axis=0)
@@ -128,7 +128,7 @@ def get_multi_step_fn(steps):
     return multi_step_fn
 multi_step_fn = get_multi_step_fn(update_every) if use_neighborlist else None
 print('# Step\tTemp\tKE\tPE\tInvariant\tModel Dev\ttime')
-print('################################################')
+print('####################################################################')
 pos_traj, vel_traj, model_devi_traj = [], [], []
 i, tic, NBRS_FLAG = 0, time(), False
 while i < total_steps:
