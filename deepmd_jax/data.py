@@ -73,7 +73,7 @@ class DPDataset():
         if self.is_leaf:
             return [(self.type_count, self.data['energy'].mean())]
         else:
-            return sum([subset._get_or_shift_energy_stats() for subset in self.subsets], [])
+            return sum([subset._get_energy_stats() for subset in self.subsets], [])
 
 def compute_lattice_candidate(boxes, rcut, print_message=False):
     # input boxes (nframes, 3, 3)
