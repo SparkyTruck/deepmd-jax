@@ -4,7 +4,7 @@ import jax, optax, sys, os, pickle, datetime
 import flax.linen as nn
 from time import time
 from functools import partial
-# Path to deepmd_jax; change it if you're running this script from a different directory
+# Path to deepmd_jax; change if you're running this script from a different directory
 sys.path.append(os.path.abspath('../'))
 from deepmd_jax.data import DPDataset
 from deepmd_jax.dpmodel import DPModel
@@ -18,29 +18,28 @@ if precision == '64':
     jax.config.update('jax_enable_x64', True)
 
 # Beginning config parameters; change as you need
-save_name      = 'trained_models/model_water_new.pkl' # model save path
+save_name      = 'trained_models/dp_polaron_tensor_1.pkl' # model save path
 model_type     = 'energy'      # 'energy': global scalar model; 'atomic': atomic vector model e.g. wannier 
 atomic_sel     = [0]           # select atom type for model predictions (only for 'atomic' model)
 # Please prepare your dataset in the same format as DeepMD-kit
-# You can use nested data paths like [[dat1,dat2],[dat3]]; but make sure dat1,dat2 have the same type_map
-train_data     = DPDataset(['/pscratch/sd/r/ruiqig/polaron_cp2k/aimd/aimd-water/water_128'], ['coord', 'box', 'force', 'energy'])
-# train_data     = DPDataset(['data/wannier_water/0data/'], ['coord', 'box', 'atomic_dipole'], {'atomic_sel':atomic_sel})
+# You can use lists of paths like [dat1,dat2] or [[dat1,dat2],[dat3]]; but make sure dat1,dat2 have the same type_map
+train_data     = DPDataset(['/pscratch/sd/r/ruiqig/polaron_cp2k/aimd/aimd-water/water_128', 'data/water_128_shifted'], ['coord', 'box', 'force', 'energy'])
 use_val_data   = True          # if False, comment next line
-train_data     = DPDataset(['/pscratch/sd/r/ruiqig/polaron_cp2k/aimd/aimd-water/water_128_val'], ['coord', 'box', 'force', 'energy'])# val_data       = DPDataset(['data/mdsim/lips/val/'], ['coord', 'box', 'force', 'energy'])
+val_data       = DPDataset(['/pscratch/sd/r/ruiqig/polaron_cp2k/aimd/aimd-water/water_128_val'], ['coord', 'box', 'force', 'energy'])
 rcut           = 6.0           # cutoff radius (Angstrom)
-use_2nd_tensor = True         # Use 2nd order tensor descriptor for more accuracy (usually recommended, slightly slower)
+use_2nd_tensor = True          # Use 2nd order tensor descriptor for more accuracy (recommended, slightly slower)
 use_mp         = False         # Use message passing (DP-MP) model for even more accuracy (slower)  
-embed_widths   = [16,32,64]    # # Recommended: [16,32,64] ([24,48,96] for accuracy) for DP; [32,32] for DP-MP
-embedMP_widths = [64,32,64]    # MP width; Recommended: [64,32,64] ([64,64,64] for accuracy, [32,32,32] for speed)
+embed_widths   = [32,32,64]    # Recommended: [32,32,64] (Try [48,48,96] for accuracy)
+embedMP_widths = [64,64]       # Used in MP; Recommended: [64,64] (Try [32,64] or [96,96], adjust according to embed_widths)
 fit_widths     = [64,64,64]    # For 'atomic' model, assert fit_widths[-1,] == embed_widths[-1](DP) or embedMP_widths[-1](DP-MP)
-axis_neurons   = 12            # Recommended: 8-12; Most of network parameters are in this layer
+axis_neurons   = 12            # Recommended: 8-16; Most of network parameters are in this layer
 batch_size     = 1             # training batch size, Recommended: labels_per_frame * batch_size in (128, 512)
 val_batch_size = 8             # validation batch size. Beware: too much can cause OOM error.
 lr             = 0.002         # learning rate at the beginning, Recommended: 1e-3 or 2e-3 for DP/DP-MP, 1e-2 for atomic
 s_pref_e       = 0.02          # starting prefactor for energy loss
-l_pref_e       = 1             # limit prefactor for energy loss
+l_pref_e       = 1             # limit prefactor for energy loss, increase this for more accurate energy prediction
 s_pref_f       = 1000          # starting prefactor for force loss
-l_pref_f       = 1             # limit prefactor for force loss
+l_pref_f       = 1             # limit prefactor for force loss, increase this for more accurate force prediction
 total_steps    = 500000        # total training steps; Recommended: 5e5-1e6 for DP/DP-MP, 5e4-2e5 for atomic
 print_every    = 1000          # print loss and conduct validation every print_every steps in output
 # parameters you usually don't need to worry about
@@ -51,8 +50,8 @@ decay_steps    = 5000          # learning rate decays every decay_steps
 getstat_bs     = 64            # batch size for computing model statistics at the beginning
 
 # From here on you don't need to change anything unless you know what you are doing
-model = DPModel({'embed_widths':embed_widths,
-                 'embedMP_widths':embedMP_widths if use_mp else None,
+model = DPModel({'embed_widths':embed_widths[:-1] if use_mp else embed_widths,
+                 'embedMP_widths':embed_widths[-1:] + embedMP_widths if use_mp else None,
                  'fit_widths':fit_widths,
                  'axis':axis_neurons,
                  'Ebias':train_data.fit_energy() if model_type == 'energy' else None,
@@ -107,7 +106,7 @@ def val_step(batch, variables, static_args):
         return loss_total
 
 tic = time()
-for iteration in range(total_steps):
+for iteration in range(total_steps+1):
     batch, type_idx, lattice_args = train_data.get_batch(batch_size)
     static_args = nn.FrozenDict({'type_idx':tuple(type_idx), 'lattice':lattice_args})
     variables, opt_state, state = train_step(batch, variables, opt_state, state, static_args)

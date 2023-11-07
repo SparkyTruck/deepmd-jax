@@ -19,11 +19,13 @@ python -m ipykernel install --user --name deepmd-jax
 ```
 
 ## Example scripts
-- `examples/train.py`: train a model
-- `examples/evaluate.ipynb`: evaluate model predictions (These scripts should execute in seconds on GPUs)
-- `examples/simulate.py`: simulate a system in NVT/NVE ensemble with trained models
-- `sub` and `sub_simulation`: example slurms scripts for running on clusters (here it is Perlmutter at NERSC).
+- `examples/train.py`: Training a model; you should prepare your data in the format of DeepMD-kit.
+- `examples/evaluate.ipynb`: Evaluating model predictions
+- `examples/simulate.py`: Simulating a system in NVT/NVE ensemble with trained models
+- `examples/sub` and `examples/sub_simulation`: Example slurms scripts for running on clusters (here it is Perlmutter@NERSC).
 
 You can modify the paramters inside the the scripts to fit your needs, or create you're own script from it.
 
-Note: In training, no neighbor list need to be used. In simulations, neighbor lists are only supported when the periodic box is orthorhombic and the model cutoff is less than half of the box length. For simulation with neighbor lists, currently multiple GPUs are supported but only on a single GPU node.
+Note: In training, no neighbor list need to be used. In simulations, neighbor lists are only supported when the periodic box is orthorhombic and the model cutoff is less than half of the box length. 
+
+Note: In the script `examples/simulate.py`, multiple GPU/TPU devices can be used for simulation with neighbor lists, but it only runs on a single compute node.

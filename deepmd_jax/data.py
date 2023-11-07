@@ -33,8 +33,8 @@ class DPDataset():
                                                    for i in params['atomic_sel']], axis=-1)
             self.data['box'] = self.data['box'].reshape(-1,3,3).transpose(0,2,1)
             self.data['coord'] = np.array(vmap(shift)(self.data['coord'], self.data['box']))
-            print('Dataset loaded: %d frames/%d atoms. Path:'%(self.nframes,self.natoms),
-                  ''.join(['\n\t\'%s\'' % abspath(path) for path in paths]))
+            print('# Dataset loaded: %d frames/%d atoms. Path:'%(self.nframes,self.natoms),
+                  ''.join(['\n# \t\'%s\'' % abspath(path) for path in paths]))
 
     def get_batch(self, batch_size):
         if not self.is_leaf:
@@ -89,5 +89,5 @@ def compute_lattice_candidate(boxes, rcut, print_message=False):
     lattice_cand = np.array(lattice_cand[:,(jnp.linalg.norm(cand[...,None]-trial_points[:,:,None],axis=1).min(2)<rcut).any(0)]) # (3, -1)
     lattice_max = (jnp.linalg.norm(cand[...,None]-trial_points[:,:,None],axis=1) < rcut).sum(1).max().item()
     if print_message:
-        print('Lattice vectors for neighbor images: Max %d out of %d condidates.' % (lattice_max, lattice_cand.shape[1]))
+        print('# Lattice vectors for neighbor images: Max %d out of %d condidates.' % (lattice_max, lattice_cand.shape[1]))
     return {'lattice_cand': tuple(map(tuple, lattice_cand)), 'lattice_max': lattice_max, 'ortho': ortho}

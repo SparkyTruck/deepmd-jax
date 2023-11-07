@@ -23,6 +23,8 @@ class NeighborListLoader():
             self.nbrlists.append(partition.neighbor_list(displace, box, rcut_all[i],
                 capacity_multiplier=size, custom_mask_function=mask_fn))
     def allocate(self, coord):
-        return [nbrlist.allocate(reorder_by_device(coord,tuple(self.type_idx),self.K)) for nbrlist in self.nbrlists]
+        nbrs_list = [nbrlist.allocate(reorder_by_device(coord,tuple(self.type_idx),self.K)) for nbrlist in self.nbrlists]
+        print('# Neighborlist allocated with size', [nbrs.idx.shape[1] for nbrs in nbrs_list])
+        return nbrs_list
     def update(self, coord, nbrs_list):
         return [nbrlist.update(reorder_by_device(coord,tuple(self.type_idx),self.K),nbrs) for nbrlist,nbrs in zip(self.nbrlists,nbrs_list)]
