@@ -19,12 +19,12 @@ python -m ipykernel install --user --name deepmd-jax
 ```
 
 ## Example scripts
-- `examples/train.py`: Training a model; you should prepare your data in the format of DeepMD-kit.
-- `examples/evaluate.ipynb`: Evaluating model predictions
-- `examples/simulate.py`: Simulating a system in NVT/NVE ensemble with trained models
-- `examples/sub` and `examples/sub_simulation`: Example slurms scripts for running on clusters (here it is Perlmutter@NERSC).
+- `examples/train.py`: Training a model. Note: You should prepare your data in the format of DeepMD-kit.
+- `examples/evaluate.ipynb`: Evaluating model predictions.
+- `examples/simulate.py`: Simulation in NVT/NVE with trained models (example is a H2O system).
+- `examples/sub` and `examples/sub_simulation`: Example slurms scripts for running on clusters.
 
-You can modify the paramters inside the the scripts to fit your needs, or create you're own script from it.
+You can modify the paramters inside the the scripts to fit your needs, or create your own script from it.
 
 Note: In training, no neighbor list need to be used. In simulations, neighbor lists are only supported when the periodic box is orthorhombic and the model cutoff is less than half of the box length. 
 
