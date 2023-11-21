@@ -7,7 +7,7 @@ Currently supports Deep Potential and Deep Wannier models.  Also, try the Deep P
 conda create --name deepmd-jax python=3.10
 conda activate deepmd-jax 
 pip install --upgrade "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-pip install flax optax jax-md jaxopt matplotlib
+pip install flax optax jax-md ase jaxopt matplotlib
 ```
 Please download the package and see the scripts in `examples/` folder. No installation required. 
 

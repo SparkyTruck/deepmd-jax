@@ -3,12 +3,15 @@
 #SBATCH -A m3538_g
 #SBATCH -C gpu
 #SBATCH -q shared
-#SBATCH -t 02:00:00
+#SBATCH -t 03:30:00
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1
 
 module load python
 conda activate deepmd-jax
-python -u train.py > outdir/log_dpmp_water_1.out
+python -u train.py > outdir/log_dp_water_compress.out
+# python -u train2.py > outdir/log_dpmp_polaronfull_2.out
+# python -u train3.py > outdir/log_dpmp_polaronwater_long.out
+# python -u train2.py > outdir/log_dpmp_polaron_full_2.out
 # python -u train2.py > outdir/log_dpmp_water_2.out
