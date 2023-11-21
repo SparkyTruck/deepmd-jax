@@ -3,14 +3,14 @@ import numpy as np
 deepmd_jax_path  = '../'               # Path to deepmd_jax package; change if you run this script at a different directory
 precision        = 'default'           # 'default'(fp32), 'low'(mixed 32-16), 'high'(fp64)
 # model_path       = 'trained_models/dpsr_chunyidplr.pkl'  # path to the trained model for simulation
-model_path       = 'trained_models/dp_water_compressed.pkl'  # path to the trained model for simulation
+model_path       = 'trained_models/new_dp_water_1024.pkl'  # path to the trained model for simulation
 save_path        = './'                # path to save trajectory
 save_prefix      = 'water'             # prefix for saved trajectory
 use_model_devi   = False               # compute model deviation of different models
 model_devi_paths = ['trained_models/dp_water_2.pkl', 'trained_models/dp_water_3.pkl']
-use_dplr         = False               # Use DPLR
+use_dplr         = False                # Use DPLR
 wannier_model    = 'trained_models/dw_chunyidplr_1.pkl'  # path to Wannier model in DPLR
-low_memory_mode  = False               # Reduce memory use, sacrificing speed; use only for huge systems with compressed models 
+memory_cap       = None                # Reduce memory use, sacrificing speed; only for compressed models; if not None, set it to e.g. 1e9, at large as possible so far as no OOM occurs
 # simulation parameters; all units in (Angstrom, eV, fs)
 dt               = 0.48                # time step (fs)
 temp             = 350 * 8.61733e-5    # temperature (Kelvin * unit_convert)
@@ -24,7 +24,7 @@ save_every       = 1                   # Frequency of recording trajectory
 rcut_buffer      = 1.                  # buffer radius (Angstrom) of neighborlist (can be a list for different types)
 # DPLR parameters
 beta             = 0.4                 # inverse spread of the point charge distribution
-resolution       = 0.2                 # grid length of particle mesh = resolution / beta
+resolution       = 0.2                 # particle mesh grid length = resolution / beta
 q_atoms          = [6, 1]              # charge of atomic cores, here Oxygen and Hydrogen
 q_wc             = [-8]                # charge of wannier center/centroid
 
@@ -47,7 +47,7 @@ force = np.load(path + 'set.001/force.npy')[0].reshape(-1, 3)
 box = np.load(path + 'set.001/box.npy')[0].reshape(3, 3)
 type_list = np.genfromtxt(path + 'type.raw')
 # Example 3: Repeating a prepared config to a larger system
-copy = [2,2,2] # number of copies in each direction x,y,z
+copy = [8,8,8] # number of copies in each direction x,y,z
 for k in range(3):
     coord = np.concatenate([(coord + i*box[k])[:,None] for i in range(copy[k])], axis=1).reshape(-1,3)
 box = np.diag(copy) @ box
@@ -73,15 +73,14 @@ if precision == 'default':
     jax.config.update('jax_default_matmul_precision', 'float32')
 if precision == 'high':
     jax.config.update('jax_enable_x64', True)
-if low_memory_mode:
-    utils.LOW_MEM_MODE = True
+utils.MEM_CAP = memory_cap
 # prepare configuation and model
 type_list = type_list.astype(int)
 def sort_type(x):             # atoms are sorted by type in simulation
-    return x[type_list.argsort()]
+    return x[type_list.argsort(kind='stable')]
 @jit
 def vmap_inv_sort_type(x):    # sort back to original order
-    return x[:,type_list.argsort().argsort()]
+    return x[:,type_list.argsort(kind='stable').argsort(kind='stable')]
 type_count = np.bincount(type_list)
 coord, force = sort_type(coord), None if not 'force' in vars() else sort_type(force)
 mass = jnp.repeat(mass, type_count)              # expand mass vector
@@ -99,7 +98,6 @@ static_args = nn.FrozenDict({'type_count':type_count, 'lattice':lattice_args})
 coord = jax.device_put(coord*jnp.ones(1), jax.sharding.PositionalSharding(jax.devices()).replicate())
 displace, shift = space.periodic(jnp.diag(box) if lattice_args['ortho'] else box)
 # prepare neighborlist
-use_neighborlist, nbrs_list = False, None
 if not lattice_args['ortho']:
     print('# Neighborlist disabled: Non-orthorhombic box.')
 elif rcut_max + np.array(rcut_buffer).max() > np.diag(box).min() / 2:
@@ -118,13 +116,14 @@ if not use_neighborlist and jax.device_count() > 1:
 def get_energy_fn(model, variables):
     if use_dplr:
         p3mlr_fn = utils.get_p3mlr_fn(np.diag(box), beta, resolution=resolution)
-        qatoms, qwc = jnp.repeat(q_atoms, type_count), jnp.repeat(q_wc, [type_count[i] for i in wmodel.params['nsel']])
+        qatoms = jnp.array(np.repeat(q_atoms, type_count))
+        qwc = jnp.array(np.repeat(q_wc, [type_count[i] for i in wmodel.params['nsel']]))
     def energy_fn(coord, nbrs_list):
         E = model.apply(variables, coord, box, static_args, nbrs_list)[0]
         if not use_dplr:
             return E
         else:
-            wc = model.wc_predict(wvariables, coord, box, static_args, nbrs_list)
+            wc = wmodel.wc_predict(wvariables, coord, box, static_args, nbrs_list)
             return E + p3mlr_fn(jnp.concatenate([coord, wc]), jnp.concatenate([qatoms, qwc]))
     return jit(energy_fn)
 energy_fn = get_energy_fn(model, variables) # for simulation

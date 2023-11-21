@@ -3,7 +3,7 @@ import jax
 from jax import lax, vmap, jacfwd
 import numpy as np
 import flax.linen as nn
-import pickle
+import pickle, os
 from functools import partial
 from scipy.interpolate import PPoly, BPoly
 
@@ -55,7 +55,7 @@ def get_relative_coord(coord_N3, box_33, type_count, lattice_args, nbrs_nm=None)
                     if X == Y:
                         x_N3M = x_N3MX.reshape(N,3,-1)
                     else:
-                        r_NMX = jnp.linalg.norm(jnp.where(jnp.abs(x_N3M) > 1e-15, x_N3M, 1e-15), axis=1)
+                        r_NMX = jnp.linalg.norm(jnp.where(jnp.abs(x_N3MX) > 1e-15, x_N3MX, 1e-15), axis=1)
                         idx_NMY = r_NMX.argpartition(lattice_args['lattice_max'], axis=-1)[:,:,:lattice_args['lattice_max']]
                         x_N3M = jnp.take_along_axis(x_N3MX, idx_NMY[:,None], axis=-1).reshape(N,3,-1)
                 r_NM = jnp.linalg.norm(jnp.where(jnp.abs(x_N3M) > 1e-15, x_N3M, 1e-15), axis=1)
@@ -77,7 +77,7 @@ linear_init = nn.initializers.variance_scaling(0.05, "fan_in", "truncated_normal
 ones_init = nn.initializers.ones_init()
 zeros_init = nn.initializers.zeros_init()
 
-LOW_MEM_MODE = False
+MEM_CAP = None
     
 class embedding_net(nn.Module):
     widths: list
@@ -114,8 +114,8 @@ class embedding_net(nn.Module):
             x = x[...,0] - srmin
             idx = (x / delta).astype(int)
             x0 = x - idx * delta
-            if LOW_MEM_MODE:
-                Nchunks = int(poly_coeff.shape[-1] * x.nbytes / (jax.device_count() * 2e8) + 1)
+            if MEM_CAP is not None:
+                Nchunks = int(poly_coeff.shape[-1] * x.nbytes / (jax.device_count() * MEM_CAP) + 1)
                 print(Nchunks)
                 pad = -len(idx) % Nchunks
                 idx = jnp.pad(idx,((0,pad),(0,0))).reshape(Nchunks, -1, idx.shape[1])
@@ -219,21 +219,34 @@ def load_model(path):
     print('# Model loaded from \'%s\'.' % path)
     return m['model'], jax.device_put(m['variables'], sharding)
 
+def save_dataset(target_path, labeled_data):
+    os.makedirs(target_path, exist_ok=True)
+    os.makedirs(target_path + '/set.000', exist_ok=True)
+    N = labeled_data['coord'].shape[0]
+    np.savetxt(target_path + '/type.raw', labeled_data['type'], fmt='%d')
+    for l in labeled_data:
+        if l == 'type': continue
+        labeled_data[l] = labeled_data[l].reshape(N,) if labeled_data[l].size == N else labeled_data[l].reshape(N,-1)
+        np.save(target_path + '/set.000/' + l + '.npy', labeled_data[l])
+    print('Saved dataset with %d frames to' % N, target_path)
+
 def compress_model(model, variables, Ngrids, rmin):
     model.params['is_compressed'] = True
-    # prepare list of names, widths, sr_ranges (srmin and srmax) for all compressible embedding nets
-    names = [net for net in variables['params']
-            if 'embed' in net and variables['params'][net]['Dense_0']['kernel'].shape[0] == 1]
     Y = len(model.params['sr_mean'])
+    Z = len(model.params['nsel']) if model.params['atomic'] else Y
+    # prepare list of names, widths, sr_ranges (srmin and srmax) for all compressible embedding nets
     sr_range = (np.array([0.,sr(rmin,model.params['rcut'])])-np.array(model.params['sr_mean'])[:,None])/np.array(model.params['sr_std'])[:,None]
     if model.params['use_mp']:
-        widths = Y**2*[model.params['embed_widths']+model.params['embedMP_widths'][:1]] + 2*Y**2*model.params['embed_widths']
-        sr_ranges = np.concatenate([np.repeat(sr_range, Y, axis=0), np.repeat(sr_range, 2*Y, axis=0)])
-        out_linear_onlys = Y**2*[True] + 2*Y**2*[False]
+        names = ['embedding_net_%d' % i for i in range(Y*Z + 2*Y**2)]
+        widths = Y*Z*[model.params['embed_widths']+model.params['embedMP_widths'][:1]] + 2*Y**2*[model.params['embed_widths']]
+        sr_ranges = np.concatenate([np.repeat(sr_range[model.params['nsel']] if model.params['atomic'] else sr_range, Y, axis=0),
+                                    np.tile(np.repeat(sr_range, Y, axis=0),(2,1))])
+        out_linear_onlys = Y*Z*[True] + 2*Y**2*[False]
     else:
-        widths = Y*(len(model.params['nsel']) if model.params['atomic'] else Y) * [model.params['embed_widths']]
+        names = ['embedding_net_%d' % i for i in range(Y*Z)]
+        widths = Y*Z * [model.params['embed_widths']]
         sr_ranges = np.repeat(sr_range[model.params['nsel']] if model.params['atomic'] else sr_range, Y, axis=0)
-        out_linear_onlys = Y**2 * [False]
+        out_linear_onlys = Y*Z * [False]
     # compute poly_coeff for each embedding net
     variables['compress_var'] = {}
     err0, err1, err2 = [], [], []
@@ -259,8 +272,8 @@ def compress_model(model, variables, Ngrids, rmin):
         err0.append(net.apply(var,r[...,None]) - net.apply(newvar,r[...,None],True))
         err1.append(vmap(jacfwd(lambda r: net.apply(var,r[...,None]) - net.apply(newvar,r[...,None],True)))(r))
         err2.append(vmap(jacfwd(jacfwd(lambda r: net.apply(var,r[...,None]) - net.apply(newvar,r[...,None],True))))(r))
-    err0, err1, err2 = jnp.concatenate(err0), jnp.concatenate(err1), jnp.concatenate(err2)
+    err0, err1, err2 = jnp.concatenate(err0,axis=None), jnp.concatenate(err1,axis=None), jnp.concatenate(err2,axis=None)
     print('# Model Compressed: %d embedding nets, %d intervals' % (len(names), Ngrids))
-    print('# (0,1,2)-order error: Mean = (%.2e, %.2e, %.2e), Max = (%.2e, %.2e, %.2e)'
+    print('# Compression (0,1,2)-order error: Mean = (%.2e,%.2e,%.2e), Max = (%.2e,%.2e,%.2e)'
             % (err0.mean(), err1.mean(), err2.mean(), err0.max(), err1.max(), err2.max()))
     return model, variables

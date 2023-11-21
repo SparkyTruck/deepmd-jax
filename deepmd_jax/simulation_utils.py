@@ -1,3 +1,4 @@
+# this module contains functions that requires jax_md
 import jax.numpy as jnp
 import jax
 from jax import lax

@@ -17,7 +17,6 @@ class DPModel(nn.Module):
         compress = self.params.get('is_compressed', False)
         if nbrs_lists is not None:
             K, type_count = jax.device_count(), static_args['type_count']
-            print(type_count)
             type_count_new = [-(-type_count[i])//K for i in range(len(type_count))]
             type_idx_new = np.cumsum([0] + list(type_count_new))
             sharding = jax.sharding.PositionalSharding(jax.devices()).reshape(K, 1)
@@ -27,7 +26,6 @@ class DPModel(nn.Module):
                 type_idx_new[-1]*K), type_count_new, K=K) for i, nbrs in enumerate(nbrs_idx)])]
             mask = get_mask_by_device(type_count)
             coord = lax.with_sharding_constraint(reorder_by_device(coord, tuple(type_count)), sharding.replicate())
-            print(type_count_new)
             return coord, type_count_new, nbrs_nm, mask, compress, K
         else:
             return coord, static_args['type_count'], None, jnp.ones_like(coord[:,0]), compress, 1
@@ -66,13 +64,14 @@ class DPModel(nn.Module):
             if nbrs_lists is not None:
                 sharding = jax.sharding.PositionalSharding(jax.devices()).replicate()
                 T_2_nD, T_2_n3C = lax.with_sharding_constraint([T_2_nD, T_2_n3C], sharding)
-            F_nselmE = [[linear_norm(E)(T_2_nD[0][i])[:,None]
+            F_nselmE = [[(linear_norm(E)(T_2_nD[0][i])[:,None]
                       + (linear_norm(E)(T_2_nD[1][j])[nbrs_nm[i][j]] if nbrs_lists is not None else
                          jnp.repeat(linear_norm(E)(T_2_nD[1][j]),L,axis=0))
                       + (R_n3m[i][j][...,None] * (linear_norm(E)(T_2_n3C[0][i])[:,:,None]
-                          + (linear_norm(E)(T_2_n3C[1][j])[nbrs_nm[i][j]] if nbrs_lists is not None else
+                          + (linear_norm(E)(T_2_n3C[1][j])[nbrs_nm[i][j]].transpose(0,2,1,3) if nbrs_lists is not None else
                             jnp.repeat(linear_norm(E)(T_2_n3C[1][j]),L,axis=0).transpose(1,0,2)))).sum(1)
-                      + emb for j,emb in enumerate(EMB)] for i,EMB in enumerate(embed_nselmE)]
+                      + emb) * (self.param('layer_norm_%d_%d'%(i,j), ones_init, (1,))**2 if self.params['atomic'] else 1)
+                        for j,emb in enumerate(EMB)] for i,EMB in zip(nsel,embed_nselmE)]
             T_NXW = concat([sum([embedding_net(self.params['embedMP_widths'], in_bias_only=True,
                         dt_layers=range(2,len(self.params['embedMP_widths'])))(f, reducer=rx)
                         for f,rx in zip(F,RX)]) for F,RX in zip(F_nselmE, R_nselXm)],K=K) / self.params['Nnbrs'] 

@@ -24,11 +24,11 @@ class DPDataset():
             for l in labels:
                 if l in ['coord', 'force']:
                     self.data[l] = self.data[l].reshape(self.data[l].shape[0],-1,3)
-                    self.data[l] = self.data[l][:,self.type.argsort()]
+                    self.data[l] = self.data[l][:,self.type.argsort(kind='stable')]
                 if 'atomic' in l:
                     self.data[l] = self.data[l].reshape(self.data[l].shape[0],-1,3)
                     sel_type = self.type[np.in1d(self.type, params['atomic_sel'])]
-                    self.data[l] = self.data[l][:,sel_type.argsort()]
+                    self.data[l] = self.data[l][:,sel_type.argsort(kind='stable')]
             self.data['box'] = self.data['box'].reshape(-1,3,3)
             self.data['coord'] = np.array(vmap(shift)(self.data['coord'], self.data['box']))
             print('# Dataset loaded: %d frames/%d atoms. Path:'%(self.nframes,self.natoms),

@@ -1,7 +1,7 @@
 # Config parameters
 deepmd_jax_path = '../'           # Path to deepmd_jax package; change if you run this script at a different directory
 precision       = 'default'       # 'default'(fp32), 'low'(mixed 32-16), 'high'(fp64)
-save_name       = 'trained_models/dp_water_compressed_new.pkl' # model save path
+save_name       = 'trained_models/new_dpmp_water32.pkl' # model save path
 model_type      = 'energy'        # 'energy' or 'atomic' (e.g. wannier)
 atomic_sel      = [0]             # select atom type for prediction (only for 'atomic' model)
 atomic_label    = 'atomic_dipole' # data file prefix for 'atomic' model; string must contain 'atomic'
@@ -18,11 +18,11 @@ val_paths       = ['/pscratch/sd/r/ruiqig/polaron_cp2k/aimd/polaron_full_val']
 
 # Model parameters
 rcut            = 6.0             # cutoff radius (Angstrom)
-use_2nd_tensor  = False           # Use 2nd order tensor descriptor for more accuracy, slightly slower
-use_mp          = False           # Use message passing (DP-MP) model for even more accuracy (slower) 
-compress        = True            # Compress model after training for faster inference. Rec: True  
+use_2nd_tensor  = True            # Use 2nd order tensor descriptor for more accuracy, slightly slower
+use_mp          = True            # Use message passing (DP-MP) model for even more accuracy (slower) 
+compress        = False            # Compress model after training for faster inference. Rec: True  
 embed_widths    = [32,32,64]      # Rec: [32,32,64] (for accuracy try [48,48,96])
-embedMP_widths  = [64,64]         # Rec: [64,64]; Only used in MP; (Try [32,64] or [96,96] according to embed_widths)
+embedMP_widths  = [32,64]         # Rec: [32,64]; Only used in MP; (Try [64,64] or [96,96] according to embed_widths)
 fit_widths      = [64,64,64]      # For 'atomic' model, fit_widths[-1] must equal embed_widths[-1](DP)/embedMP_widths[-1](DP-MP)
 axis_neurons    = 12              # Rec: 8-16
 
@@ -34,7 +34,7 @@ s_pref_e        = 0.02            # starting prefactor for energy loss
 l_pref_e        = 1               # limit prefactor for energy loss, increase for energy accuracy
 s_pref_f        = 1000            # starting prefactor for force loss
 l_pref_f        = 1               # limit prefactor for force loss, increase for force accuracy
-total_steps     = 500000          # total training steps. Rec: 1e6 for 'energy', 1e5 for 'atomic'
+total_steps     = 200000          # total training steps. Rec: 1e6 for 'energy', 1e5 for 'atomic'
 print_every     = 1000            # for printing loss and validation
 
 # parameters you usually don't need to change
@@ -83,17 +83,17 @@ if use_val_data:
 batch, type_count, lattice_args = train_data.get_batch(getstat_bs)
 static_args         = nn.FrozenDict({'type_count':type_count, 'lattice':lattice_args})
 model.get_stats(batch['coord'], batch['box'], static_args)
-print('# Model statistics computed.')
+print('# Model params:', model.params)
 variables           = model.init(random.PRNGKey(np.random.randint(42)), batch['coord'][0], batch['box'][0], static_args)
-print('# \'%s\' model initialized. Precision: %s. Parameter count: %d.' % (model_type,
-            {'default': 'fp32', 'low': 'tf32', 'high': 'fp64'}[precision], 
+print('# Model initialized. Precision: %s. Parameter count: %d.' % 
+            ({'default': 'fp32', 'low': 'fp32-16', 'high': 'fp64'}[precision], 
             sum(i.size for i in tree_util.tree_flatten(variables)[0])))
 lr_scheduler        = optax.exponential_decay(init_value=lr, transition_steps=decay_steps,
                         decay_rate=(lr_limit/lr)**(decay_steps/(total_steps-decay_steps)), transition_begin=0, staircase=True)
 optimizer           = optax.adam(learning_rate=lr_scheduler, b2=beta2)
 opt_state           = optimizer.init(variables)
 loss, loss_and_grad = model.get_loss_fn()
-print('# Optimizer initialized. Starting training...')
+print('# Optimizer initialized, lr starts from %.1e. Starting training...' % lr)
 
 state = {'loss_avg':0., 'iteration':0} | ({} if model_type == 'atomic' else {'le_avg':0., 'lf_avg':0.})
 @partial(jit, static_argnums=(4,))
@@ -146,5 +146,4 @@ if compress:
     model, variables = utils.compress_model(model, variables, compress_Ngrids, compress_rmin)
 utils.save_model(save_name, model, variables)
 T = int(time() - TIC)
-print('# Model saved to \'%s\'.' % save_name)
 print('# Training finished in %dh %dm %ds.' % (T//3600,(T%3600)//60,T%60))
