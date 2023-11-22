@@ -35,7 +35,7 @@ print_every     = 1000            # for printing loss and validation
 
 # parameters you usually don't need to change
 lr_limit        = 5e-7            # learning rate at end of training
-compress_Ngrids = 512             # Number of intervals used in compression
+compress_Ngrids = 1024            # Number of intervals used in compression
 compress_rmin   = 0.6             # Lower bound for interatomic distance in compression
 beta2           = 0.99            # adam optimizer parameter
 l_smoothing     = 20              # smoothing factor for loss printing
