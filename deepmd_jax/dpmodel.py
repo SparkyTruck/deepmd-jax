@@ -22,7 +22,7 @@ class DPModel(nn.Module):
             sharding = jax.sharding.PositionalSharding(jax.devices()).reshape(K, 1)
             nbrs_idx = [lax.with_sharding_constraint(nbrs.idx, sharding) for nbrs in nbrs_lists]
             nbrs_nm = [mlist for mlist in zip(*[split(jnp.where(nbrs < type_idx_new[-1]*K,
-                nbrs%type_idx_new[-1] - type_idx_new[i] + (nbrs//type_idx_new[-1]) * (type_count[i]),
+                nbrs%type_idx_new[-1] - type_idx_new[i] + (nbrs//type_idx_new[-1]) * (type_count_new[i]),
                 type_idx_new[-1]*K), type_count_new, K=K) for i, nbrs in enumerate(nbrs_idx)])]
             mask = get_mask_by_device(type_count)
             coord = lax.with_sharding_constraint(reorder_by_device(coord, tuple(type_count)), sharding.replicate())
@@ -52,7 +52,7 @@ class DPModel(nn.Module):
         # compute embedding net and atomic features T
         if not self.params.get('use_mp', False): # original DP without message passing
             T_NXW = concat([sum([embedding_net(self.params['embed_widths'])(sr[:,:,None],compress,rx) for sr,rx in
-                        zip(sr_centernorm_nm[nsel[i]], R_nselXm[i])]) for i in range(len(nsel))]) / self.params['Nnbrs']
+                        zip(sr_centernorm_nm[nsel[i]], R_nselXm[i])]) for i in range(len(nsel))], K=K) / self.params['Nnbrs']
         else: # Message Passing: Compute atomic features T; linear transform, add into F; Y=#types; B=2C, D=4C
             C, E = self.params['embed_widths'][-1], self.params['embedMP_widths'][0]
             embed_nselmE = [[embedding_net(self.params['embed_widths']+(E,), out_linear_only=True)(sr[:,:,None],

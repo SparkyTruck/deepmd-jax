@@ -1,20 +1,16 @@
 # Config parameters
 deepmd_jax_path = '../'           # Path to deepmd_jax package; change if you run this script at a different directory
 precision       = 'default'       # 'default'(fp32), 'low'(mixed 32-16), 'high'(fp64)
-save_name       = 'trained_models/new_dpmp_water32.pkl' # model save path
+save_name       = 'model.pkl'     # model save path
 model_type      = 'energy'        # 'energy' or 'atomic' (e.g. wannier)
 atomic_sel      = [0]             # select atom type for prediction (only for 'atomic' model)
 atomic_label    = 'atomic_dipole' # data file prefix for 'atomic' model; string must contain 'atomic'
 
 # Dataset in DeepMD-kit format; nested paths like [[dat1,dat2],[dat3]] allowed
 # Note: Here the atomic type index of dat1,dat2 must be the same, but that of dat3 can be different
-# train_paths     = ['data/chunyi_dplr/data/dipole_data']
-train_paths     = ['data/water_128_shifted/']
-# train_paths     = ['data/chunyi_dplr/data/energy_force_data/data_sr']
-# train_paths     = ['data/chunyi_dplr/data/energy_force_data/data/data' + str(i) for i in range(1,46)] \
-#                    + ['data/chunyi_dplr/data/energy_force_data/data/data_ex' + str(i) for i in range(1,7)]
+train_paths     = ['data_path']
 use_val_data    = False           # if not, next line is ignored
-val_paths       = ['/pscratch/sd/r/ruiqig/polaron_cp2k/aimd/polaron_full_val']
+val_paths       = ['val_data_path']
 
 # Model parameters
 rcut            = 6.0             # cutoff radius (Angstrom)
@@ -34,7 +30,7 @@ s_pref_e        = 0.02            # starting prefactor for energy loss
 l_pref_e        = 1               # limit prefactor for energy loss, increase for energy accuracy
 s_pref_f        = 1000            # starting prefactor for force loss
 l_pref_f        = 1               # limit prefactor for force loss, increase for force accuracy
-total_steps     = 200000          # total training steps. Rec: 1e6 for 'energy', 1e5 for 'atomic'
+total_steps     = 500000          # total training steps. Rec: 1e6 for 'energy', 1e5 for 'atomic'
 print_every     = 1000            # for printing loss and validation
 
 # parameters you usually don't need to change

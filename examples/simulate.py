@@ -2,14 +2,13 @@ import numpy as np
 # config parameters
 deepmd_jax_path  = '../'               # Path to deepmd_jax package; change if you run this script at a different directory
 precision        = 'default'           # 'default'(fp32), 'low'(mixed 32-16), 'high'(fp64)
-# model_path       = 'trained_models/dpsr_chunyidplr.pkl'  # path to the trained model for simulation
-model_path       = 'trained_models/new_dp_water_1024.pkl'  # path to the trained model for simulation
+model_path       = 'model.pkl'         # path to the trained model for simulation
 save_path        = './'                # path to save trajectory
 save_prefix      = 'water'             # prefix for saved trajectory
 use_model_devi   = False               # compute model deviation of different models
-model_devi_paths = ['trained_models/dp_water_2.pkl', 'trained_models/dp_water_3.pkl']
-use_dplr         = False                # Use DPLR
-wannier_model    = 'trained_models/dw_chunyidplr_1.pkl'  # path to Wannier model in DPLR
+model_devi_paths = ['model_2.pkl', 'model_3.pkl'] # paths to the models for model deviation
+use_dplr         = False               # Use DPLR
+wannier_model    = 'wanniermodel.pkl'  # path to Wannier model in DPLR
 memory_cap       = None                # Reduce memory use, sacrificing speed; only for compressed models; if not None, set it to e.g. 1e9, at large as possible so far as no OOM occurs
 # simulation parameters; all units in (Angstrom, eV, fs)
 dt               = 0.48                # time step (fs)
@@ -37,17 +36,13 @@ q_wc             = [-8]                # charge of wannier center/centroid
 #    - velocity, (N,3): initial velocity; if not provided, will be initialized by temperature
 #    - force, (N,3): ground truth force of initial config; if provided, will be used in initial model check
 # Here as an example we use a configuration from the training dataset
-path = '/pscratch/sd/r/ruiqig/polaron_cp2k/aimd/aimd-water/water_128/'
-# path = 'data/chunyi_dplr/data/energy_force_data/data/data21/'
-# coord = np.load(path + 'set.000/coord.npy')[0].reshape(-1, 3)
-# force = np.load(path + 'set.000/force.npy')[0].reshape(-1, 3)
-# box = np.load(path + 'set.000/box.npy')[0].reshape(3, 3)
+path = 'data_path'
 coord = np.load(path + 'set.001/coord.npy')[0].reshape(-1, 3)
 force = np.load(path + 'set.001/force.npy')[0].reshape(-1, 3)
 box = np.load(path + 'set.001/box.npy')[0].reshape(3, 3)
 type_list = np.genfromtxt(path + 'type.raw')
-# Example 3: Repeating a prepared config to a larger system
-copy = [8,8,8] # number of copies in each direction x,y,z
+# Example: Repeating a prepared config to a larger system
+copy = [4,4,4] # number of copies in each direction x,y,z
 for k in range(3):
     coord = np.concatenate([(coord + i*box[k])[:,None] for i in range(copy[k])], axis=1).reshape(-1,3)
 box = np.diag(copy) @ box
