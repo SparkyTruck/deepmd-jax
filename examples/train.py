@@ -15,8 +15,8 @@ val_paths       = ['val_data_path']
 # Model parameters
 rcut            = 6.0             # cutoff radius (Angstrom)
 use_2nd_tensor  = True            # Use 2nd order tensor descriptor for more accuracy, slightly slower
-use_mp          = True            # Use message passing (DP-MP) model for even more accuracy (slower) 
-compress        = False            # Compress model after training for faster inference. Rec: True  
+use_mp          = False           # Use message passing (DP-MP) model for even more accuracy (slower) 
+compress        = True            # Compress model after training for faster inference. Rec: True  
 embed_widths    = [32,32,64]      # Rec: [32,32,64] (for accuracy try [48,48,96])
 embedMP_widths  = [32,64]         # Rec: [32,64]; Only used in MP; (Try [64,64] or [96,96] according to embed_widths)
 fit_widths      = [64,64,64]      # For 'atomic' model, fit_widths[-1] must equal embed_widths[-1](DP)/embedMP_widths[-1](DP-MP)
