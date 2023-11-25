@@ -1,16 +1,13 @@
-deepmd_jax_path  = '../'           # Path to deepmd_jax package; change if you run this script at a different directory
 precision        = 'default'       # 'default'(fp32), 'low'(mixed 32-16), 'high'(fp64)
 model_path       = 'model.pkl'     # Path to the model file
 data_paths       = ['data/water_128'] # Path to the data files
 test_batch_size  = 8               # Batch size for testing
-
 import numpy as np
 import jax.numpy as jnp
 from jax import jit, vmap
-import jax, sys, os, datetime
+import jax, datetime
 import flax.linen as nn
 import matplotlib.pyplot as plt
-sys.path.append(os.path.abspath(deepmd_jax_path))
 from deepmd_jax import data, utils
 from deepmd_jax.dpmodel import DPModel
 if precision == 'default':

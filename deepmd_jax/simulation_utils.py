@@ -3,30 +3,54 @@ import jax.numpy as jnp
 import jax
 from jax import lax
 import numpy as np
-import flax.linen as nn
 from jax_md import space, partition
-from .utils import split, get_mask_by_device, reorder_by_device
+from .utils import split, get_mask_by_device, reorder_by_device, split
 
-class NeighborListLoader():
-    def __init__(self, box, type_count, rcut_all, size):
-        K = jax.device_count()
-        self.type_count, self.nbrlists = type_count, []
-        displace, _ = space.periodic(box)
-        Kmask = get_mask_by_device(type_count)
-        type_idx_filled_each = np.cumsum(np.concatenate([[0], -(-type_count//K)]))
-        N_each = type_idx_filled_each[-1]
-        for i in range(len(self.type_count)):
-            def mask_fn(idx, i=i):
-                idx = jax.device_put(idx, jax.sharding.PositionalSharding(jax.devices()).reshape(K,1))
-                cond = Kmask[:,None] * ((idx%N_each >= type_idx_filled_each[i]) * (idx%N_each < type_idx_filled_each[i+1]))
-                cond *= ~((idx//N_each == K-1) * (idx%N_each >= type_idx_filled_each[i+1] - (-type_count[i])%K)) 
-                return jnp.where(cond, idx, N_each * K)
-            self.nbrlists.append(partition.neighbor_list(displace, box, rcut_all[i],
-                capacity_multiplier=size, custom_mask_function=mask_fn))
+def get_type_mask_fns(type_count):
+    mask_fns = []
+    K = jax.device_count()
+    Kmask = get_mask_by_device(type_count)
+    type_idx_filled_each = np.cumsum(np.concatenate([[0], -(-type_count//K)]))
+    N_each = type_idx_filled_each[-1]
+    for i in range(len(type_count)):
+        def mask_fn(idx, i=i):
+            idx = jax.device_put(idx, jax.sharding.PositionalSharding(jax.devices()).reshape(K,1))
+            cond = Kmask[:,None] * ((idx%N_each >= type_idx_filled_each[i]) * (idx%N_each < type_idx_filled_each[i+1]))
+            cond *= ~((idx//N_each == K-1) * (idx%N_each >= type_idx_filled_each[i+1] - (-type_count[i])%K)) 
+            return jnp.where(cond, idx, N_each * K)
+        mask_fns.append(mask_fn)
+    return mask_fns
+class NeighborList():
+    def __init__(self, coord, box, type_count, rcut, dr_buffer, size):
+        self.type_count, self.box = tuple(type_count), box
+        self.mask_fns = get_type_mask_fns(np.array(type_count))
+        self.mask_fn = lambda idx: jax.device_put(idx, jax.sharding.PositionalSharding(jax.devices()).reshape(jax.device_count(),1))
+        self.rcut, self.dr_buffer, self.size = rcut, dr_buffer, size
     def allocate(self, coord):
-        nbrs_list = [nbrlist.allocate(reorder_by_device(coord,tuple(self.type_count))) for nbrlist in self.nbrlists]
-        print('# Neighborlist allocated with size', [nbrs.idx.shape[1] for nbrs in nbrs_list])
-        return nbrs_list
-    def update(self, coord, nbrs_list):
-        return [nbrlist.update(reorder_by_device(coord,tuple(self.type_count)),nbrs) for nbrlist,nbrs in zip(self.nbrlists,nbrs_list)]
-    
+        displace = space.periodic(self.box)[0]
+        test_nbr = [partition.neighbor_list(displace, self.box, self.rcut+self.dr_buffer, capacity_multiplier=self.size,
+                 custom_mask_function=fn).allocate(reorder_by_device(coord%self.box, self.type_count)) for fn in self.mask_fns]
+        test_all_nbr = partition.neighbor_list(displace, self.box, self.rcut+self.dr_buffer,
+                                               capacity_multiplier=1.).allocate(reorder_by_device(coord%self.box, self.type_count))
+        self.knbr = [nbr.idx.shape[1]+1 for nbr in test_nbr]
+        all_buffer = (sum(self.knbr)+1) / test_all_nbr.idx.shape[1]
+        print('# Neighborlist allocated with size', np.array(self.knbr)-1)
+        return partition.neighbor_list(displace, self.box, self.rcut, dr_threshold=self.dr_buffer, capacity_multiplier=all_buffer,
+                        custom_mask_function=self.mask_fn).allocate(reorder_by_device(coord % self.box, self.type_count))
+    def update(self, coord, nbrs):
+        return nbrs.update(reorder_by_device(coord%self.box, self.type_count))
+    def check_dr_overflow(self, coord, ref):
+        return (jnp.linalg.norm((coord-ref-self.box/2)
+                    %self.box - self.box/2, axis=-1) > self.dr_buffer/2).any()
+    def get_nm(self, nbrs):
+        K = jax.device_count()
+        sharding = jax.sharding.PositionalSharding(jax.devices()).reshape(K, 1)
+        nbr_idx = lax.with_sharding_constraint(nbrs.idx, sharding)
+        nbrs_idx = [-lax.top_k(-fn(nbr_idx), self.knbr[i])[0] for i, fn in enumerate(self.mask_fns)]
+        type_count_new = [-(-self.type_count[i]//K) for i in range(len(self.type_count))]
+        type_idx_new = np.cumsum([0] + list(type_count_new))
+        nbrs_nm = [mlist for mlist in zip(*[split(jnp.where(nbrs < type_idx_new[-1]*K,
+            nbrs%type_idx_new[-1] - type_idx_new[i] + (nbrs//type_idx_new[-1]) * (type_count_new[i]),
+            type_idx_new[-1]*K), type_count_new, K=K) for i, nbrs in enumerate(nbrs_idx)])]
+        overflow = jnp.array([(idx.max(axis=1)<type_idx_new[-1]*K).any() for idx in nbrs_idx]).any() | nbrs.did_buffer_overflow
+        return nbrs_nm, overflow

@@ -2,14 +2,20 @@
 
 Supports Deep Potential, Deep Wannier, and Long Range (DPLR) models. Also, try the Deep Potential Message Passing (DP-MP) model for more accuracy. 
 
-## Setting up environment
+## Installation
+We recommend using conda to create a new environment with the latest GPU version of JAX installed.
 ```bash
 conda create --name deepmd-jax python=3.10
 conda activate deepmd-jax 
 pip install --upgrade "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-pip install flax optax jax-md ase jaxopt matplotlib
 ```
-Please download the package and see the scripts in `examples/` folder. No installation required. 
+
+Then, download the package to some directory, and install it by
+```
+cd path/to/deepmd-jax
+conda activate deepmd-jax 
+pip install -e .
+```
 
 To run in Jupyter notebooks, create a kernel by
 ```

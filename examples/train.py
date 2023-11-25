@@ -1,5 +1,4 @@
 # Config parameters
-deepmd_jax_path = '../'           # Path to deepmd_jax package; change if you run this script at a different directory
 precision       = 'default'       # 'default'(fp32), 'low'(mixed 32-16), 'high'(fp64)
 save_name       = 'model.pkl'     # model save path
 model_type      = 'energy'        # 'energy' or 'atomic' (e.g. wannier)
@@ -8,9 +7,10 @@ atomic_label    = 'atomic_dipole' # data file prefix for 'atomic' model; string 
 
 # Dataset in DeepMD-kit format; nested paths like [[dat1,dat2],[dat3]] allowed
 # Note: Here the atomic type index of dat1,dat2 must be the same, but that of dat3 can be different
-train_paths     = ['data_path']
+# train_paths     = ['data/chunyi_dplr/data/dipole_data']
+train_paths     = ['train_path']  # paths to training data
 use_val_data    = False           # if not, next line is ignored
-val_paths       = ['val_data_path']
+val_paths       = ['val_path']    # paths to validation data
 
 # Model parameters
 rcut            = 6.0             # cutoff radius (Angstrom)
@@ -23,14 +23,14 @@ fit_widths      = [64,64,64]      # For 'atomic' model, fit_widths[-1] must equa
 axis_neurons    = 12              # Rec: 8-16
 
 # Training parameters
-batch_size      = 1               # training batch size; Rec: 128 <= labels_per_frame*batch_size <= 512
-val_batch_size  = 8               # validation batch size. Too much can cause OOM error.
-lr              = 0.002           # learning rate at start. Rec: 0.001/0.002 for 'energy', 0.01 for 'atomic'
+label_bs        = 160             # training batch size in Nlabels, Rec: 128-512; Nframes_per_batch = ceil(label_bs/Nlabels_per_frame)
+val_label_bs    = 1024            # validation batch size in Nlabels. Too much can cause OOM error.
+lr              = 0.001           # learning rate at start. Rec: 0.001/0.002 for 'energy', 0.01 for 'atomic'
 s_pref_e        = 0.02            # starting prefactor for energy loss
 l_pref_e        = 1               # limit prefactor for energy loss, increase for energy accuracy
 s_pref_f        = 1000            # starting prefactor for force loss
 l_pref_f        = 1               # limit prefactor for force loss, increase for force accuracy
-total_steps     = 500000          # total training steps. Rec: 1e6 for 'energy', 1e5 for 'atomic'
+total_steps     = 300000          # total training steps. Rec: 1e6 for 'energy', 1e5 for 'atomic'
 print_every     = 1000            # for printing loss and validation
 
 # parameters you usually don't need to change
@@ -45,13 +45,12 @@ getstat_bs      = 64              # batch size for computing model statistics at
 # From here on you don't need to change anything unless you know what you are doing
 import numpy as np
 from jax import jit, random, tree_util
-import jax, optax, sys, os, datetime
+import jax, optax, datetime
 import flax.linen as nn
 from time import time
 from functools import partial
-sys.path.append(os.path.abspath(deepmd_jax_path))
 from deepmd_jax import data, utils
-from deepmd_jax.dpmodel import DPModel, compress_model
+from deepmd_jax.dpmodel import DPModel
 if precision == 'default':
     jax.config.update('jax_default_matmul_precision', 'float32')
 if precision == 'high':
@@ -62,7 +61,10 @@ print('# Program start at', datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"
 labels = ['coord','box'] + (['force','energy'] if model_type == 'energy' else [atomic_label])
 train_data     = data.DPDataset(train_paths, labels, {'atomic_sel':atomic_sel})
 val_data       = data.DPDataset(val_paths, labels, {'atomic_sel':atomic_sel}) if use_val_data else None
-model = DPModel({'embed_widths':embed_widths[:-1] if use_mp else embed_widths,
+train_data.compute_lattice_candidate(rcut)
+if use_val_data:
+    val_data.compute_lattice_candidate(rcut)
+params = {'embed_widths':embed_widths[:-1] if use_mp else embed_widths,
                  'embedMP_widths':embed_widths[-1:] + embedMP_widths if use_mp else None,
                  'fit_widths':fit_widths,
                  'axis':axis_neurons,
@@ -72,18 +74,18 @@ model = DPModel({'embed_widths':embed_widths[:-1] if use_mp else embed_widths,
                  'use_mp':use_mp,
                  'atomic':True if model_type == 'atomic' else False,
                  'nsel':atomic_sel if model_type == 'atomic' else None,
-                 'out_norm': 1. if model_type == 'energy' else train_data.get_atomic_label_scale()})
-train_data.compute_lattice_candidate(rcut)
-if use_val_data:
-    val_data.compute_lattice_candidate(rcut)
-batch, type_count, lattice_args = train_data.get_batch(getstat_bs)
-static_args         = nn.FrozenDict({'type_count':type_count, 'lattice':lattice_args})
-model.get_stats(batch['coord'], batch['box'], static_args)
+                 'out_norm': 1. if model_type == 'energy' else train_data.get_atomic_label_scale()}
+data_stats = train_data.get_stats(rcut, getstat_bs)
+model = DPModel(params|data_stats)
 print('# Model params:', model.params)
+# initialize model variables
+batch, type_count, lattice_args = train_data.get_batch(1)
+static_args         = nn.FrozenDict({'type_count':type_count, 'lattice':lattice_args})
 variables           = model.init(random.PRNGKey(np.random.randint(42)), batch['coord'][0], batch['box'][0], static_args)
 print('# Model initialized. Precision: %s. Parameter count: %d.' % 
             ({'default': 'fp32', 'low': 'fp32-16', 'high': 'fp64'}[precision], 
             sum(i.size for i in tree_util.tree_flatten(variables)[0])))
+# initialize optimizer
 lr_scheduler        = optax.exponential_decay(init_value=lr, transition_steps=decay_steps,
                         decay_rate=(lr_limit/lr)**(decay_steps/(total_steps-decay_steps)), transition_begin=0, staircase=True)
 optimizer           = optax.adam(learning_rate=lr_scheduler, b2=beta2)
@@ -120,12 +122,12 @@ def val_step(batch, variables, static_args):
 
 tic = time()
 for iteration in range(total_steps+1):
-    batch, type_count, lattice_args = train_data.get_batch(batch_size)
+    batch, type_count, lattice_args = train_data.get_batch(label_bs, 'label')
     static_args = nn.FrozenDict({'type_count':tuple(type_count), 'lattice':lattice_args})
     variables, opt_state, state = train_step(batch, variables, opt_state, state, static_args)
     if iteration % print_every == 0:
         if use_val_data:
-            val_batch, type_count, lattice_args = val_data.get_batch(val_batch_size)
+            val_batch, type_count, lattice_args = val_data.get_batch(val_label_bs, 'label')
             static_args = nn.FrozenDict({'type_count':tuple(type_count), 'lattice':lattice_args})
             loss_val = val_step(val_batch, variables, static_args)
         beta = l_smoothing * (1 - (1/l_smoothing)**(iteration+1))

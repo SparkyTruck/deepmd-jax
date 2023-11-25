@@ -3,7 +3,7 @@ import jax.numpy as jnp
 from jax import vmap
 from glob import glob
 from os.path import abspath
-from .utils import shift
+from .utils import shift, get_relative_coord, sr
 
 class DPDataset():
     def __init__(self, paths, labels, params={}):
@@ -11,7 +11,11 @@ class DPDataset():
             self.is_leaf = False
             self.subsets = [DPDataset(path, labels, params) for path in paths]
             self.nframes = sum([subset.nframes for subset in self.subsets])
+            self.ntypes = max([subset.ntypes for subset in self.subsets])
+            [subset.fill_type(self.ntypes) for subset in self.subsets]
             self.prob = np.array([subset.nframes for subset in self.subsets]) / self.nframes
+            self.type_count = self.count_max()
+            self.valid_types = np.arange(self.ntypes)[self.type_count > 0]
         else:
             self.is_leaf = True
             self.type = np.genfromtxt(paths[0] + '/type.raw').astype(int)
@@ -21,30 +25,77 @@ class DPDataset():
             self.nframes = len(self.data['coord'])
             self.pointer = self.nframes
             self.type_count = np.array([(self.type == i).sum() for i in range(max(self.type)+1)])
+            self.ntypes = len(self.type_count)
+            self.nsel = params.get('atomic_sel', None)
+            if self.nsel is not None:
+                self.nsel = [i for i in self.nsel if i in range(self.ntypes)]
+            if any(['atomic' in l for l in labels]):
+                self.nlabels = sum(self.type_count[self.nsel])
+            else:
+                self.nlabels = self.natoms
             for l in labels:
                 if l in ['coord', 'force']:
                     self.data[l] = self.data[l].reshape(self.data[l].shape[0],-1,3)
                     self.data[l] = self.data[l][:,self.type.argsort(kind='stable')]
                 if 'atomic' in l:
                     self.data[l] = self.data[l].reshape(self.data[l].shape[0],-1,3)
-                    sel_type = self.type[np.in1d(self.type, params['atomic_sel'])]
+                    sel_type = self.type[np.in1d(self.type, self.nsel)]
                     self.data[l] = self.data[l][:,sel_type.argsort(kind='stable')]
             self.data['box'] = self.data['box'].reshape(-1,3,3)
             self.data['coord'] = np.array(vmap(shift)(self.data['coord'], self.data['box']))
             print('# Dataset loaded: %d frames/%d atoms. Path:'%(self.nframes,self.natoms),
                   ''.join(['\n# \t\'%s\'' % abspath(path) for path in paths]))
+            
+    def count_max(self):
+        if self.is_leaf:
+            return np.array(self.type_count)
+        else:
+            return np.array([subset.count_max() for subset in self.subsets]).max(0)
 
-    def get_batch(self, batch_size):
+    def fill_type(self, ntypes):
+        if not self.is_leaf:
+            [subset.fill_type(ntypes) for subset in self.subsets]
+        else:
+            self.type_count = np.pad(self.type_count, (0,ntypes-self.ntypes))
+
+    def _get_stats(self, rcut, bs):
+        if self.is_leaf:
+            batch = self.get_batch(bs)[0]
+            coord, box = batch['coord'], batch['box']
+            r_Bnm = vmap(get_relative_coord,(0,0,None,None))(coord, box, self.type_count, self.lattice_args)[1]
+            sr_BnM = [sr(jnp.concatenate(r,axis=-1), rcut) for r in r_Bnm]
+            sr_sum = np.array([sr.sum() for sr in sr_BnM])
+            sr_sum2 = np.array([(sr**2).sum() for sr in sr_BnM])
+            sr_count = np.array([(sr>1e-15).sum() for sr in sr_BnM])
+            Nnbrs = (np.concatenate(sr_BnM, axis=1) > 0).sum(2).mean() + 1
+            return np.array([sr_sum, sr_sum2, sr_count, Nnbrs*np.ones_like(sr_sum)]) # (4, ntypes)
+        else:
+            s = np.stack([subset._get_stats(rcut, bs) for subset in self.subsets], axis=-1)
+            return (s * self.prob).sum(-1)
+        
+    def get_stats(self, rcut, bs):
+        self.params = {'ntypes': self.ntypes, 'rcut': rcut}
+        sr_sum, sr_sum2, sr_count, Nnbrs = self._get_stats(rcut, bs)
+        sr_sum, sr_sum2, sr_count = sr_sum[self.valid_types], sr_sum2[self.valid_types], sr_count[self.valid_types]
+        self.params['valid_types'] = self.valid_types
+        self.params['sr_mean'] = sr_sum / sr_count
+        self.params['sr_std'] = np.sqrt(sr_sum2 / sr_count - self.params['sr_mean']**2)
+        self.params['Nnbrs'] = Nnbrs[0]
+        return self.params
+
+    def get_batch(self, batch_size, type='frame'):
         if not self.is_leaf:
             subset = np.random.choice(len(self.subsets), p=self.prob)
-            return self.subsets[subset].get_batch(batch_size)
+            return self.subsets[subset].get_batch(batch_size, type)
         else:
+            if type == 'label':
+                batch_size = int(batch_size / self.nlabels + 1)
             if self.pointer + batch_size > self.nframes:
                 self.pointer = 0
                 perm = np.random.permutation(self.nframes)
                 self.data = {l: self.data[l][perm] for l in self.data}
             batch = {'atomic' if 'atomic' in l else l:
-                     self.data[l][self.pointer:self.pointer+batch_size] for l in self.data}
+                     self.data[l][self.pointer:min(self.pointer+batch_size,self.nframes)] for l in self.data}
             self.pointer += batch_size
             return batch, tuple(self.type_count), self.lattice_args
 
@@ -58,6 +109,7 @@ class DPDataset():
     def fit_energy(self):
         energy_stats = self._get_energy_stats()
         type_count, energy_mean = [np.array(x) for x in zip(*energy_stats)]
+        type_count = type_count[:,self.valid_types]
         return np.linalg.lstsq(type_count, energy_mean, rcond=1e-3)[0].astype(np.float32)
     
     def get_atomic_label_scale(self):

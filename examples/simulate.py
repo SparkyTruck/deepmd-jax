@@ -1,6 +1,5 @@
 import numpy as np
 # config parameters
-deepmd_jax_path  = '../'               # Path to deepmd_jax package; change if you run this script at a different directory
 precision        = 'default'           # 'default'(fp32), 'low'(mixed 32-16), 'high'(fp64)
 model_path       = 'model.pkl'         # path to the trained model for simulation
 save_path        = './'                # path to save trajectory
@@ -9,7 +8,6 @@ use_model_devi   = False               # compute model deviation of different mo
 model_devi_paths = ['model_2.pkl', 'model_3.pkl'] # paths to the models for model deviation
 use_dplr         = False               # Use DPLR
 wannier_model    = 'wanniermodel.pkl'  # path to Wannier model in DPLR
-memory_cap       = None                # Reduce memory use, sacrificing speed; only for compressed models; if not None, set it to e.g. 1e9, at large as possible so far as no OOM occurs
 # simulation parameters; all units in (Angstrom, eV, fs)
 dt               = 0.48                # time step (fs)
 temp             = 350 * 8.61733e-5    # temperature (Kelvin * unit_convert)
@@ -20,7 +18,7 @@ tau              = 2000 * dt           # NH relaxation time in NVT
 total_steps      = 10000             # Total number of simulation steps
 print_every      = 100                 # Frequency of printing and calculating model deviation
 save_every       = 1                   # Frequency of recording trajectory
-rcut_buffer      = 1.                  # buffer radius (Angstrom) of neighborlist (can be a list for different types)
+dr_buffer        = 1.                  # buffer radius (Angstrom) of neighborlist
 # DPLR parameters
 beta             = 0.4                 # inverse spread of the point charge distribution
 resolution       = 0.2                 # particle mesh grid length = resolution / beta
@@ -54,10 +52,9 @@ force = np.repeat(force, np.prod(copy), axis=0)
 import jax.numpy as jnp
 from jax import jit, random, grad
 import flax.linen as nn
-import jax, sys, os, warnings
+import jax, warnings, os
 from time import time
 from jax_md import space, quantity, simulate
-sys.path.append(os.path.abspath(deepmd_jax_path))
 from deepmd_jax import data, utils, simulation_utils
 from deepmd_jax.dpmodel import DPModel
 print('# Starting program on %d device(s):' % jax.device_count(), jax.devices())
@@ -68,7 +65,6 @@ if precision == 'default':
     jax.config.update('jax_default_matmul_precision', 'float32')
 if precision == 'high':
     jax.config.update('jax_enable_x64', True)
-utils.MEM_CAP = memory_cap
 # prepare configuation and model
 type_list = type_list.astype(int)
 def sort_type(x):             # atoms are sorted by type in simulation
@@ -87,24 +83,24 @@ if use_model_devi:
         model_list.append(m), variables_list.append(v)
 if use_dplr:
     wmodel, wvariables = utils.load_model(wannier_model)
+type_count = np.pad(type_count, (0, model.params['ntypes'] - len(type_count)))
 rcut_max = max([m.params['rcut'] for m in model_list] + ([wmodel.params['rcut']] if use_dplr else []))
 lattice_args = data.compute_lattice_candidate(box[None], rcut_max)
 static_args = nn.FrozenDict({'type_count':type_count, 'lattice':lattice_args})
 coord = jax.device_put(coord*jnp.ones(1), jax.sharding.PositionalSharding(jax.devices()).replicate())
 displace, shift = space.periodic(jnp.diag(box) if lattice_args['ortho'] else box)
 # prepare neighborlist
+use_neighborlist, nbrs = False, None
 if not lattice_args['ortho']:
     print('# Neighborlist disabled: Non-orthorhombic box.')
-elif rcut_max + np.array(rcut_buffer).max() > np.diag(box).min() / 2:
+elif rcut_max + np.array(dr_buffer).max() > np.diag(box).min() / 2:
     print('# Neighborlist disabled: rcut + rcutbuffer larger than half of the box length.')
 else:
     use_neighborlist = True
     buffer_size = 1.2
     update_every = max([i for i in [1,2,3,4,5,10] if print_every % i == 0])
-    rcut_buffer = np.full(len(type_count), rcut_buffer) if np.array(rcut_buffer).size == 1 else np.array(rcut_buffer)
-    rbuffer_array = jnp.repeat(rcut_buffer, type_count)
-    neighborlist = simulation_utils.NeighborListLoader(np.diag(box), type_count, rcut_max+rcut_buffer, buffer_size)
-    nbrs_list = neighborlist.allocate(coord % jnp.diag(box))
+    nblist = simulation_utils.NeighborList(coord,np.diag(box),type_count,rcut_max,dr_buffer,buffer_size)
+    nbrs = nblist.allocate(coord)
 if not use_neighborlist and jax.device_count() > 1:
     print('# Warning: Multiple devices detected but program only runs on 1 device when neighborlist is disabled.')
 # prepare energy function
@@ -113,63 +109,66 @@ def get_energy_fn(model, variables):
         p3mlr_fn = utils.get_p3mlr_fn(np.diag(box), beta, resolution=resolution)
         qatoms = jnp.array(np.repeat(q_atoms, type_count))
         qwc = jnp.array(np.repeat(q_wc, [type_count[i] for i in wmodel.params['nsel']]))
-    def energy_fn(coord, nbrs_list):
-        E = model.apply(variables, coord, box, static_args, nbrs_list)[0]
+    def energy_fn(coord, nbrs_nm):
+        E = model.apply(variables, coord, box, static_args, nbrs_nm)[0]
         if not use_dplr:
             return E
         else:
-            wc = wmodel.wc_predict(wvariables, coord, box, static_args, nbrs_list)
+            wc = wmodel.wc_predict(wvariables, coord, box, static_args, nbrs_nm)
             return E + p3mlr_fn(jnp.concatenate([coord, wc]), jnp.concatenate([qatoms, qwc]))
     return jit(energy_fn)
 energy_fn = get_energy_fn(model, variables) # for simulation
 energy_fns = [get_energy_fn(model, variables) for model, variables in zip(model_list, variables_list)] # for model deviation
-print('# Model check: NAtoms = ', len(coord), 'Energy = ', energy_fn(coord,nbrs_list), + '' if not 'force' in vars() else
-        'Force error = ', ((force + jit(grad(energy_fn))(coord, nbrs_list))**2).mean()**0.5)
+nbrs_nm = None if not use_neighborlist else nblist.get_nm(nbrs)[0]
+print('# Model check: NAtoms =', len(coord), 'Energy = ', energy_fn(coord, nbrs_nm), + '' if not 'force' in vars() else
+        'Force error = ', ((force + jit(grad(energy_fn))(coord, nbrs_nm))**2).mean()**0.5)
 
 # Initialize simulation state
 TIC = time()
 if fix_type == 'NVT':
     init_fn, apply_fn = simulate.nvt_nose_hoover(energy_fn, shift, dt, temp, chain_length=chain_length, tau=tau) 
-    state = init_fn(random.PRNGKey(0), coord, mass=mass, nbrs_list=nbrs_list)
+    state = init_fn(random.PRNGKey(0), coord, mass=mass, nbrs_nm=nbrs_nm)
 elif fix_type == 'NVE':                    
     init_fn, apply_fn = simulate.nve(energy_fn, shift, dt)                               
-    state = init_fn(random.PRNGKey(0), coord, mass=mass, kT=temp, nbrs_list=nbrs_list)
+    state = init_fn(random.PRNGKey(0), coord, mass=mass, kT=temp, nbrs_nm=nbrs_nm)
 if 'velocity' in vars():
     state = state.set(momentum = state.mass * velocity)
-states_sharding = jax.tree_util.tree_map(lambda x: x.sharding, [state, nbrs_list])
+states_sharding = jax.tree_util.tree_map(lambda x: x.sharding, [state, nbrs])
 # Define step function
 def inner_step_fn(states, i): # inner_step_fn = 1 md step
-    state, nbrs_list = states
-    state = apply_fn(state, nbrs_list=nbrs_list)
-    return (state, nbrs_list), (state.position, state.velocity)
+    state, nbrs_nm = states
+    state = apply_fn(state, nbrs_nm=nbrs_nm)
+    return (state, nbrs_nm), (state.position, state.velocity)
 def get_step_fn():  # 1 step_fn = print_every steps        
     def multi_inner_step_fn(states, i): # multi_inner_step_fn = update_every steps + 1 step update neighborlist
-        state, nbrs_list = states
-        nbrs_list = neighborlist.update(state.position % jnp.diag(box), nbrs_list)
-        (state_new, _), (pos, vel) = jax.lax.scan(inner_step_fn, (state,nbrs_list), None, update_every)
-        rcut_overflow = (jnp.linalg.norm((state.position-pos-jnp.diag(box)/2)%jnp.diag(box)-jnp.diag(box)/2, axis=-1) > rbuffer_array/2).any()
-        return (state_new, nbrs_list), (pos, vel, rcut_overflow)
-    def step_fn(state, nbrs_list=None): 
+        state, nbrs = states
+        nbrs = nblist.update(state.position, nbrs)
+        nbrs_nm, buffer_overflow = nblist.get_nm(nbrs)
+        (state_new, _), (pos, vel) = jax.lax.scan(inner_step_fn, (state,nbrs_nm), None, update_every)
+        dr_overflow = nblist.check_dr_overflow(pos, state.position)
+        return (state_new, nbrs), (pos, vel, buffer_overflow, dr_overflow)
+    def step_fn(state, nbrs=None): 
         if not use_neighborlist:
             return jax.lax.scan(inner_step_fn, (state,None), None, print_every, unroll=1)
         else:
-            return jax.lax.scan(multi_inner_step_fn, (state, nbrs_list), None, print_every//update_every, unroll=1)
+            return jax.lax.scan(multi_inner_step_fn, (state, nbrs), None, print_every//update_every, unroll=1)
     return jit(step_fn)
 step_fn = get_step_fn()
 # jit functions for calculating quantities
 @jit
-def get_quantity(state, nbrs_list):
-    PE = energy_fn(state.position, nbrs_list=nbrs_list)
+def get_quantity(state, nbrs):
+    nbrs_nm = nblist.get_nm(nbrs)[0] if use_neighborlist else None
+    PE = energy_fn(state.position, nbrs_nm)
     T = quantity.temperature(velocity=state.velocity, mass=state.mass) / 1.380649e-23 * 1.602176634e-19
     KE = quantity.kinetic_energy(velocity=state.velocity, mass=state.mass)
     if fix_type == 'NVT':
-        inv = simulate.nvt_nose_hoover_invariant(energy_fn, state, temp, nbrs_list=nbrs_list)
+        inv = simulate.nvt_nose_hoover_invariant(energy_fn, state, temp, nbrs_nm=nbrs_nm)
     elif fix_type == 'NVE':
         inv = PE + KE
     return T, KE, PE, inv
 @jit
-def compute_model_devi(coord, nbrs_list):
-    all_forces = jnp.array([-grad(energy_fn)(coord, nbrs_list) for energy_fn in energy_fns])
+def compute_model_devi(coord, nbrs):
+    all_forces = jnp.array([-grad(energy_fn)(coord, nbrs) for energy_fn in energy_fns])
     return jnp.std(all_forces, axis=0).max()
 
 # Run simulation
@@ -178,38 +177,38 @@ print('####################################################################')
 pos_traj, vel_traj, model_devi_traj = [], [], []
 i, tic, NBRS_FLAG, save_idx = 0, time(), False, 0
 while i < total_steps:
-    T, KE, PE, inv = get_quantity(state, nbrs_list)
-    model_devi = compute_model_devi(state.position, nbrs_list) if use_model_devi else 0.
+    T, KE, PE, inv = get_quantity(state, nbrs)
+    model_devi = compute_model_devi(state.position, nbrs) if use_model_devi else 0.
     print('{}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.3f}\t{:.2f}'.format(
             i, T, KE, PE, inv, model_devi, (time() - tic)))
     tic = time()
     if not use_neighborlist:
         (state, _), (pos, vel) = step_fn(state)
     else:
-        state, nbrs_list = jax.device_put([state, nbrs_list], states_sharding)
-        (state_new, nbrs_list_new), (pos, vel, rcut_overflow) = step_fn(state, nbrs_list)
-        if any([nbrs.did_buffer_overflow for nbrs in nbrs_list_new]):
+        state, nbrs = jax.device_put([state, nbrs], states_sharding)
+        (state_new, nbrs_new), (pos, vel, buffer_overflow, dr_overflow) = step_fn(state, nbrs)
+        if buffer_overflow.any():
             if NBRS_FLAG:
                 NBRS_FLAG, buffer_size = False, buffer_size + 0.05
                 print('# Neighbor list overflow for a second time; Increasing buffer_size to', buffer_size)
-                neighborlist = simulation_utils.NeighborListLoader(jnp.diag(box),type_count,rcut_max+rcut_buffer,buffer_size)
-                nbrs_list = neighborlist.allocate(coord % jnp.diag(box))
+                nblist = simulation_utils.NeighborList(coord,np.diag(box),type_count,rcut_max,dr_buffer,buffer_size)
+                nbrs = nblist.allocate(coord)
             else:
                 NBRS_FLAG = True
-            nbrs_list = neighborlist.allocate(state.position % jnp.diag(box))
-            states_sharding = jax.tree_util.tree_map(lambda x: x.sharding, [state, nbrs_list])
+            nbrs = nblist.allocate(state.position)
+            states_sharding = jax.tree_util.tree_map(lambda x: x.sharding, [state, nbrs])
             continue
         NBRS_FLAG = False
-        if rcut_overflow.any():
+        if dr_overflow.any():
             if update_every == 1:
-                print('# Error: rcut_buffer overflow for a single step; Check for bugs or increase rcut_buffer')
+                print('# Error: dr_buffer overflow for a single step; Check for bugs or increase dr_buffer')
                 break
             else:
-                update_every = (update_every + 1) // 2
+                update_every = max([i for i in [1,2,3,4,5] if (print_every%i == 0 and i<update_every)])
                 step_fn = get_step_fn()
-                print('# rcut_buffer overflow; Decreasing update_every to', update_every)
+                print('# dr_buffer overflow; Decreasing update_every to', update_every)
                 continue
-        state, nbrs_list = state_new, nbrs_list_new
+        state, nbrs = state_new, nbrs_new
         pos, vel = pos.reshape(-1,pos.shape[2],3), vel.reshape(-1,vel.shape[2],3)
     i += print_every
     pos_traj.append(np.array(vmap_inv_sort_type(pos[save_every-1::save_every]), dtype=np.float32))

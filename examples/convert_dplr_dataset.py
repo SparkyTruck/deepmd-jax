@@ -2,7 +2,6 @@
 # This code typically runs within a minute on a GPU
 # Input a list of source datasets, output a single target dataset
 # Source datasets should have the same type index; if not, run the code for each group of sets with the same type index
-deepmd_jax_path    = '../'              # Path to deepmd_jax package; change if you run this script at a different directory
 precision          = 'default'          # 'default'(fp32), 'low'(mixed 32-16), 'high'(fp64)
 source_paths       = ['source_dataset_path'] # Path to the source data files
 target_path        = 'target_dataset_path'   # Path to the target data file
@@ -16,10 +15,9 @@ resolution         = 0.2                # particle mesh grid length = resolution
 import numpy as np
 import jax.numpy as jnp
 from jax import jit, value_and_grad
-import jax, sys, os, datetime
+import jax, datetime
 import flax.linen as nn
 from functools import partial
-sys.path.append(os.path.abspath(deepmd_jax_path))
 from deepmd_jax import data, utils
 from deepmd_jax.dpmodel import DPModel
 if precision == 'default':

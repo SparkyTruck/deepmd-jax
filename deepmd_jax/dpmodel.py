@@ -6,36 +6,29 @@ from .utils import *
 
 class DPModel(nn.Module):
     params: dict
-    def get_stats(self, coord_BN3, box_B33, static_args):
-        r_Bnm = vmap(get_relative_coord,(0,0,None,None))(coord_BN3, box_B33, static_args['type_count'], static_args['lattice'])[1]
-        sr_BnM = [sr(concat(r,axis=-1), self.params['rcut']) for r in r_Bnm]
-        self.params['sr_mean'] = [jnp.mean(i[i>1e-15]) for i in sr_BnM]
-        self.params['sr_std'] = [jnp.std(i[i>1e-15]) for i in sr_BnM]
-        self.params['Nnbrs'] = (concat(sr_BnM, axis=1) > 0).sum(2).mean() + 1
-
-    def organize(self, coord, static_args, nbrs_lists):
+    def get_input(self, coord, static_args, nbrs_nm):
+        type_count = np.pad(np.array(static_args['type_count']), (0,self.params['ntypes']-len(static_args['type_count'])))[self.params['valid_types']]
         compress = self.params.get('is_compressed', False)
-        if nbrs_lists is not None:
-            K, type_count = jax.device_count(), static_args['type_count']
-            type_count_new = [-(-type_count[i])//K for i in range(len(type_count))]
-            type_idx_new = np.cumsum([0] + list(type_count_new))
-            sharding = jax.sharding.PositionalSharding(jax.devices()).reshape(K, 1)
-            nbrs_idx = [lax.with_sharding_constraint(nbrs.idx, sharding) for nbrs in nbrs_lists]
-            nbrs_nm = [mlist for mlist in zip(*[split(jnp.where(nbrs < type_idx_new[-1]*K,
-                nbrs%type_idx_new[-1] - type_idx_new[i] + (nbrs//type_idx_new[-1]) * (type_count_new[i]),
-                type_idx_new[-1]*K), type_count_new, K=K) for i, nbrs in enumerate(nbrs_idx)])]
-            mask = get_mask_by_device(type_count)
-            coord = lax.with_sharding_constraint(reorder_by_device(coord, tuple(type_count)), sharding.replicate())
-            return coord, type_count_new, nbrs_nm, mask, compress, K
+        if self.params['atomic']:
+            nsel = [list(self.params['valid_types']).index(i) for i in self.params['nsel']]
         else:
-            return coord, static_args['type_count'], None, jnp.ones_like(coord[:,0]), compress, 1
+            nsel = list(range(len(type_count)))
+        if nbrs_nm is not None:
+            nbrs_nm = [[nbrs_nm[i][j] for j in self.params['valid_types']] for i in self.params['valid_types']]
+            K = jax.device_count()
+            type_count_new = [-(-type_count[i]//K) for i in range(len(type_count))]
+            mask = get_mask_by_device(type_count)
+            sharding = jax.sharding.PositionalSharding(jax.devices()).replicate()
+            coord = lax.with_sharding_constraint(reorder_by_device(coord, tuple(type_count)), sharding.replicate())
+            return coord, type_count_new, mask, compress, K, nsel, nbrs_nm
+        else:
+            return coord, type_count, jnp.ones_like(coord[:,0]), compress, 1, nsel, None
             
     @nn.compact
-    def __call__(self, coord_N3, box_33, static_args, nbrs_lists=None):
+    def __call__(self, coord_N3, box_33, static_args, nbrs_nm=None):
         # prepare input parameters
-        coord_N3, type_count, nbrs_nm, mask, compress, K = self.organize(coord_N3, static_args, nbrs_lists)
-        A, Y, L = self.params['axis'], len(type_count), static_args['lattice']['lattice_max'] if nbrs_nm is None else None
-        nsel = self.params['nsel'] if self.params['atomic'] else list(range(Y))
+        coord_N3, type_count, mask, compress, K, nsel, nbrs_nm = self.get_input(coord_N3, static_args, nbrs_nm)
+        A, L = self.params['axis'], static_args['lattice']['lattice_max'] if nbrs_nm is None else None
         # compute relative coordinates x_3NM, distance r_NM, s(r) and normalized s(r)
         x_n3m, r_nm = get_relative_coord(coord_N3, box_33, type_count, static_args.get('lattice',None), nbrs_nm)
         sr_nm = [[sr(r, self.params['rcut']) for r in R] for R in r_nm]
@@ -51,7 +44,7 @@ class DPModel(nn.Module):
                     for sr,r3,r6 in zip(sr_norm_nm[nsel[i]],R_n3m[nsel[i]],R_nsel6m[i])] for i in range(len(nsel))]
         # compute embedding net and atomic features T
         if not self.params.get('use_mp', False): # original DP without message passing
-            T_NXW = concat([sum([embedding_net(self.params['embed_widths'])(sr[:,:,None],compress,rx) for sr,rx in
+            T_NselXW = concat([sum([embedding_net(self.params['embed_widths'])(sr[:,:,None],compress,rx) for sr,rx in
                         zip(sr_centernorm_nm[nsel[i]], R_nselXm[i])]) for i in range(len(nsel))], K=K) / self.params['Nnbrs']
         else: # Message Passing: Compute atomic features T; linear transform, add into F; Y=#types; B=2C, D=4C
             C, E = self.params['embed_widths'][-1], self.params['embedMP_widths'][0]
@@ -61,35 +54,39 @@ class DPModel(nn.Module):
                         / self.params['Nnbrs'] for SR,R4 in zip(sr_centernorm_nm,R_n4m)] for _ in range(2)]
             T_2_nD = [[(t[:,:,None]*t[:,:,:4,None]).sum(1).reshape(-1,4*C) for t in T] for T in T_2_n4C]
             T_2_n3C = [[t[:,1:] for t in T] for T in T_2_n4C]
-            if nbrs_lists is not None:
+            if nbrs_nm is not None:
                 sharding = jax.sharding.PositionalSharding(jax.devices()).replicate()
                 T_2_nD, T_2_n3C = lax.with_sharding_constraint([T_2_nD, T_2_n3C], sharding)
             F_nselmE = [[(linear_norm(E)(T_2_nD[0][i])[:,None]
-                      + (linear_norm(E)(T_2_nD[1][j])[nbrs_nm[i][j]] if nbrs_lists is not None else
+                      + (linear_norm(E)(T_2_nD[1][j])[nbrs_nm[i][j]] if nbrs_nm is not None else
                          jnp.repeat(linear_norm(E)(T_2_nD[1][j]),L,axis=0))
                       + (R_n3m[i][j][...,None] * (linear_norm(E)(T_2_n3C[0][i])[:,:,None]
-                          + (linear_norm(E)(T_2_n3C[1][j])[nbrs_nm[i][j]].transpose(0,2,1,3) if nbrs_lists is not None else
+                          + (linear_norm(E)(T_2_n3C[1][j])[nbrs_nm[i][j]].transpose(0,2,1,3) if nbrs_nm is not None else
                             jnp.repeat(linear_norm(E)(T_2_n3C[1][j]),L,axis=0).transpose(1,0,2)))).sum(1)
                       + emb) * (self.param('layer_norm_%d_%d'%(i,j), ones_init, (1,))**2 if self.params['atomic'] else 1)
                         for j,emb in enumerate(EMB)] for i,EMB in zip(nsel,embed_nselmE)]
-            T_NXW = concat([sum([embedding_net(self.params['embedMP_widths'], in_bias_only=True,
+            T_NselXW = concat([sum([embedding_net(self.params['embedMP_widths'], in_bias_only=True,
                         dt_layers=range(2,len(self.params['embedMP_widths'])))(f, reducer=rx)
                         for f,rx in zip(F,RX)]) for F,RX in zip(F_nselmE, R_nselXm)],K=K) / self.params['Nnbrs'] 
         # compute fitting net with input G = T @ T_sub; energy is sum of output; A for any axis dimension
-        T_NW, T_N3W, T_N6W = T_NXW[:,0]+self.param('Tbias',zeros_init,T_NXW.shape[-1:]), T_NXW[:,1:4], T_NXW[:,4:] 
-        G_NAW = T_NW[:,None]*T_NW[:,:A,None] + (T_N3W[:,:,None]*T_N3W[:,:,:A,None]).sum(1)
+        T_NselW, T_Nsel3W, T_Nsel6W = T_NselXW[:,0]+self.param('Tbias',zeros_init,T_NselXW.shape[-1:]), T_NselXW[:,1:4], T_NselXW[:,4:] 
+        G_NselAW = T_NselW[:,None]*T_NselW[:,:A,None] + (T_Nsel3W[:,:,None]*T_Nsel3W[:,:,:A,None]).sum(1)
         if self.params['use_2nd']:
-            G2_axis_N6A = tensor_3to6(T_N3W[:,:,A:2*A], axis=1) + T_N6W[:,:,A:2*A]
-            G_NAW += (G2_axis_N6A[...,None] * T_N6W[:,:,None]).sum(1)
+            G2_axis_Nsel6A = tensor_3to6(T_Nsel3W[:,:,A:2*A], axis=1) + T_Nsel6W[:,:,A:2*A]
+            G_NselAW += (G2_axis_Nsel6A[...,None] * T_Nsel6W[:,:,None]).sum(1)
         if not self.params['atomic']: # Energy prediction
-            fit_n1 = [fitting_net(self.params['fit_widths'])(G) for G in split(G_NAW.reshape(G_NAW.shape[0],-1),type_count,0,K=K)]
+            fit_n1 = [fitting_net(self.params['fit_widths'])(G) for G in split(G_NselAW.reshape(G_NselAW.shape[0],-1),type_count,0,K=K)]
             pred = (mask * concat([f[:,0]+Eb for f,Eb in zip(fit_n1,self.params['Ebias'])], K=K)).sum()
         else: # Atomic tensor prediction
             sel_count = [type_count[i] for i in nsel]
-            fit_nW = [fitting_net(self.params['fit_widths'], use_final=False)(G) for G in split(G_NAW.reshape(G_NAW.shape[0],-1),sel_count,0,K=K)]
-            T_n3W = split(T_N3W, sel_count, 0, K=K)
-            pred = concat([(f[:,None]*T).sum(-1)[:static_args['type_count'][nsel[i]]] for i,(f,T) in enumerate(zip(fit_nW,T_n3W))])
-        debug = T_NXW
+            sharding = jax.sharding.PositionalSharding(jax.devices())
+            fit_nselW = [fitting_net(self.params['fit_widths'], use_final=False)(G) for G in split(G_NselAW.reshape(G_NselAW.shape[0],-1),sel_count,0,K=K)]
+            T_nsel3W = split(T_Nsel3W, sel_count, 0, K=K)
+            fit_nselW = [jax.lax.with_sharding_constraint(f, sharding.reshape(K,1)) for f in fit_nselW]
+            T_nsel3W = [jax.lax.with_sharding_constraint(T, sharding.reshape(K,1,1)) for T in T_nsel3W]
+            pred = concat([lax.with_sharding_constraint((f[:,None]*T).sum(-1)[:static_args['type_count'][self.params['nsel'][i]]],
+                            sharding.replicate()) for i,(f,T) in enumerate(zip(fit_nselW,T_nsel3W))])
+        debug = T_NselXW
         return pred * self.params['out_norm'], debug
 
     def energy_and_force(self, variables, coord_N3, box_33, static_args, nbrs_lists=None):
