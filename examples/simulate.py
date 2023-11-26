@@ -191,8 +191,7 @@ while i < total_steps:
             if NBRS_FLAG:
                 NBRS_FLAG, buffer_size = False, buffer_size + 0.05
                 print('# Neighbor list overflow for a second time; Increasing buffer_size to', buffer_size)
-                nblist = simulation_utils.NeighborList(coord,np.diag(box),type_count,rcut_max,dr_buffer,buffer_size)
-                nbrs = nblist.allocate(coord)
+                nblist = simulation_utils.NeighborList(state.position,np.diag(box),type_count,rcut_max,dr_buffer,buffer_size)
             else:
                 NBRS_FLAG = True
             nbrs = nblist.allocate(state.position)

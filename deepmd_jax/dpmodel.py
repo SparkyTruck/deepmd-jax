@@ -79,13 +79,9 @@ class DPModel(nn.Module):
             pred = (mask * concat([f[:,0]+Eb for f,Eb in zip(fit_n1,self.params['Ebias'])], K=K)).sum()
         else: # Atomic tensor prediction
             sel_count = [type_count[i] for i in nsel]
-            sharding = jax.sharding.PositionalSharding(jax.devices())
             fit_nselW = [fitting_net(self.params['fit_widths'], use_final=False)(G) for G in split(G_NselAW.reshape(G_NselAW.shape[0],-1),sel_count,0,K=K)]
-            T_nsel3W = split(T_Nsel3W, sel_count, 0, K=K)
-            fit_nselW = [jax.lax.with_sharding_constraint(f, sharding.reshape(K,1)) for f in fit_nselW]
-            T_nsel3W = [jax.lax.with_sharding_constraint(T, sharding.reshape(K,1,1)) for T in T_nsel3W]
-            pred = concat([lax.with_sharding_constraint((f[:,None]*T).sum(-1)[:static_args['type_count'][self.params['nsel'][i]]],
-                            sharding.replicate()) for i,(f,T) in enumerate(zip(fit_nselW,T_nsel3W))])
+            T_nsel3W = split(T_Nsel3W, sel_count, 0, K=K)            
+            pred = concat([(f[:,None]*T).sum(-1)[:static_args['type_count'][self.params['nsel'][i]]] for i,(f,T) in enumerate(zip(fit_nselW,T_nsel3W))])
         debug = T_NselXW
         return pred * self.params['out_norm'], debug
 

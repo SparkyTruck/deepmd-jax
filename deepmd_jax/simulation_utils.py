@@ -28,15 +28,15 @@ class NeighborList():
         self.rcut, self.dr_buffer, self.size = rcut, dr_buffer, size
     def allocate(self, coord):
         displace = space.periodic(self.box)[0]
-        test_nbr = [partition.neighbor_list(displace, self.box, self.rcut+self.dr_buffer, capacity_multiplier=self.size,
-                 custom_mask_function=fn).allocate(reorder_by_device(coord%self.box, self.type_count)) for fn in self.mask_fns]
-        test_all_nbr = partition.neighbor_list(displace, self.box, self.rcut+self.dr_buffer,
-                                               capacity_multiplier=1.).allocate(reorder_by_device(coord%self.box, self.type_count))
-        self.knbr = [nbr.idx.shape[1]+1 for nbr in test_nbr]
-        all_buffer = (sum(self.knbr)+1) / test_all_nbr.idx.shape[1]
+        coord = reorder_by_device(coord%self.box, self.type_count)
+        test_nbr = partition.neighbor_list(displace, self.box, self.rcut+self.dr_buffer,
+                                               capacity_multiplier=1.).allocate(coord)
+        self.knbr = np.array([int(((fn(test_nbr.idx)<len(coord)).sum(1).max())*self.size) for fn in self.mask_fns])
+        self.knbr = np.where(self.knbr==0, 1, self.knbr + 1 + max(int(20*(self.size-1.2)),0))
+        all_buffer = (sum(self.knbr)+1) / test_nbr.idx.shape[1]
         print('# Neighborlist allocated with size', np.array(self.knbr)-1)
         return partition.neighbor_list(displace, self.box, self.rcut, dr_threshold=self.dr_buffer, capacity_multiplier=all_buffer,
-                        custom_mask_function=self.mask_fn).allocate(reorder_by_device(coord % self.box, self.type_count))
+                        custom_mask_function=self.mask_fn).allocate(coord)
     def update(self, coord, nbrs):
         return nbrs.update(reorder_by_device(coord%self.box, self.type_count))
     def check_dr_overflow(self, coord, ref):

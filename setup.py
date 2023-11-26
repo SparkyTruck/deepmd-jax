@@ -6,7 +6,7 @@ setup(
     packages=find_packages(),
     install_requires=[
         'jax>=0.4.19',
-        'flax', 'optax', 'jax-md', 'ase', 'jaxopt', 'matplotlib'
+        'flax', 'optax', 'jax-md', 'ase', 'jaxopt', 'matplotlib', 'gpustat'
     ],
     author='Ruiqi Gao',
     author_email='ruiqigao@princeton.edu',
