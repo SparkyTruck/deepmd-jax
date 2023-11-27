@@ -27,9 +27,9 @@ python -m ipykernel install --user --name deepmd-jax
 ## Example scripts
 Examples are mostly based on an H2O system.
 - `examples/train.py`: Training a model. Note: You should prepare your data in the format of DeepMD-kit.
+- `examples/simulate.py`: Simulation in NVT/NVE with trained models.
 - `examples/evaluate.py`: Evaluating model predictions.
 - `examples/convert_dplr_dataset.py`: Convert dataset to short range part used in DPLR.
-- `examples/simulate.py`: Simulation in NVT/NVE with trained models.
 - `examples/sub`: Example slurms scripts for running on clusters.
 
 You can modify the paramters inside the the scripts to fit your needs, or create your own script from it.
