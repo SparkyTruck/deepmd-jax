@@ -168,7 +168,8 @@ def get_quantity(state, nbrs):
     return T, KE, PE, inv
 @jit
 def compute_model_devi(coord, nbrs):
-    all_forces = jnp.array([-grad(energy_fn)(coord, nbrs) for energy_fn in energy_fns])
+    nbrs_nm = nblist.get_nm(nbrs)[0] if use_neighborlist else None
+    all_forces = jnp.array([-grad(energy_fn)(coord, nbrs_nm) for energy_fn in energy_fns])
     return jnp.std(all_forces, axis=0).max()
 
 # Run simulation
