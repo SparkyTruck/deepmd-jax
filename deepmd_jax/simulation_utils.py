@@ -36,7 +36,7 @@ class NeighborList():
         self.mask_fn = get_full_mask_fn(np.array(type_count))
         self.rcut, self.size = rcut, size
     def canonicalize(self, coord):
-        coord = (coord.astype(jnp.float32) % self.box) * (1-1e-7) + 1e-7 # avoid numerical error at box boundary
+        coord = (coord.astype(jnp.float32) % self.box) * (1-2e-7) + 1e-7*self.box # avoid numerical error at box boundary
         return reorder_by_device(coord, self.type_count)
     def allocate(self, coord):
         displace = space.periodic(self.box)[0]
