@@ -10,9 +10,9 @@ conda activate deepmd-jax
 pip install --upgrade "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 ```
 
-Then, download the package to some directory, and install it by
+Then, download the package to some path, and install it by
 ```
-cd path/to/deepmd-jax
+cd your_path/deepmd-jax
 conda activate deepmd-jax 
 pip install -e .
 ```

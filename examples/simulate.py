@@ -1,6 +1,6 @@
 import numpy as np
 # config parameters
-precision        = 'default'           # 'default'(fp32), 'low'(mixed 32-16), 'high'(fp64)
+precision        = 'high'              # 'default'(fp32), 'low'(mixed 32-16), 'high'(fp64); if not 'high', expect a slight energy/momentum drift
 model_path       = 'model.pkl'         # path to the trained model for simulation
 save_path        = './'                # path to save trajectory
 save_prefix      = 'water'             # prefix for saved trajectory
@@ -94,12 +94,12 @@ use_neighborlist, nbrs = False, None
 if not lattice_args['ortho']:
     print('# Neighborlist disabled: Non-orthorhombic box.')
 elif rcut_max + np.array(dr_buffer).max() > np.diag(box).min() / 2:
-    print('# Neighborlist disabled: rcut + rcutbuffer larger than half of the box length.')
+    print('# Neighborlist disabled: rcut + dr_buffer larger than half of the box length.')
 else:
     use_neighborlist = True
     buffer_size = 1.2
     update_every = max([i for i in [1,2,3,4,5,10] if print_every % i == 0])
-    nblist = simulation_utils.NeighborList(coord,np.diag(box),type_count,rcut_max,dr_buffer,buffer_size)
+    nblist = simulation_utils.NeighborList(np.diag(box),type_count,rcut_max+dr_buffer,buffer_size)
     nbrs = nblist.allocate(coord)
 if not use_neighborlist and jax.device_count() > 1:
     print('# Warning: Multiple devices detected but program only runs on 1 device when neighborlist is disabled.')
@@ -145,7 +145,7 @@ def get_step_fn():  # 1 step_fn = print_every steps
         nbrs = nblist.update(state.position, nbrs)
         nbrs_nm, buffer_overflow = nblist.get_nm(nbrs)
         (state_new, _), (pos, vel) = jax.lax.scan(inner_step_fn, (state,nbrs_nm), None, update_every)
-        dr_overflow = nblist.check_dr_overflow(pos, state.position)
+        dr_overflow = nblist.check_dr_overflow(pos, state.position, dr_buffer)
         return (state_new, nbrs), (pos, vel, buffer_overflow, dr_overflow)
     def step_fn(state, nbrs=None): 
         if not use_neighborlist:
@@ -191,7 +191,7 @@ while i < total_steps:
             if NBRS_FLAG:
                 NBRS_FLAG, buffer_size = False, buffer_size + 0.05
                 print('# Neighbor list overflow for a second time; Increasing buffer_size to', buffer_size)
-                nblist = simulation_utils.NeighborList(state.position,np.diag(box),type_count,rcut_max,dr_buffer,buffer_size)
+                nblist = simulation_utils.NeighborList(np.diag(box),type_count,rcut_max+dr_buffer,buffer_size)
             else:
                 NBRS_FLAG = True
             nbrs = nblist.allocate(state.position)

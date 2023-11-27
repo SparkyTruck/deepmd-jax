@@ -18,8 +18,7 @@ class DPModel(nn.Module):
             K = jax.device_count()
             type_count_new = [-(-type_count[i]//K) for i in range(len(type_count))]
             mask = get_mask_by_device(type_count)
-            sharding = jax.sharding.PositionalSharding(jax.devices()).replicate()
-            coord = lax.with_sharding_constraint(reorder_by_device(coord, tuple(type_count)), sharding.replicate())
+            coord = reorder_by_device(coord, type_count)
             return coord, type_count_new, mask, compress, K, nsel, nbrs_nm
         else:
             return coord, type_count, jnp.ones_like(coord[:,0]), compress, 1, nsel, None
@@ -81,7 +80,8 @@ class DPModel(nn.Module):
             sel_count = [type_count[i] for i in nsel]
             fit_nselW = [fitting_net(self.params['fit_widths'], use_final=False)(G) for G in split(G_NselAW.reshape(G_NselAW.shape[0],-1),sel_count,0,K=K)]
             T_nsel3W = split(T_Nsel3W, sel_count, 0, K=K)            
-            pred = concat([(f[:,None]*T).sum(-1)[:static_args['type_count'][self.params['nsel'][i]]] for i,(f,T) in enumerate(zip(fit_nselW,T_nsel3W))])
+            pred = concat([lax.with_sharding_constraint((f[:,None]*T).sum(-1)[:static_args['type_count'][self.params['nsel'][i]]],
+                jax.sharding.PositionalSharding(jax.devices()).replicate()) for i,(f,T) in enumerate(zip(fit_nselW,T_nsel3W))])
         debug = T_NselXW
         return pred * self.params['out_norm'], debug
 
@@ -89,10 +89,11 @@ class DPModel(nn.Module):
         (pred, _), g = value_and_grad(self.apply, argnums=1, has_aux=True)(variables, coord_N3, box_33, static_args, nbrs_lists)
         return pred, -g
     
-    def wc_predict(self, variables, coord_N3, box_33, static_args, nbrs_lists=None):
-        wc_relative = self.apply(variables, coord_N3, box_33, static_args, nbrs_lists)[0]
+    def wc_predict(self, variables, coord_N3, box_33, static_args, nbrs_nm=None):
+        wc_relative = self.apply(variables, coord_N3, box_33, static_args, nbrs_nm)[0]
         coord_ref = [c for i,c in enumerate(split(coord_N3, static_args['type_count'])) if i in self.params['nsel']]
         return concat(coord_ref) + wc_relative
+        # return lax.with_sharding_constraint(concat(coord_ref) + wc_relative, jax.sharding.PositionalSharding(jax.devices()[0])
     
     def get_loss_fn(self):
         if self.params['atomic'] is False:
