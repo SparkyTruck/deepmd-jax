@@ -7,7 +7,7 @@ We recommend using conda to create a new environment with the latest GPU version
 ```bash
 conda create --name deepmd-jax python=3.10
 conda activate deepmd-jax 
-pip install --upgrade "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+pip install --upgrade "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 ```
 
 Then, download the package to some path, and install it by
