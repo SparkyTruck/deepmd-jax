@@ -45,22 +45,28 @@ def get_relative_coord(coord_N3, box_33, type_count, lattice_args, nbrs_nm=None)
     for i in range(len(type_count)):
         x, r = [], []
         for j in range(len(type_count)):
-            if nbrs_nm is None:
-                lattice_cand = jnp.array(lattice_args['lattice_cand'])
-                N, X, Y = len(coord_n3[i]), len(lattice_cand), lattice_args['lattice_max']
-                x_N3M = shift(coord_n3[j] - coord_n3[i][:,None], box_33, lattice_args['ortho']).transpose(0,2,1)
-                if X > 1:
-                    x_N3MX = x_N3M[...,None] - (lattice_cand @ box_33).T[:,None]
-                    if X == Y:
-                        x_N3M = x_N3MX.reshape(N,3,-1)
-                    else:
-                        r_NMX = jnp.linalg.norm(jnp.where(jnp.abs(x_N3MX) > 1e-15, x_N3MX, 1e-15), axis=1)
-                        idx_NMY = r_NMX.argpartition(lattice_args['lattice_max'], axis=-1)[:,:,:lattice_args['lattice_max']]
-                        x_N3M = jnp.take_along_axis(x_N3MX, idx_NMY[:,None], axis=-1).reshape(N,3,-1)
-                r_NM = jnp.linalg.norm(jnp.where(jnp.abs(x_N3M) > 1e-15, x_N3M, 1e-15), axis=1)
+            N, M = len(coord_n3[i]), len(coord_n3[j])
+            if N * M == 0:
+                M = M*lattice_args['lattice_max'] if nbrs_nm is None else nbrs_nm[i][j].shape[1]
+                x_N3M = jnp.ones((N, 3, M), dtype=coord_N3.dtype)
+                r_NM = jnp.ones((N, M), dtype=coord_N3.dtype)
             else:
-                x_N3M = shift(coord_n3[j][nbrs_nm[i][j]] - coord_n3[i][:,None], box_33, True).transpose(0,2,1)
-                r_NM = jnp.linalg.norm(jnp.where(jnp.abs(x_N3M) > 1e-15, x_N3M, 1e-15), axis=1) * (nbrs_nm[i][j] < len(coord_n3[j]))
+                if nbrs_nm is None:
+                    lattice_cand = jnp.array(lattice_args['lattice_cand'])
+                    X, Y = len(lattice_cand), lattice_args['lattice_max']
+                    x_N3M = shift(coord_n3[j] - coord_n3[i][:,None], box_33, lattice_args['ortho']).transpose(0,2,1)
+                    if X > 1:
+                        x_N3MX = x_N3M[...,None] - (lattice_cand @ box_33).T[:,None]
+                        if X == Y:
+                            x_N3M = x_N3MX.reshape(N,3,-1)
+                        else:
+                            r_NMX = jnp.linalg.norm(jnp.where(jnp.abs(x_N3MX) > 1e-15, x_N3MX, 1e-15), axis=1)
+                            idx_NMY = r_NMX.argpartition(lattice_args['lattice_max'], axis=-1)[:,:,:lattice_args['lattice_max']]
+                            x_N3M = jnp.take_along_axis(x_N3MX, idx_NMY[:,None], axis=-1).reshape(N,3,-1)
+                    r_NM = jnp.linalg.norm(jnp.where(jnp.abs(x_N3M) > 1e-15, x_N3M, 1e-15), axis=1)
+                else:
+                    x_N3M = shift(coord_n3[j][nbrs_nm[i][j]] - coord_n3[i][:,None], box_33, True).transpose(0,2,1)
+                    r_NM = jnp.linalg.norm(jnp.where(jnp.abs(x_N3M) > 1e-15, x_N3M, 1e-15), axis=1) * (nbrs_nm[i][j] < len(coord_n3[j]))
             x.append(x_N3M)
             r.append(r_NM)
         x_n3m.append(x)
