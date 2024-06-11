@@ -8,7 +8,7 @@ setup(
         'jax>=0.4.19',
         'flax',
         'optax',
-        'jax-md @ git+https://github.com/google/jax-md.git@jax-md-v0.2.24',
+        'jax-md @ git+https://github.com/google/jax-md.git',
         'ase',
         'jaxopt',
         'matplotlib',
