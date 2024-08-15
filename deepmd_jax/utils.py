@@ -100,7 +100,7 @@ class embedding_net(nn.Module):
                 else:
                     Z = self.widths[i] / self.widths[i-1]
                     assert Z.is_integer() or (1/Z).is_integer()
-                    x_prev = jnp.repeat(x, int(Z), axis=-1) if Z.is_integer() else x.reshape(x.shape[:-1]+(int(1/Z),-1)).mean(-2)
+                    x_prev = jnp.repeat(x, int(Z), axis=-1) if Z.is_integer() else x.reshape(x.shape[:-1]+(int(1/Z),int(x.shape[-1]*Z))).mean(-2)
                     if self.out_linear_only and i == len(self.widths) - 1:
                         x = jnp.repeat(nn.Dense(self.widths[i-1], kernel_init=linear_init, use_bias=False)(x), int(Z), axis=-1)
                     else:
