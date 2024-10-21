@@ -6,6 +6,9 @@ import flax.linen as nn
 import pickle, os
 from scipy.interpolate import PPoly, BPoly
 
+if not jax.config.read('jax_enable_x64'):
+    jax.config.update('jax_default_matmul_precision', 'float32')
+
 def shift(coord, box, ortho=False): # shift coordinates to the parallelepiped around the origin
     if ortho:
         box = jnp.diag(box)
