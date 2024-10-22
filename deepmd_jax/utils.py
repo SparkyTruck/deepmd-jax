@@ -6,6 +6,7 @@ import flax.linen as nn
 import pickle, os
 from scipy.interpolate import PPoly, BPoly
 
+print('# DeepMD_JAX: Starting on %d device(s):' % jax.device_count(), jax.devices())
 if not jax.config.read('jax_enable_x64'):
     jax.config.update('jax_default_matmul_precision', 'float32')
 
@@ -160,19 +161,6 @@ class linear_norm(nn.Module):
     @nn.compact
     def __call__(self, x):
         return (nn.Dense(self.width, kernel_init=linear_init, use_bias=False)(x) * self.param('norm',ones_init,(1,)))
-    
-def get_mask_by_device(type_count):
-    K = jax.device_count()
-    mask = concat([concat([jnp.ones(count, dtype=bool), jnp.zeros((-count%K,), dtype=bool)]).reshape(K,-1)
-                   for count in type_count], axis=1).reshape(-1)
-    return lax.with_sharding_constraint(mask, jax.sharding.PositionalSharding(jax.devices()))
-
-def reorder_by_device(coord, type_count): # Pad with zeros in first dimension to be divisible by device count K
-    K = jax.device_count()
-    coord = jnp.concatenate([jnp.pad(c, ((0,-c.shape[0]%K),)+((0,0),)*(c.ndim-1)).reshape(K,-1,*c.shape[1:])
-                            for c in split(coord,type_count)], axis=1).reshape(-1, *coord.shape[1:])
-    sharding = jax.sharding.PositionalSharding(jax.devices())
-    return lax.with_sharding_constraint(coord,sharding.replicate())
 
 def get_p3mlr_grid_size(box3, beta, resolution=0.2): # resolution=0.1 for better accuracy
     M = tuple((box3*beta/resolution).astype(int))
