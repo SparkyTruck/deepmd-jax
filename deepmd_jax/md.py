@@ -4,7 +4,9 @@ import jax.numpy as jnp
 import numpy as np
 from utils import load_model
 import flax.linen as nn
+from time import time
 from data import compute_lattice_candidate
+from utils import split, concat
 
 mass_unit_convertion = 1.036427e2 # from AMU to eV * fs^2 / Å^2
 temperature_unit_convertion = 8.617333e-5 # from Kelvin to eV
@@ -40,6 +42,7 @@ class Simulation:
     dr_buffer_neighbor: float = 0.8
     dr_buffer_lattice: float = 1.
     neighbor_buffer_size: float = 1.2
+
     def __init__(self,
                  model_path,
                  type_idx,
@@ -62,6 +65,7 @@ class Simulation:
         self.energy_fn = get_energy_fn_from_potential(self.model, self.variables)
         type_count = np.bincount(type_idx.astype(int))
         self.type_count = np.pad(type_count, (0, self.model.params['ntypes'] - len(type_count)))
+
         # If orthorhombic, keep box as (3,); else keep (3,3)
         box = jnp.array(box)
         if box.size == 1:
@@ -69,7 +73,8 @@ class Simulation:
         if box.shape == (3,3) and (box == jnp.diag(jnp.diag(box))).all():
             self.initial_box = jnp.diag(box)
         self.current_box = self.initial_box
-        # When box is variable, use fractional coordinates for shift_fn and include extra buffer for lattice selection
+
+        # When box is variable, include extra buffer for lattice selection, and jax_md need fractional coordinates for shift_fn
         if "NPT" in self.routine:
             self.displacement_fn, self.shift_fn = jax_md.space.periodic_general(self.current_box)
             self.static_args = get_static_args(position,
@@ -88,6 +93,7 @@ class Simulation:
                                        self.model.params['rcut'] + self.dr_buffer_neighbor,
                                        self.neighbor_buffer_size)
             self.nbrs.allocate(position, box=self.current_box)
+        
         # Initialize according to routine;
         if self.routine == "NVE":
             self.routine_fn = jax_md.simulate.nve
@@ -160,8 +166,18 @@ class Simulation:
                                             **energy_fn_kwargs
                                         )
         def report_fn(state):
-            return {fn(state) for fn in self.reporters.values()}
+            return [fn(state) for fn in self.reporters.values()]
         return jax.jit(report_fn)
+    
+    def make_report(self, initial=False):
+        char_space = ["8"] + ["12"] * len(self.reporters) + ["6"]
+        if initial:
+            self.tic = time()
+            headers = ["Step"] + list(self.reporters.keys()) + ["Time"]
+            print("|".join([f"{header:^{char_space[i]}}" for i, header in enumerate(headers)]))
+        report = [self.step] + self.report_fn(self.state) + [time()-self.tic]
+        print("|".join([f"{value:^{char_space[i]}.3f}" for i, value in enumerate(report)]))
+        self.tic = time()
             
     def check_lattice_overflow(self, position, box):
         '''Overflow that requires increasing lattice candidate/buffer, not jit-compatible'''
@@ -212,11 +228,7 @@ class Simulation:
 
         # Make an initial report
         self.report_fn = self.generate_report_fn()
-        headers = ["Step"] + list(self.reporters.keys()) + ["Time"]
-        char_space = ["8"] + ["12"] * len(self.reporters) + ["6"]
-        print("|".join([f"{header:^{char_space[i]}}" for i, header in enumerate(headers)]))
-        report = self.report_fn(self.state)
-        print("|".join([f"{value:^{char_space[i]}.3f}" for i, value in enumerate(report)]))
+        self.make_report(initial=True)
 
         # steps stands for the remaining steps to run
         while steps > 0:
@@ -260,39 +272,93 @@ class Simulation:
 
             # Report at preset regular intervals
             if self.step % self.report_interval == 0:
-                report = self.report_fn(self.state)
-                print("|".join([f"{value:^{char_space[i]}.3f}" for i, value in enumerate(report)]))
+                self.make_report()
         
         # Return the trajectory
         position_trajectory = np.concatenate(position_trajectory)
         velocity_trajectory = np.concatenate(velocity_trajectory)
         return position_trajectory, velocity_trajectory
 
+def get_mask_by_device(type_count):
+    '''
+        For multiple-device partitioning, ghost atoms are padded.
+        Returns a binary mask indicating the valid atoms, sharded by device.
+    '''
+    K = jax.device_count()
+    mask = concat([
+                concat([jnp.ones(count, dtype=bool),
+                        jnp.zeros((-count%K,), dtype=bool)
+                        ]).reshape(K,-1)
+                for count in type_count
+                ],
+            axis=1).reshape(-1)
+    # ensure mask is sharded by device
+    sharding = jax.sharding.PositionalSharding(jax.devices())
+    return jax.lax.with_sharding_constraint(mask, sharding)
 
 def get_type_mask_fns(type_count):
-    mask_fns = []
+    '''
+        Returned type_mask_fns filter nbrs.idx by atom type.
+        Padded ghost atoms are excluded.
+        This can be used to postprocess neighbor indices,
+        and can also be added as a custom_mask_function in jax_md.neighbor_list.
+    '''
+    type_mask_fns = []
     K = jax.device_count()
-    Kmask = get_mask_by_device(type_count)
-    type_count_new = -(-type_count//K)
+    full_mask = get_mask_by_device(type_count)
+    type_count_new = -(-type_count//K) # type_count for each device after padding
     type_idx_filled_each = np.cumsum(np.concatenate([[0], type_count_new]))
-    N_each = type_idx_filled_each[-1]
+    N_each = type_idx_filled_each[-1] # number of atoms for each device after padding
     for i in range(len(type_count)):
-        def mask_fn(idx, i=i):
-            idx = jax.device_put(idx, jax.sharding.PositionalSharding(jax.devices()).reshape(K,1))
-            cond = Kmask[:,None] * ((idx%N_each >= type_idx_filled_each[i]) * (idx%N_each < type_idx_filled_each[i+1]))
-            cond *= (idx-type_idx_filled_each[i]-(idx//N_each)*(N_each-type_count_new[i]) < type_count[i]) * (idx < N_each * K)
-            return jnp.where(cond, idx, N_each * K)
-        mask_fns.append(mask_fn)
-    return mask_fns
-def get_full_mask_fn(type_count):
-    Kmask = get_mask_by_device(type_count)
-    Kmask_idx = np.arange(len(Kmask))[~np.array(Kmask)]
-    def mask_fn(idx):
-        idx = jax.device_put(idx, jax.sharding.PositionalSharding(jax.devices()).reshape(jax.device_count(),1))
-        cond = Kmask[:,None] * jnp.isin(idx, Kmask_idx, invert=True)
-        return jnp.where(cond, idx, len(Kmask))
-    return mask_fn
-class NeighborList():
+        # filter neighbor atoms by type i; idx = nbrs.idx returned by jax_md
+        def mask_fn(idx, i=i): 
+            # ensure idx is sharded by device
+            sharding = jax.sharding.PositionalSharding(jax.devices()).reshape(K,1)
+            idx = jax.device_put(idx, sharding)
+            valid_center_atom = full_mask[:,None]
+            valid_type_neighbor_atom = idx%N_each >= type_idx_filled_each[i]
+            valid_type_neighbor_atom *= idx%N_each < type_idx_filled_each[i+1]
+            valid_neighbor_atom = (idx-type_idx_filled_each[i]-(idx//N_each)*(N_each-type_count_new[i]) < type_count[i])
+            is_neighbor = (idx < N_each * K)
+            filter = valid_center_atom * valid_type_neighbor_atom * valid_neighbor_atom * is_neighbor
+            return jnp.where(filter, idx, N_each * K)
+        type_mask_fns.append(mask_fn)
+    return type_mask_fns
+
+def get_idx_mask_fn(type_count):
+    '''
+        Returned idx_mask_fn that filters out ghost atoms from nbrs.idx.
+    '''
+    full_mask = get_mask_by_device(type_count)
+    idx_mask_out = np.arange(len(full_mask))[~np.array(full_mask)]
+    def idx_mask_fn(idx):
+        # ensure idx is sharded by device
+        sharding = jax.sharding.PositionalSharding(jax.devices()).reshape(jax.device_count(),1)
+        idx = jax.device_put(idx, sharding)
+        filter = full_mask[:,None] * jnp.isin(idx, idx_mask_out, invert=True)
+        return jnp.where(filter, idx, len(full_mask))
+    return idx_mask_fn
+
+from typing import Callable
+@jax_md.dataclasses.dataclass
+class TypedNeighborList():
+    nbrs: jax_md.partition.NeighborList
+    type_count: tuple
+    idx_mask_fn: list[Callable]
+    type_mask_fns: list[Callable]
+    rcut: float
+    @property
+    def did_buffer_overflow(self) -> bool:
+        return self.nbrs.did_buffer_overflow
+    @property
+    def idx(self) -> jax.Array:
+        return self.nbrs.idx
+    @property
+    def reference_position(self) -> jax.Array:
+        return self.nbrs.reference_position
+
+def type_neighbor_list_fn():
+
     def __init__(self, box, type_count, rcut, size):
         self.type_count, self.box = tuple(type_count), box.astype(jnp.float32)
         self.mask_fns = get_type_mask_fns(np.array(type_count))
