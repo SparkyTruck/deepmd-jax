@@ -17,8 +17,8 @@ def get_energy_fn_from_potential(model, variables):
         return E
     return jax.jit(energy_fn, static_argnames=('static_args'))
 
-def get_static_args(rcut_maybe_with_buffer, type_count, box):
-    use_neighbor_list = check_if_use_neighbor_list(box, rcut_maybe_with_buffer)
+def get_static_args(position, rcut_maybe_with_buffer, type_count, box, use_neighbor_list=True):
+    use_neighbor_list *= check_if_use_neighbor_list(box, rcut_maybe_with_buffer)
     if use_neighbor_list:
         static_args = nn.FrozenDict({'type_count':type_count, 'use_neighbor_list':True})
         return static_args
@@ -65,26 +65,29 @@ class Simulation:
         # If orthorhombic, keep box as (3,); else keep (3,3)
         box = jnp.array(box)
         if box.size == 1:
-            self.reference_box = box.item() * jnp.ones(3)
+            self.initial_box = box.item() * jnp.ones(3)
         if box.shape == (3,3) and (box == jnp.diag(jnp.diag(box))).all():
-            self.reference_box = jnp.diag(box)
+            self.initial_box = jnp.diag(box)
+        self.current_box = self.initial_box
         # When box is variable, use fractional coordinates for shift_fn and include extra buffer for lattice selection
         if "NPT" in self.routine:
-            self.displacement_fn, self.shift_fn = jax_md.space.periodic_general(self.reference_box)
-            self.static_args = get_static_args(self.model.params['rcut'] + self.dr_buffer_lattice,
+            self.displacement_fn, self.shift_fn = jax_md.space.periodic_general(self.current_box)
+            self.static_args = get_static_args(position,
+                                               self.model.params['rcut'] + self.dr_buffer_lattice,
                                                self.type_count,
-                                               self.reference_box)
+                                               self.current_box)
         else:
-            self.displacement_fn, self.shift_fn = jax_md.space.periodic(self.reference_box)
-            self.static_args = get_static_args(self.model.params['rcut'],
+            self.displacement_fn, self.shift_fn = jax_md.space.periodic(self.current_box)
+            self.static_args = get_static_args(position,
+                                               self.model.params['rcut'],
                                                self.type_count,
-                                               self.reference_box)
+                                               self.current_box)
         if self.static_args['use_neighbor_list']:
-            self.nbrs = NeighborList(self.reference_box,
+            self.nbrs = NeighborList(self.current_box,
                                        self.type_count,
                                        self.model.params['rcut'] + self.dr_buffer_neighbor,
                                        self.neighbor_buffer_size)
-            self.nbrs.allocate(self.position)
+            self.nbrs.allocate(position, box=self.current_box)
         # Initialize according to routine;
         if self.routine == "NVE":
             self.routine_fn = jax_md.simulate.nve
@@ -117,11 +120,49 @@ class Simulation:
                                       * temperature_unit_convertion),
                                   nbrs=self.nbrs.nbrs_nm if self.static_args['use_neighbor_list'] else None,
                                   static_args=self.static_args,
-                                  cell=self.reference_box,
-                                  **({'box':self.reference_box} if "NPT" in self.routine else {}))
+                                  cell=self.current_box,
+                                  **({'box':self.current_box} if "NPT" in self.routine else {}))
         if init_temperature is None:
             self.state.set(velocity=velocity)
-    
+
+    def generate_report_fn(self):
+        energy_fn_kwargs = {"cell":self.state.box if "NPT" in self.routine else self.initial_box,
+                            "nbrs_nm":self.nbrs.nbrs_nm if self.static_args['use_neighbor_list'] else None,
+                            "static_args":self.static_args}
+        self.reporters = {
+            "Temperature": lambda state: jax_md.quantity.temperature(
+                                                            velocity=state.velocity,
+                                                            mass=state.mass,
+                                                        ) / temperature_unit_convertion,
+            "KE": lambda state: jax_md.quantity.kinetic_energy(
+                                                    velocity=state.velocity,
+                                                    mass=state.mass,
+                                                ),
+            "PE": lambda state: self.energy_fn(
+                                    state.position,
+                                    **energy_fn_kwargs,
+                                ),                 
+            }
+
+        if self.routine == "NVT_Nose_Hoover":
+            self.reporters["Invariant"] = lambda state: jax_md.simulate.nvt_nose_hoover_invariant(
+                                            self.energy_fn,
+                                            state,
+                                            self.temperature,
+                                            **energy_fn_kwargs
+                                        )
+        elif self.routine == "NPT_Nose_Hoover":
+            self.reporters["Invariant"] = lambda state: jax_md.simulate.npt_nose_hoover_invariant(
+                                            self.energy_fn,
+                                            state,
+                                            self.temperature,
+                                            self.pressure,
+                                            **energy_fn_kwargs
+                                        )
+        def report_fn(state):
+            return {fn(state) for fn in self.reporters.values()}
+        return jax.jit(report_fn)
+            
     def check_lattice_overflow(self, position, box):
         '''Overflow that requires increasing lattice candidate/buffer, not jit-compatible'''
         pass
@@ -138,12 +179,12 @@ class Simulation:
     def check_soft_overflow(self, position, ref_position, box):
         '''Movement over dr_buffer_neighbor/2 that requires neighbor update, jit-compatible'''
         return False
-    
+
     def get_inner_step(self):
         def inner_step(states):
             state, nbrs, overflow = states
             npt_box = state.box if "NPT" in self.routine else None
-            current_box = state.box if "NPT" in self.routine else self.reference_box
+            current_box = state.box if "NPT" in self.routine else self.current_box
             soft_overflow = self.check_soft_overflow(state.position, nbrs.reference_position, current_box)
             nbrs = jax.lax.cond(soft_overflow,
                                 lambda nbrs: nbrs.update(state.position, box=npt_box),
@@ -164,29 +205,68 @@ class Simulation:
                     (state.position, state.velocity))
         return inner_step
 
-    def run(self, steps, state):
+    def run(self, steps):
+
+        position_trajectory, velocity_trajectory = [], []
         self.inner_step_fn = self.get_inner_step()
+
+        # Make an initial report
+        self.report_fn = self.generate_report_fn()
+        headers = ["Step"] + list(self.reporters.keys()) + ["Time"]
+        char_space = ["8"] + ["12"] * len(self.reporters) + ["6"]
+        print("|".join([f"{header:^{char_space[i]}}" for i, header in enumerate(headers)]))
+        report = self.report_fn(self.state)
+        print("|".join([f"{value:^{char_space[i]}.3f}" for i, value in enumerate(report)]))
+
+        # steps stands for the remaining steps to run
         while steps > 0:
+
             # run the simulation for a chunk of steps in a lax.scan loop
             next_chunk = min(self.report_interval - self.step % self.report_interval,
                         self._step_chunk_size - self.step % self._step_chunk_size)
             states = (self.state,
                       self.nbrs if self.static_args['use_neighbor_list'] else None,
                       (False,) * 3)
-            states_new, (pos, vel) = jax.lax.scan(self.inner_step_fn, states, None, next_chunk)
+            states_new, (pos_traj, vel_traj) = jax.lax.scan(self.inner_step_fn, states, None, next_chunk)
             state_new, nbrs_new, overflow = states_new
-            is_
-            if count < self._chunk_size:
-                state, report = self.inner_step(count)
-                count = 0
-            else:
-                state, report = self.inner_step(self._chunk_size)
-                count -= self._chunk_size
-            self.step += self._chunk_size
-            if self.step % self.report_interval == 0:
-                print(report)
+            is_nbr_buffer_overflow, is_lattice_overflow, is_hard_overflow = overflow
 
-    
+            # If anything overflows, we have to re-run the chunk
+            if is_hard_overflow or is_lattice_overflow or is_nbr_buffer_overflow:
+                if is_hard_overflow: # Need to disable neighbor list
+                    self.static_args = get_static_args(self.state.position,
+                                                    self.model.params['rcut'],
+                                                    self.type_count,
+                                                    state_new.box,
+                                                    use_neighbor_list=False)
+                elif is_nbr_buffer_overflow: # Need to reallocate neighbor list
+                    self.nbrs.allocate(self.state.position, box=self.current_box)
+                elif is_lattice_overflow: # Need to increase lattice candidate/neighbor count
+                    self.static_args = get_static_args(self.state.position,
+                                                    self.model.params['rcut'] + self.dr_buffer_lattice,
+                                                    self.type_count,
+                                                    state_new.box)
+                self.inner_step_fn = self.get_inner_step()
+                self.report_fn = self.generate_report_fn()
+                continue
+
+            # If nothing overflows, update the state and record the trajectory
+            self.state = state_new
+            self.nbrs = nbrs_new
+            self.step += next_chunk
+            steps -= next_chunk
+            position_trajectory.append(np.array(pos_traj))
+            velocity_trajectory.append(np.array(vel_traj))
+
+            # Report at preset regular intervals
+            if self.step % self.report_interval == 0:
+                report = self.report_fn(self.state)
+                print("|".join([f"{value:^{char_space[i]}.3f}" for i, value in enumerate(report)]))
+        
+        # Return the trajectory
+        position_trajectory = np.concatenate(position_trajectory)
+        velocity_trajectory = np.concatenate(velocity_trajectory)
+        return position_trajectory, velocity_trajectory
 
 
 def get_type_mask_fns(type_count):
