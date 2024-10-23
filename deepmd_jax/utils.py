@@ -6,9 +6,20 @@ import flax.linen as nn
 import pickle, os
 from scipy.interpolate import PPoly, BPoly
 
-print('# DeepMD_JAX: Starting on %d device(s):' % jax.device_count(), jax.devices())
 if not jax.config.read('jax_enable_x64'):
     jax.config.update('jax_default_matmul_precision', 'float32')
+np.set_printoptions(precision=4, suppress=True)
+print('# DeepMD-JAX: Starting on %d device(s):' % jax.device_count(), jax.devices())
+
+@jax.jit
+def norm_ortho_box(coord, box):
+    '''
+        Compute the closest distance to a lattice in a orthorhombic system.
+    '''
+    if box.shape == (3,3):
+        box = jnp.diag(box)
+    shifted_coord = (coord - box/2) % box - box/2
+    return jnp.linalg.norm(shifted_coord, axis=-1)
 
 def shift(coord, box, ortho=False): # shift coordinates to the parallelepiped around the origin
     if ortho:
@@ -275,3 +286,35 @@ def compress_model(model, variables, Ngrids, rmin):
     print('# Compression (0,1,2)-order error: Mean = (%.2e,%.2e,%.2e), Max = (%.2e,%.2e,%.2e)'
             % (err0.mean(), err1.mean(), err2.mean(), err0.max(), err1.max(), err2.max()))
     return model, variables
+
+def periodic_replicate(copy, coord, box, type_idx=None, force=None, velocity=None):
+    '''
+        Used to replicate a periodic system in all 3 directisons.
+        Input: copy: (1,) or (3,), number of copies (in each direction)
+               coord: (N,3)
+               box: (1,) or (3,) or (3,3)
+               Optional: type_idx (N,) force (N,3) velocity (N,3)
+        Returns the replicated coord, box, and if provided, type_idx, force, velocity.
+    '''
+    copy = np.array(copy)
+    box = np.array(box)
+    if box.size == 1 and copy.size == 1:
+        box = box * copy
+    else:
+        copy = (copy * np.ones(3)).astype(int)
+        box = np.diag(copy) @ box
+    for d in range(3):
+        coord = np.concatenate([(coord + i*box[d])[None]
+                                for i in range(copy[d])]
+                               ).reshape(-1,3)
+    ret = [coord, box]
+    if type_idx is not None:
+        ret.append(np.tile(type_idx, copy.prod()))
+    if force is not None:
+        ret.append(np.concatenate([force]*copy.prod()))
+    if velocity is not None:
+        ret.append(np.concatenate([velocity]*copy.prod()))
+    return ret
+    
+
+    
