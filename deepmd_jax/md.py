@@ -13,16 +13,24 @@ mass_unit_convertion = 1.036427e2 # from AMU to eV * fs^2 / Å^2
 temperature_unit_convertion = 8.617333e-5 # from Kelvin to eV
 pressure_unit_convertion = 6.241509e-7 # from bar to eV / Å^3
 
-def get_energy_fn_from_potential(model, variables):
-    '''
-        Returns a energy function from a deepmd model.
-        You can define a custom energy function with the same signature,
-        and setting the energy_fn property of a Simulation instance.
-    '''
+def get_energy_fn_from_potential(model, variables, type_idx):
+
     def energy_fn(coord, cell, nbrs_nm, static_args):
+        '''
+            Energy function that can be used in jax_md.simulate routines.
+            You can define a custom energy function with the same signature,
+            and setting the energy_fn property of a Simulation instance.
+        '''
+        # Atoms are reordered and grouped by type in neural network inputs.
+        coord = coord[type_idx.argsort(kind='stable')]
+        # Ensure coord is replicated on all devices
+        sharding = jax.sharding.PositionalSharding(jax.devices()).replicate()
+        coord = jax.lax.with_sharding_constraint(coord, sharding)
+
         if True: # model type is energy
             E = model.apply(variables, coord, cell, static_args, nbrs_nm)[0]
         return E
+    
     return jax.jit(energy_fn, static_argnames=('static_args'))
 
 def get_static_args(position, rcut_maybe_with_buffer, type_count, box, use_neighbor_list=True):
@@ -73,15 +81,18 @@ class Simulation:
                  **routine_args):
         if velocity is None and init_temperature is None:
             raise ValueError("Please either provide velocity or init_temperature to initialize velocity")
+        position = jnp.array(position) * jnp.ones(1) # Ensure default precision
         self.energy_fn = get_energy_fn_from_potential(model_path, type_idx)
         self.dt = dt
         self.routine = routine
         self.routine_args = routine_args
         self.mass = jnp.array(np.array(mass)[np.array(type_idx)]) # AMU
-        self.model, self.variables = load_model(model_path)
-        self.energy_fn = get_energy_fn_from_potential(self.model, self.variables)
-        type_count = np.bincount(type_idx.astype(int))
+        self.type_idx = np.array(type_idx.astype(int))
+        type_count = np.bincount(self.type_idx)
         self.type_count = np.pad(type_count, (0, self.model.params['ntypes'] - len(type_count)))
+        self.model, self.variables = load_model(model_path)
+        self.energy_fn = get_energy_fn_from_potential(self.model, self.variables, self.type_idx)
+        self.is_initial_state = True
 
         # If orthorhombic, keep box as (3,); else keep (3,3)
         box = jnp.array(box)
@@ -146,6 +157,10 @@ class Simulation:
             self.state.set(velocity=velocity)
 
     def generate_report_fn(self):
+        '''
+            Returns a set of functions that reports the current state.
+            You can define custom report functions with the same signature.
+        '''
         energy_fn_kwargs = {"cell":self.state.box if "NPT" in self.routine else self.initial_box,
                             "nbrs_nm":self.typed_nbrs.nbrs_nm if self.static_args['use_neighbor_list'] else None,
                             "static_args":self.static_args}
@@ -183,7 +198,10 @@ class Simulation:
             return [fn(state) for fn in self.reporters.values()]
         return jax.jit(report_fn)
     
-    def make_report(self, initial=False):
+    def print_report(self, initial=False):
+        '''
+            Print a report of the current state.
+        '''
         char_space = ["8"] + ["12"] * len(self.reporters) + ["6"]
         if initial:
             self.tic = time()
@@ -219,15 +237,19 @@ class Simulation:
     def check_soft_overflow(self, position, ref_position, box):
         '''Movement over dr_buffer_neighbor/2 that requires neighbor update, jit-compatible'''
         return False
-
+    
     def get_inner_step(self):
+        '''
+            Returns a function that performs one simulation step, used in lax.scan.
+        '''
         def inner_step(states):
             state, typed_nbrs, overflow = states
-            npt_box = state.box if "NPT" in self.routine else None
             current_box = state.box if "NPT" in self.routine else self.initial_box
             soft_overflow = self.check_soft_overflow(state.position, typed_nbrs.reference_position, current_box)
             typed_nbrs = jax.lax.cond(soft_overflow,
-                                lambda typed_nbrs: self.typed_nbr_fn.update(state.position, box=npt_box),
+                                lambda typed_nbrs: self.typed_nbr_fn.update(state.position,
+                                                                            typed_nbrs,
+                                                                            box=current_box),
                                 lambda typed_nbrs: typed_nbrs,
                                 typed_nbrs)
             state = self.apply_fn(state,
@@ -237,7 +259,7 @@ class Simulation:
             is_nbr_buffer_overflow, is_lattice_overflow, is_hard_overflow = overflow
             if self.static_args['use_neighbor_list']:
                 is_nbr_buffer_overflow |= typed_nbrs.did_buffer_overflow
-                is_hard_overflow |= self.check_hard_overflow(npt_box)
+                is_hard_overflow |= self.check_hard_overflow(current_box)
             else:
                 is_lattice_overflow |= self.check_lattice_overflow(state.position, current_box)
             overflow = (is_nbr_buffer_overflow, is_lattice_overflow, is_hard_overflow)
@@ -253,11 +275,17 @@ class Simulation:
             Usage: trajectory = run(steps)
         '''
         position_trajectory, velocity_trajectory, box_trajectory = [], [], []
-        self.inner_step_fn = self.get_inner_step()
-
-        # Make an initial report
-        self.report_fn = self.generate_report_fn()
-        self.make_report(initial=True)
+        if self.is_initial_state:
+            self.report_fn = self.generate_report_fn()
+            self.print_report(initial=True) # print report with headers
+            self.inner_step_fn = self.get_inner_step()
+            # At first run, include the initial config in the trajectory
+            position_trajectory.append(self.state.position[None])
+            velocity_trajectory.append(self.state.velocity[None])
+            box_trajectory.append(self.state.box[None])
+            self.is_initial_state = False
+        else:
+            self.print_report()
 
         # steps stands for the remaining steps to run
         while steps > 0:
@@ -307,7 +335,7 @@ class Simulation:
 
             # Report at preset regular intervals
             if self.step % self.report_interval == 0:
-                self.make_report()
+                self.print_report()
         
         # Return the trajectory
         trajectory = {
@@ -415,25 +443,34 @@ class typed_neighbor_list_fn():
     allocate: Callable = jax_md.dataclasses.field()
     update: Callable = jax_md.dataclasses.field()
 
-def typed_neighbor_list(box, type_count, rcut, buffer_size, fractional=False):
+def typed_neighbor_list(box, type_count, rcut, buffer_size):
+    '''
+        Returns a typed neighbor list function that can be used to allocate and update neighbor lists.
+    '''
     type_count = tuple(type_count)
-    box = box.astype(jnp.float32)
+    reference_box = box.astype(jnp.float32) # box at creation of typed_neighbor_list_fn
     type_mask_fns = get_type_mask_fns(type_count)
     idx_mask_fn = get_idx_mask_fn(type_count)
-
-    # store coord in float32, reorder by device, and shrink by 1e-7 to avoid numerical issues
-    def canonicalize(coord):
-        coord = (coord.astype(jnp.float32) % box) * (1-2e-7) + 1e-7 * box
-        return reorder_by_device(coord, type_count)
+    
+    def canonicalize(coord, box=reference_box):
+        # scale coord to reference_box and store in float32 fractional coordinates
+        box = box.astype(jnp.float32)
+        scale = reference_box[0] / box[0]
+        coord = (coord.astype(jnp.float32) % box) * scale
+        # shrink by 1e-7 from the boundary to avoid numerical issues
+        coord = coord * (1-2e-7) + 1e-7 * reference_box
+        # reorder and partition to multiple devices
+        coord = reorder_by_device(coord, type_count)
+        return coord
     
     # allocate function: non-jit-compatible
-    def allocate_fn(coord):
-        displacement_fn = jax_md.space.periodic(box)[0]
-        coord = canonicalize(coord)
+    def allocate_fn(coord, box=reference_box):
+        coord = canonicalize(coord, box)
+        displacement_fn = jax_md.space.periodic(reference_box)[0]
         # Measure the exact size of max neighbors for each atom type
         test_nbr = jax_md.partition.neighbor_list(displacement_fn,
-                                                  box,
-                                                  rcut,
+                                                  reference_box,
+                                                  rcut * reference_box[0] / box[0], # scale rcut to reference_box
                                                   capacity_multiplier=1.,
                                                   custom_mask_function=idx_mask_fn
                                                 ).allocate(coord)
@@ -448,12 +485,12 @@ def typed_neighbor_list(box, type_count, rcut, buffer_size, fractional=False):
                             max(20 - knbr,0) * max(buffer_size-1.2,0)))
         print('# Neighborlist allocated with size', np.array(knbr) - 1)
         # infer a total buffer from the max neighbors of each type
-        buffer = (sum(knbr)+1.01) / test_nbr.idx.shape[1]
+        total_buffer_ratio = (sum(knbr)+1.01) / test_nbr.idx.shape[1]
         # Allocate the neighbor list with the inferred buffer ratio
         nbrs = jax_md.partition.neighbor_list(displacement_fn,
                                               box,
-                                              rcut,
-                                              capacity_multiplier=buffer,
+                                              rcut * reference_box[0] / box[0], # scale rcut to reference_box
+                                              capacity_multiplier=total_buffer_ratio,
                                               custom_mask_function=idx_mask_fn
                                             ).allocate(coord)
         nbrs_nm, overflow = get_nm(nbrs, knbr)
@@ -463,8 +500,9 @@ def typed_neighbor_list(box, type_count, rcut, buffer_size, fractional=False):
                                  did_buffer_overflow=overflow)
     
     # update function: jit-compatible
-    def update_fn(coord, typed_nbrs):
-        typed_nbrs = typed_nbrs.set(nbrs=typed_nbrs.nbrs.update(canonicalize(coord)))
+    def update_fn(coord, typed_nbrs, box=reference_box):
+        coord = canonicalize(coord, box)
+        typed_nbrs = typed_nbrs.set(nbrs=typed_nbrs.nbrs.update(coord))
         nbrs_nm, overflow = get_nm(typed_nbrs.nbrs, typed_nbrs.knbr)
         return typed_nbrs.set(nbrs_nm=nbrs_nm,
                               did_buffer_overflow=overflow|typed_nbrs.did_buffer_overflow)
@@ -492,7 +530,7 @@ def typed_neighbor_list(box, type_count, rcut, buffer_size, fractional=False):
                     for i, fn in enumerate(type_mask_fns)]
         type_count_each = -(-np.array(type_count)//K)        # type_count for each device after padding
         type_idx_each = np.cumsum([0] + list(type_count_each)) # type_idx for each device after padding
-        # convert idx to each type pair
+        # convert idx to each type pair; this is a bit tricky
         nbrs_nm = [mlist for mlist in 
                    zip(*[split(jnp.where(nbrs < type_idx_each[-1]*K,
                                          nbrs - type_idx_each[i] - (nbrs//type_idx_each[-1]) * (type_idx_each[-1] - type_count_each[i]),
