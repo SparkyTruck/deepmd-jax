@@ -14,17 +14,19 @@ pressure_unit_convertion = 6.241509e-7 # from bar to eV / Å^3
 
 def get_energy_fn_from_potential(model, variables, type_idx):
 
-    def energy_fn(coord, cell, nbrs_nm, static_args):
+    def energy_fn(coord, cell, nbrs_nm, static_args, perturbation=1.):
         '''
             Energy function that can be used in jax_md.simulate routines.
             You can define a custom energy function with the same signature,
             and setting the energy_fn property of a Simulation instance.
         '''
         # Atoms are reordered and grouped by type in neural network inputs.
-        coord = coord[type_idx.argsort(kind='stable')]
-        # Ensure coord is replicated on all devices
+        coord = coord[type_idx.argsort(kind='stable')] * perturbation
+        cell = cell * perturbation
+        # Ensure coord and cell is replicated on all devices
         sharding = jax.sharding.PositionalSharding(jax.devices()).replicate()
         coord = jax.lax.with_sharding_constraint(coord, sharding)
+        cell = jax.lax.with_sharding_constraint(cell, sharding)
 
         if True: # model type is energy
             E = model.apply(variables, coord, cell, static_args, nbrs_nm)[0]
@@ -252,12 +254,13 @@ class Simulation:
                  dt,
                  velocity=None,
                  init_temperature=None,
+                 debug=False,
+                 model_deviation_paths=[],
                  **routine_args):
         if velocity is None and init_temperature is None:
             raise ValueError("Please either provide velocity or init_temperature to initialize velocity")
         position = jnp.array(position) * jnp.ones(1) # Ensure default precision
         self.energy_fn = get_energy_fn_from_potential(model_path, type_idx)
-        self.force_fn = jax.jit(jax.grad(self.energy_fn), static_argnames=('static_args'))
         self.dt = dt
         self.routine = routine
         self.routine_args = routine_args
@@ -268,6 +271,13 @@ class Simulation:
         self.model, self.variables = load_model(model_path)
         self.energy_fn = get_energy_fn_from_potential(self.model, self.variables, self.type_idx)
         self.is_initial_state = True
+        self.debug = debug
+        self.use_model_deviation = len(model_deviation_paths) > 0
+        if self.use_model_deviation:
+            self.deviation_energy_fns = [
+                get_energy_fn_from_potential(*load_model(path), self.type_idx) 
+                for path in model_deviation_paths
+            ]
 
         # If orthorhombic, keep box as (3,); else keep (3,3)
         box = jnp.array(box)
@@ -390,6 +400,12 @@ class Simulation:
                                             self.pressure,
                                             **energy_fn_kwargs
                                         )
+        if self.use_model_deviation:
+            self.reporters["Model_Devi"] = lambda state: jnp.array([
+                -jax.grad(fn)(state.position, **energy_fn_kwargs)
+                for fn in self.deviation_energy_fns
+            ]).std(axis=0).max()
+
         def report_fn(state):
             return [fn(state) for fn in self.reporters.values()]
         return jax.jit(report_fn)
@@ -403,8 +419,15 @@ class Simulation:
         if self.is_initial_state:
             self.tic = time()
             headers = ["Step"] + list(self.reporters.keys()) + ["Time"]
+            if self.debug and self.static_args['use_neighbor_list']:
+                headers += ["nbr_update_ratio"]
             print("|".join([f"{header:^{char_space[i]}}" for i, header in enumerate(headers)]))
         report = [self.step] + self.report_fn(self.state) + [time()-self.tic]
+        if self.debug and self.static_args['use_neighbor_list']:
+            if self.neighbor_update_profile[0] > 0:
+                report += [self.neighbor_update_profile[1] / (self.neighbor_update_profile[0])]
+            else:
+                report += [-1]
         self.report_log.append(report)
         print("|".join([f"{value:^{char_space[i]}.3f}" for i, value in enumerate(report)]))
         self.tic = time()
@@ -472,12 +495,15 @@ class Simulation:
         '''
         self.typed_nbrs = None
         if self.static_args['use_neighbor_list']:
-            self.typed_nbrs = self.soft_update_nbrs(self.typed_nbrs, self.state.position, self.current_box)
+            self.typed_nbrs, _ = self.soft_update_nbrs(self.typed_nbrs,
+                                                      self.state.position,
+                                                      self.current_box,
+                                                      self.neighbor_update_profile)
         self.error_code = self.check_hard_overflow(self.state, self.typed_nbrs)
         self.error_code |= 2 * self.typed_nbrs.did_buffer_overflow
         self.resolve_error_code()
 
-    def soft_update_nbrs(self, typed_nbrs, position, box):
+    def soft_update_nbrs(self, typed_nbrs, position, box, profile):
         '''
             A lazy jit-compatible update of neighbor list.
             Intuition: only update if atoms have moved more than dr_buffer_neighbor/2.
@@ -491,21 +517,25 @@ class Simulation:
                                 scaled_position - typed_nbrs.reference_position,
                                 typed_nbrs.reference_box
                             ).max()
-        return jax.lax.cond(max_movement > allowed_movement,
+        update_required = max_movement > allowed_movement
+        profile += jnp.array([1, int(update_required)])
+        typed_nbrs = jax.lax.cond(update_required,
                             jax.jit(lambda typed_nbrs: self.typed_nbr_fn.update(position, typed_nbrs, box=box)),
                             lambda typed_nbrs: typed_nbrs,
                             typed_nbrs)
+        return typed_nbrs, profile
     
     def get_inner_step(self):
         '''
             Returns a function that performs a single simulation step.
         '''
         def inner_step(states):
-            state, typed_nbrs, error_code = states
+            state, typed_nbrs, error_code, profile = states
             current_box = state.box if "NPT" in self.routine else self.initial_box
 
             # soft update neighbor list before a step
-            typed_nbrs = self.soft_update_nbrs(typed_nbrs, state.position, current_box)
+            if self.static_args['use_neighbor_list']:
+                typed_nbrs, profile = self.soft_update_nbrs(typed_nbrs, state.position, current_box, profile)
 
             # check if there is any hard overflow
             error_code = error_code | self.check_hard_overflow(state, typed_nbrs, current_box)
@@ -513,10 +543,10 @@ class Simulation:
             # apply the simulation step                  
             state = self.apply_fn(state,
                                   cell=current_box,
-                                  nbrs=typed_nbrs.nbrs_nm if self.static_args['use_neighbor_list'] else None,
+                                  nbrs=typed_nbrs.nbrs_nm if typed_nbrs else None,
                                   static_args=self.static_args)
             
-            return ((state, typed_nbrs, error_code),
+            return ((state, typed_nbrs, error_code, profile),
                     (state.position,
                      state.velocity, 
                      state.box if "NPT" in self.routine else self.initial_box,
@@ -540,6 +570,7 @@ class Simulation:
             self.box_trajectory = []
         self.tic_of_this_run = time()
         self.error_code = 0
+        self.neighbor_update_profile = jnp.array([0,0])
         self.print_report()
         self.is_initial_state = False
 
@@ -558,11 +589,12 @@ class Simulation:
                              self._step_chunk_size - self.step % self._step_chunk_size)
             states = (self.state,
                       self.typed_nbrs if self.static_args['use_neighbor_list'] else None,
-                      self.error_code)
+                      self.error_code,
+                      self.neighbor_update_profile)
             states_new, traj = jax.lax.scan(self.inner_step_fn,
                                             states,
                                             length=next_chunk)
-            state_new, typed_nbrs_new, error_code = states_new
+            state_new, typed_nbrs_new, error_code, profile = states_new
             self.error_code |= error_code
 
             # If there is any hard overflow, we have to re-run the chunk
@@ -574,6 +606,7 @@ class Simulation:
             self.resolve_error_code()
             self.state = state_new
             self.typed_nbrs = typed_nbrs_new
+            self.neighbor_update_profile = profile
             if "NPT" in self.routine:
                 self.current_box = self.state.box
             self.step += next_chunk
@@ -619,10 +652,12 @@ class Simulation:
         '''
             Returns the force of the current state.
         '''
-        return self.force_fn(self.state.position,
-                             cell=self.current_box,
-                             nbrs_nm=self.typed_nbrs.nbrs_nm if self.static_args['use_neighbor_list'] else None,
-                             static_args=self.static_args)
+        return -jax.jit(jax.grad(self.energy_fn), static_argnames=('static_args'))(
+                            self.state.position,
+                            cell=self.current_box,
+                            nbrs_nm=self.typed_nbrs.nbrs_nm if self.static_args['use_neighbor_list'] else None,
+                            static_args=self.static_args
+                        )
 
     def getPressure(self):
         '''
