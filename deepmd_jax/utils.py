@@ -6,6 +6,10 @@ import flax.linen as nn
 import pickle, os
 from scipy.interpolate import PPoly, BPoly
 
+# Global system settings
+import warnings
+warnings.simplefilter(action='ignore', category=UserWarning)
+jax.config.update("jax_traceback_filtering", "off")
 if not jax.config.read('jax_enable_x64'):
     jax.config.update('jax_default_matmul_precision', 'float32')
 np.set_printoptions(precision=4, suppress=True)
@@ -316,5 +320,35 @@ def periodic_replicate(copy, coord, box, type_idx=None, force=None, velocity=Non
         ret.append(np.concatenate([velocity]*copy.prod()))
     return ret
     
+def reorder_by_device(coord, type_count):
+    '''
+        For multiple devices, ghost atoms are padded to ensure equal partitioning.
+        Each type of atom is padded and partitioned separately and then concatenated.
+    '''
+    K = jax.device_count()
+    coord = jnp.concatenate(
+                [
+                    jnp.pad(c,
+                            ((0,-c.shape[0]%K),)+((0,0),)*(c.ndim-1)
+                        ).reshape(K,-1,*c.shape[1:])
+                    for c in split(coord,type_count)
+                ], axis=1).reshape(-1, *coord.shape[1:])
+    sharding = jax.sharding.PositionalSharding(jax.devices())
+    return jax.lax.with_sharding_constraint(coord, sharding.replicate())
 
-    
+def get_mask_by_device(type_count):
+    '''
+        For multiple-device partitioning, ghost atoms are padded.
+        Returns a binary mask indicating the valid atoms, sharded by device.
+    '''
+    K = jax.device_count()
+    mask = concat([
+                concat([jnp.ones(count, dtype=bool),
+                        jnp.zeros((-count%K,), dtype=bool)
+                        ]).reshape(K,-1)
+                for count in type_count
+                ],
+            axis=1).reshape(-1)
+    # ensure mask is sharded by device
+    sharding = jax.sharding.PositionalSharding(jax.devices())
+    return jax.lax.with_sharding_constraint(mask, sharding)
