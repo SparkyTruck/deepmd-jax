@@ -7,13 +7,18 @@ import pickle, os
 from scipy.interpolate import PPoly, BPoly
 
 # Global system settings
-import warnings
-warnings.simplefilter(action='ignore', category=UserWarning)
-jax.config.update("jax_traceback_filtering", "off")
-if not jax.config.read('jax_enable_x64'):
-    jax.config.update('jax_default_matmul_precision', 'float32')
-np.set_printoptions(precision=4, suppress=True)
-print('# DeepMD-JAX: Starting on %d device(s):' % jax.device_count(), jax.devices())
+def initialize():
+    import warnings
+    warnings.simplefilter(action='ignore', category=UserWarning)
+    warnings.simplefilter(action='ignore', category=FutureWarning)
+    # jax.config.update("jax_traceback_filtering", "off")
+    # jax.config.update("jax_log_compiles", True)
+    if not jax.config.read('jax_enable_x64'):
+        jax.config.update('jax_default_matmul_precision', 'float32')
+    np.set_printoptions(precision=4, suppress=True)
+    print('# DeepMD-JAX: Starting on %d device(s):' % jax.device_count(), jax.devices())
+
+initialize()
 
 @jax.jit
 def norm_ortho_box(coord, box):
@@ -36,6 +41,7 @@ def shift(coord, box, ortho=False): # shift coordinates to the parallelepiped ar
 
 def sr(r, rcut): # 1/r with smooth cutoff at rcut
     t = r / rcut
+    # jax.debug.print("🤯 {x} 🤯", x=t.tangent)
     return (r>1e-14) * (t<1) / (r+1e-15) * (1-3*t**2+2*t**3)
 
 def split(array, type_count, axis=0, K=1): # split array by idx into list of subarrays with device count K
@@ -86,6 +92,7 @@ def get_relative_coord(coord_N3, box_33, type_count, lattice_args, nbrs_nm=None)
                 else:
                     x_N3M = shift(coord_n3[j][nbrs_nm[i][j]] - coord_n3[i][:,None], box_33, True).transpose(0,2,1)
                     r_NM = jnp.linalg.norm(jnp.where(jnp.abs(x_N3M) > 1e-15, x_N3M, 1e-15), axis=1) * (nbrs_nm[i][j] < len(coord_n3[j]))
+                    x_N3M = x_N3M * (nbrs_nm[i][j] < len(coord_n3[j]))[:,None]
             x.append(x_N3M)
             r.append(r_NM)
         x_n3m.append(x)
