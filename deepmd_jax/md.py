@@ -245,10 +245,14 @@ class Simulation:
                  seed=0,
                  model_deviation_paths=[],
                  use_neighbor_list_when_possible=True,
-                 tau_t=1000.,
+                 tau_t=100.,
                  tau_p=1000.,
-                 chain_length_t=1,
-                 chain_length_p=1,
+                 chain_length_t=3,
+                 chain_length_p=3,
+                 chain_steps_t=1,
+                 chain_steps_p=1,
+                 sy_steps_t=1,
+                 sy_steps_p=1,
                 ):
         '''
             Initialize a Simulation instance.
@@ -267,10 +271,10 @@ class Simulation:
             seed: random seed for jax random number generator, e.g. in velocity initialization
             model_deviation_paths: a list of deepmd models for deviation calculation used in active learning
             use_neighbor_list_when_possible: if False, neighbor list will be disabled (for debug use)
-            tau_t: Nose-Hoover thermostat relaxation time (fs)
-            tau_p: Nose-Hoover barostat relaxation time (fs)
-            chain_length_t: Nose-Hoover thermostat chain length
-            chain_length_p: Nose-Hoover barostat chain length
+            tau: Nose-Hoover thermostat/barostat relaxation time (fs)
+            chain_length: Nose-Hoover thermostat/barostat chain length
+            chain_steps: Nose-Hoover thermostat/barostat chain steps
+            sy_steps: Nose-Hoover thermostat/barostat number of Suzuki-Yoshida steps (must be 1,3,5,7)
             ############################
             Usage:
                 sim = Simulation(...)
@@ -314,7 +318,9 @@ class Simulation:
             self._routine_args = {
                 'kT': self._temperature * TEMP_UNIT_CONVERSION,
                 'tau': tau_t,
-                'chain_length': chain_length_t
+                'chain_length': chain_length_t,
+                'chain_steps': chain_steps_t,
+                'sy_steps': sy_steps_t,
             }
         elif self._routine == "NPT":
             box33 = jnp.diag(self._initial_box) if self._initial_box.shape == (3,) else self._initial_box
@@ -325,8 +331,14 @@ class Simulation:
             self._routine_args = {
                 'pressure': pressure * PRESS_UNIT_CONVERSION,
                 'kT': self._temperature * TEMP_UNIT_CONVERSION,
-                'barostat_kwargs': {'tau': tau_p, 'chain_length': chain_length_p},
-                'thermostat_kwargs': {'tau': tau_t, 'chain_length': chain_length_t}
+                'barostat_kwargs': {'tau': tau_p,
+                                    'chain_length': chain_length_p,
+                                    'chain_steps': chain_steps_p,
+                                    'sy_steps': sy_steps_p},
+                'thermostat_kwargs': {'tau': tau_t,
+                                      'chain_length': chain_length_t,
+                                      'chain_steps': chain_steps_t,
+                                      'sy_steps': sy_steps_t},
             }
             self._pressure = pressure
         else:
@@ -354,6 +366,8 @@ class Simulation:
         ''' 
             Generate the energy function and relevant functions.
             Need to regenerate when static_args changes.
+            Beware of the order of functions here, as some functions depend on previous generated functions.
+            Neighbor list functions are generated in _construct_nbr_and_nbr_fn separately.
         '''
         self._energy_fn = self._get_energy_fn()
         self._force_fn = lambda coord, **kwargs: -jax.grad(self._energy_fn)(coord, **kwargs)
@@ -375,10 +389,10 @@ class Simulation:
                                                      self._shift_fn,
                                                      self._dt,
                                                      **self._routine_args)
-        self._multiple_inner_step_fn = self._get_inner_step()
         self._report_fn = self._generate_report_fn()
         self._soft_update_nbrs = self._get_soft_update_nbrs_fn()
         self._check_hard_overflow = self._get_check_hard_overflow_fn()
+        self._multiple_inner_step_fn = self._get_inner_step()
 
     def _get_energy_fn(self, model_and_variables=None):
 
@@ -471,13 +485,7 @@ class Simulation:
                                             nbrs_nm=nbrs_nm,
                                         )
         elif self._routine == "NPT":
-            self._reporters["Pressure"] = lambda state, nbrs_nm: jax_md.quantity.pressure(
-                                            self._energy_fn,
-                                            state.position,
-                                            state.box,
-                                            self._reporters["KE"](state, nbrs_nm),
-                                            nbrs_nm=self._typed_nbrs.nbrs_nm if self._static_args['use_neighbor_list'] else None,
-                                        ) / PRESS_UNIT_CONVERSION
+            self._reporters["Pressure"] = lambda state, nbrs_nm: self._pressure_fn(state, state.box, nbrs_nm)
             self._reporters["box_x"] = lambda state, _: state.box[0]
             self._reporters["Invariant"] = lambda state, nbrs_nm: jax_md.simulate.npt_nose_hoover_invariant(
                                             self._energy_fn,
@@ -738,7 +746,7 @@ class Simulation:
                 continue
 
             # If nothing overflows, update the tracked state and record the trajectory
-            self._resolve_error_code()
+            self._keep_nbr_or_lattice_up_to_date()
             self._state = state_new
             self._typed_nbrs = typed_nbrs_new
             self._neighbor_update_profile = profile

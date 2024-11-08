@@ -1,9 +1,9 @@
 # Deepmd-JAX
 
-Welcome to Deepmd-JAX v0.2! Supports Deep Potential, Deep Wannier, and Long Range (DPLR) models. Also, try the Deep Potential Message Passing (DP-MP) model for more accuracy. Experience blazing fast training and simulation of machine learning potentials!
+Welcome to Deepmd-JAX v0.2! Check this [example_notebook] for a quick tutorial. Supports Deep Potential (DP), Deep Wannier (DW), DP Long Range (DPLR), and you can try the Message Passing (DP-MP) model for more accuracy. Perform NVE/NVT/NPT simulations on multiple GPUs, and enjoy a simple and lightning-fast training and simulation workflow!
 
 # Installation
-Requires CUDA 12 to run on GPUs. We recommend using a conda environment
+Requires CUDA 12 for GPU support; latest CUDA subversion preferred but not mandatory. We recommend using a conda environment
 ```bash
 conda create -n deepmd-jax python=3.12
 conda activate deepmd-jax
@@ -14,5 +14,3 @@ git clone https://github.com/SparkyTruck/deepmd-jax.git
 pip install -e ./deepmd-jax
 ```
 
-## Quick Start Guide
-Check this [example_notebook] for a tutorial of training a Deep Potential model and running simulations with it.
