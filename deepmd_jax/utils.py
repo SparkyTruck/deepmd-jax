@@ -13,8 +13,7 @@ def initialize():
     warnings.simplefilter(action='ignore', category=FutureWarning)
     # jax.config.update("jax_traceback_filtering", "off")
     # jax.config.update("jax_log_compiles", True)
-    if not jax.config.read('jax_enable_x64'):
-        jax.config.update('jax_default_matmul_precision', 'float32')
+    jax.config.update('jax_default_matmul_precision', 'float32')
     np.set_printoptions(precision=4, suppress=True)
     print('# DeepMD-JAX: Starting on %d device(s):' % jax.device_count(), jax.devices())
 
@@ -298,33 +297,34 @@ def compress_model(model, variables, Ngrids, rmin):
             % (err0.mean(), err1.mean(), err2.mean(), err0.max(), err1.max(), err2.max()))
     return model, variables
 
-def periodic_replicate(copy, coord, box, type_idx=None, force=None, velocity=None):
+def periodic_replicate(n_copy, coord, box, type_idx=None, force=None, velocity=None):
     '''
-        Used to replicate a periodic system in all 3 directisons.
-        Input: copy: (1,) or (3,), number of copies (in each direction)
+        Replicate a periodic system in all 3 directions specified by copy.
+        Input: n_copy: (1,) or (3,), number of copies (in all/each direction)
                coord: (N,3)
                box: (1,) or (3,) or (3,3)
                Optional: type_idx (N,) force (N,3) velocity (N,3)
         Returns the replicated coord, box, and if provided, type_idx, force, velocity.
     '''
-    copy = np.array(copy)
+    n_copy = (n_copy * np.ones(3)).astype(int)
     box = np.array(box)
-    if box.size == 1 and copy.size == 1:
-        box = box * copy
+    if box.size <= 3:
+        return_box = n_copy * box
+        box = np.diag(np.array(box) * np.ones(3))
     else:
-        copy = (copy * np.ones(3)).astype(int)
-        box = np.diag(copy) @ box
+        return_box = np.diag(n_copy) @ box
     for d in range(3):
-        coord = np.concatenate([(coord + i*box[d])[None]
-                                for i in range(copy[d])]
+        coord = np.concatenate([(coord + i*box[:,d])[None]
+                                for i in range(n_copy[d])]
                                ).reshape(-1,3)
-    ret = [coord, box]
+    box = box * n_copy
+    ret = [coord, return_box]
     if type_idx is not None:
-        ret.append(np.tile(type_idx, copy.prod()))
+        ret.append(np.tile(type_idx, n_copy.prod()))
     if force is not None:
-        ret.append(np.concatenate([force]*copy.prod()))
+        ret.append(np.concatenate([force]*n_copy.prod()))
     if velocity is not None:
-        ret.append(np.concatenate([velocity]*copy.prod()))
+        ret.append(np.concatenate([velocity]*n_copy.prod()))
     return ret
     
 def reorder_by_device(coord, type_count):

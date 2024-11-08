@@ -112,7 +112,7 @@ class typed_neighbor_list_fn():
     allocate: Callable = jax_md.dataclasses.static_field()
     update: Callable = jax_md.dataclasses.static_field()
 
-def typed_neighbor_list(box, type_idx, rcut, buffer_ratio=1.1):
+def typed_neighbor_list(box, type_idx, rcut, buffer_ratio=1.2):
     '''
         Returns a typed neighbor list function that can be used to allocate and update neighbor lists.
         allocate_fn() and update_fn() accept real space coordinates but processes internally in fractional coordinates.
@@ -507,7 +507,6 @@ class Simulation:
         '''
         char_space = ["8"] + ["12"] * len(self._reporters) + ["6"]
         if self._is_initial_state:
-            self._tic = time()
             headers = ["Step"] + list(self._reporters.keys()) + ["Time"]
             if self._debug and self._static_args['use_neighbor_list']:
                 headers += ["NbrUpdateRate"]
@@ -516,26 +515,24 @@ class Simulation:
         report = [self.step] + self._report_fn(
                                     self._state,
                                     self._typed_nbrs.nbrs_nm if self._static_args['use_neighbor_list'] else None
-                                ) + [time() - self._tic]
+                                ) + [time() - self._tic_between_report]
         if self._debug and self._static_args['use_neighbor_list']:
             char_space += ["6"]
             report += [self._neighbor_update_profile.item()]
         self.log.append(report)
         print(f"{report[0]:<8d} " + " ".join([f"{value:<{char_space[i+1]}.3f}" for i, value in enumerate(report[1:])]))
-        self._tic = time()
+        self._tic_between_report = time()
 
     def _construct_nbr_and_nbr_fn(self, position=None):
         '''
             Initial construction, or reconstruction when dr_buffer_neighbor or neighbor_buffer_ratio changes.
         '''
-        if position is None:
-            position = self._state.position
-        position = position * self._current_box if "NPT" in self._routine else position
         self._typed_nbr_fn = typed_neighbor_list(self._current_box,
                                                 self._type_idx,
                                                 self._model.params['rcut'] + self._dr_buffer_neighbor,
                                                 self._neighbor_buffer_ratio)
-        self._typed_nbrs = self._typed_nbr_fn.allocate(position, box=self._current_box)
+        self._typed_nbrs = self._typed_nbr_fn.allocate(self._getRealPosition(position),
+                                                       box=self._current_box)
     
     def _get_check_hard_overflow_fn(self):
 
@@ -578,11 +575,9 @@ class Simulation:
             if self._error_code & 4: # Neighbor list buffer overflow twice
                 self._neighbor_buffer_ratio += 0.05
                 self._construct_nbr_and_nbr_fn()
-                position = self._state.position * self._current_box if "NPT" in self._routine else self._state.position
-                self._typed_nbrs = self._typed_nbr_fn.allocate(position, box=self._current_box)
             else: # Neighbor list buffer overflow once, simply reallocate
-                position = self._state.position * self._current_box if "NPT" in self._routine else self._state.position
-                self._typed_nbrs = self._typed_nbr_fn.allocate(position, box=self._current_box)
+                self._typed_nbrs = self._typed_nbr_fn.allocate(self._getRealPosition(),
+                                                               box=self._current_box)
             FLAG_4 = True
         elif self._error_code & 8: # Not fully implemented yet!!!
             self._static_args = self._get_static_args(self._state.position, use_neighbor_list=False)
@@ -655,7 +650,7 @@ class Simulation:
             # soft update neighbor list before a step
             if self._static_args['use_neighbor_list']:
                 typed_nbrs, profile = self._soft_update_nbrs(typed_nbrs,
-                                                             state.position * current_box if "NPT" in self._routine else state.position,
+                                                             self._getRealPosition(state.position),
                                                              current_box,
                                                              profile)
 
@@ -683,22 +678,31 @@ class Simulation:
         
         return multiple_inner_step
 
-    def _initialize_run(self):
+    def _initialize_run(self, steps):
         '''
             Reset trajectory for each new run; 
             if the simulation has not been run before, include the initial state.
             Initialize run variables.
         '''
+        print(f'# Running {steps} steps...')
+        traj_length = steps + int(self._is_initial_state)
+        self._offset = self.step - int(self._is_initial_state)
+        traj_dtype = np.float64 if jax.config.read('jax_enable_x64') else np.float32
+        # preallocate space for trajectory
+        try:
+            self._position_trajectory = np.zeros((traj_length, self._natoms, 3), dtype=traj_dtype)
+            self._velocity_trajectory = np.zeros((traj_length, self._natoms, 3), dtype=traj_dtype)
+            self._box_trajectory = np.zeros((traj_length,) + self._current_box.shape, dtype=traj_dtype)
+            safe_buffer = np.zeros((200, self._natoms, 3), dtype=traj_dtype)
+        except MemoryError:
+            raise MemoryError("Trajectory too large to fit in CPU RAM. Split into multiple run(steps) and save/postprocess the segment after each run.")
+        del safe_buffer
         if self._is_initial_state:
-            self._position_trajectory = [self._state.position[None] * self._current_box if "NPT" in self._routine else self._state.position[None]]
-            self._velocity_trajectory = [self._state.velocity[None]]
-            self._box_trajectory = [self._current_box[None]]
-        else:
-            self._position_trajectory = []
-            self._velocity_trajectory = []
-            self._box_trajectory = []
+            self._position_trajectory[0] = self.getPosition()
+            self._velocity_trajectory[0] = self.getVelocity()
+            self._box_trajectory[0] = self.getBox()
         self._tic_of_this_run = time()
-        self._tic = time()
+        self._tic_between_report = time()
         self._error_code = 0
         self._print_report()
         self._is_initial_state = False
@@ -708,12 +712,8 @@ class Simulation:
             Run the simulation for a number of steps.
         '''
 
-        print(f'# Running {steps} steps...')
-        if steps * self._state.position.shape[0] * self._state.position.dtype.itemsize > 1e9:
-            print('# Note: If memory issues arise with long trajectories, split into multiple run(steps) and save/discard each segment.')
-        self._initialize_run()
+        self._initialize_run(steps)
         remaining_steps = steps
-
         while remaining_steps > 0:
 
             # run the simulation for a jit-compiled chunk of steps 
@@ -744,12 +744,13 @@ class Simulation:
             self._neighbor_update_profile = profile
             if "NPT" in self._routine:
                 self._current_box = self._state.box
+            pos_traj, vel_traj, box_traj = traj
+            idx_l, idx_r = self.step - self._offset, self.step - self._offset + next_chunk
+            self._position_trajectory[idx_l:idx_r] = pos_traj
+            self._velocity_trajectory[idx_l:idx_r] = vel_traj
+            self._box_trajectory[idx_l:idx_r] = box_traj
             self.step += next_chunk
             remaining_steps -= next_chunk
-            pos_traj, vel_traj, box_traj = traj
-            self._position_trajectory.append(np.array(pos_traj))
-            self._velocity_trajectory.append(np.array(vel_traj))
-            self._box_trajectory.append(np.array(box_traj))
 
             # Report at preset regular intervals
             if self.step % self.report_interval == 0 or remaining_steps == 0:
@@ -758,10 +759,10 @@ class Simulation:
         self._print_run_profile(steps, time() - self._tic_of_this_run)
         self._keep_nbr_or_lattice_up_to_date()
         trajectory = {
-            'position': np.concatenate(self._position_trajectory),
-            'velocity': np.concatenate(self._velocity_trajectory),
-            'box': np.concatenate(self._box_trajectory)
-            }
+            'position': self._position_trajectory,
+            'velocity': self._velocity_trajectory,
+            'box': self._box_trajectory,
+        }
         return trajectory
     
     def _print_run_profile(self, steps, elapsed_time):
@@ -774,11 +775,24 @@ class Simulation:
                     (steps, elapsed_time // 3600, (elapsed_time % 3600) // 60, elapsed_time % 60))
         print('# Performance: %.3f ns/day, %.3f step/μs/atom' % (nanosecond_per_day, steps_per_microsecond_per_atom))
 
+    def _getRealPosition(self, position=None):
+        '''
+            Returns the real space position (Å) of the atoms.
+        '''
+        if position is None:
+            position = self._state.position
+        if not "NPT" in self._routine:
+            return position
+        elif self._current_box.size == 3:
+            return position * self._current_box
+        else:
+            return position @ self._current_box
+        
     def getPosition(self):
         '''
             Returns the current position (Å) of the atoms.
         '''
-        return np.array(self._state.position * self._current_box if "NPT" in self._routine else self._state.position)
+        return np.array(self._getRealPosition())
 
     def setPosition(self, position):
         '''
