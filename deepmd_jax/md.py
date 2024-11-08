@@ -806,6 +806,8 @@ class Simulation:
         '''
             Set the position (Å) of the atoms. Must be the same shape as the initial position representing the same atom types.
         '''
+        if position.shape != self._state.position.shape:
+            raise ValueError("Position must have the same shape as the initial position, or you have to create a new Simulation instance.")
         self._state = self._state.set(position=position)
         self._keep_nbr_or_lattice_up_to_date()
         self._state = self._state.set(force=jax.jit(self._force_fn)(
