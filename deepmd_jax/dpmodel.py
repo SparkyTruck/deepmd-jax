@@ -24,7 +24,7 @@ class DPModel(nn.Module):
             return coord, type_count, jnp.ones_like(coord[:,0]), compress, 1, nsel, None
             
     @nn.compact
-    def __call__(self, coord_N3, box_33, static_args, nbrs_nm=None):
+    def __call__(self, coord_N3, box_33, static_args, nbrs_nm=None, perturb=0.):
         # prepare input parameters
         coord_N3, type_count, mask, compress, K, nsel, nbrs_nm = self.get_input(coord_N3, static_args, nbrs_nm)
         A, L = self.params['axis'], static_args['lattice']['lattice_max'] if nbrs_nm is None else None
