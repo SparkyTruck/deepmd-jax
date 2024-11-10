@@ -1,7 +1,9 @@
 # Deepmd-JAX
 
 Welcome to Deepmd-JAX v0.2! Check this [example_notebook] for a quick tutorial. 
+
 Supports Deep Potential (DP), Deep Wannier (DW), DP Long Range (DPLR), and you can try the Message Passing (DP-MP) model for more accuracy. 
+
 You can perform NVE/NVT/NPT simulations on multiple GPUs, and enjoy a simple and lightning-fast training and simulation workflow!
 
 # Installation
