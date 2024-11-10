@@ -7,7 +7,8 @@ Deepmd-JAX supports:
 - **Deep Potential (DP)**: Fast energy and force predictions.
 - **Deep Wannier (DW)**: Predicting Wannier centers associated to atoms.
 - **DP Long Range (DPLR)**: Incorporate explicit long-range Coulomb interactions.
-Also, you can try the **DP-MP** architecture for enhanced accuracy in complex systems.
+
+Also, you can try the **DP-MP** architecture for enhanced accuracy.
 
 Deepmd-JAX allows **NVE/NVT/NPT simulations** on multiple GPUs, offering a simple, lightning-fast training and simulation workflow.
 
