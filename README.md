@@ -94,8 +94,6 @@ jax.config.update('jax_enable_x64', True)
 
 The default units are Angstrom, eV, femtosecond, and their derived units. The only exceptions are the parameters `temperature`(Kelvin), `pressure`(bar), and `mass` (Dalton) when initializing Simulate().
 
-```python
+---
 
-### 
-
-We're in active development, and if you encounter any issues, please feel free to contact me or open an issue on the GitHub page. Have fun!
+This project is in active development, and if you encounter any issues, please feel free to contact me or open an issue on the GitHub page. Have fun!
