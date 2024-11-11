@@ -17,7 +17,7 @@ Currently allows **NVE/NVT/NPT simulations** on **multiple GPUs** based on a bac
 Requires **CUDA 12** for GPU support (latest CUDA subversion preferred, but not mandatory). We recommend using a conda environment:
 
 ```
-conda create -n deepmd-jax python=3.12`  
+conda create -n deepmd-jax python=3.12
 conda activate deepmd-jax
 ```
 
@@ -25,10 +25,9 @@ Clone the repository and install it in your working directory:
 
 ```
 git clone https://github.com/SparkyTruck/deepmd-jax.git --branch staging
-pip install -e ./deepmd-jax
+cd deepmd-jax
+pip install -e .
 ```
-
-The '-e' flag installs the package in editable mode, so you can feel free to modify the code in the package.
 
 ## Quick Start
 
