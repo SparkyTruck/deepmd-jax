@@ -24,7 +24,7 @@ conda activate deepmd-jax
 Clone the repository and install it in your working directory:
 
 ```
-git clone https://github.com/SparkyTruck/deepmd-jax.git
+git clone https://github.com/SparkyTruck/deepmd-jax.git --branch staging
 pip install -e ./deepmd-jax
 ```
 
