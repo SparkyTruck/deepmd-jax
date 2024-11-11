@@ -10,7 +10,7 @@ Deepmd-JAX supports:
 
 Also, you can try the **DP-MP** architecture for enhanced accuracy.
 
-Currently allows **NVE/NVT/NPT simulations** on **multiple GPUs** based on a backend of [jax-md](https://github.com/jax-md/jax-md)
+Currently allows **NVE/NVT/NPT simulations** on **multiple GPUs** based on a backend of [jax-md](https://github.com/jax-md/jax-md).
 
 ## Installation
 
@@ -28,14 +28,16 @@ git clone https://github.com/SparkyTruck/deepmd-jax.git
 pip install -e ./deepmd-jax
 ```
 
+The '-e' flag installs the package in editable mode, so you can feel free to modify the code in the package.
+
 ## Quick Start
 
 ### Preparing Your Dataset
-To train a model, prepare a dataset in the DeepMD-kit format as described in the [DeepMD-kit documentation](https://docs.deepmodeling.com/projects/deepmd/en/r2/data/system.html). Note: Currently only supports periodic systems.
+To train a model, prepare a dataset in the [DeepMD-kit format](https://docs.deepmodeling.com/projects/deepmd/en/r2/data/system.html). Note: Currently only supports periodic systems.
 
 
 ### Training a Model
-Once your dataset is ready, do something like
+Once your dataset is ready, train a model like this:
 
 ```python
 from deepmd_jax.train import train
@@ -55,7 +57,7 @@ The default hyperparameters should be an okay baseline, but you can adjust addit
 
 To run a simulation, prepare the following numpy arrays:
 
-1. `initial_position` (Å): shape `(n, 3)` where `n` is the number of atoms.
+1. `initial_position`: shape `(n, 3)` where `n` is the number of atoms.
 2. `box` (Å): shape `(1,)`, `(3,)` or `(3, 3)`.
 3. `type_idx`: shape `(n,)`, indicates the type of each atom (similar to `type.raw` in the training dataset).
 
@@ -66,21 +68,21 @@ from deepmd_jax.md import Simulate
 
 sim = Simulate(
     model_path='trained_model.pkl',
-    box=box,
-    type_idx=type_idx,       # the meaning (i.e. 0 for Oxygen, 1 for Hydrogen) must match the dataset used to train the model
-    mass=[15.9994, 1.0078],  # Oxygen, Hydrogen
-    routine='NVT',           # 'NVE', 'NVT', 'NPT'
-    dt=0.5,                  # femtoseconds
-    initial_position=initial_position,
-    temperature=350,         # Kelvin
+    box=box,                           # Angstroms
+    type_idx=type_idx,                 # the map (i.e. 0 for Oxygen, 1 for Hydrogen) must match the dataset used to train the model
+    mass=[15.9994, 1.0078],            # Oxygen, Hydrogen
+    routine='NVT',                     # 'NVE', 'NVT', 'NPT'
+    dt=0.5,                            # femtoseconds
+    initial_position=initial_position, # Angstroms
+    temperature=300,                   # Kelvin
 )
 
-trajectory = sim.run(100000) # Run for 100,000 steps
+trajectory = sim.run(100000)           # Run for 100,000 steps
 ```
 
 ### Precision Settings
 
-By default, Deepmd-JAX uses single precision (`float32`) for both training and simulation, which I find to be generally sufficient. However, if you need double precision, enable it at the **beginning** of your script with:
+By default, single precision (`float32`) is used for both training and simulation, which I find to be generally sufficient. However, if you need double precision, enable it at the **beginning** of your script with:
 
 ```python
 import jax
