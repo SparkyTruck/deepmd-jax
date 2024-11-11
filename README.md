@@ -79,7 +79,7 @@ sim = Simulate(
 trajectory = sim.run(100000)           # Run for 100,000 steps
 ```
 
-Again, check the `Simulate` class for possible additional arguments.
+Again, check the `Simulate` class for additional arguments and methods.
 
 ### Precision Settings
 
