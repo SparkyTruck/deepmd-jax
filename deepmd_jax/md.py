@@ -216,7 +216,7 @@ def typed_neighbor_list(box, type_idx, rcut, buffer_ratio=1.2):
 class Simulation:
     '''
         A deepmd-based simulation class that wraps jax_md.simulate routines.
-        Targeting a fully automatic use: initialize and run(steps).
+        Two-step usage: instantiate and run(steps).
     '''
 
     step: int = 0
