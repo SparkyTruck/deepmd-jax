@@ -3,7 +3,7 @@
 Welcome to **DeepMD-jax v0.2**!
 
 ## Supported Features
-Deepmd-JAX supports:
+DeepMD-jax supports:
 - **Deep Potential (DP)**: Fast energy and force predictions.
 - **Deep Wannier (DW)**: Predicting Wannier centers associated to atoms.
 - **DP Long Range (DPLR)**: Incorporate explicit long-range Coulomb interactions.
@@ -33,7 +33,7 @@ The '-e' flag installs the package in editable mode, so you can feel free to mod
 ## Quick Start
 
 ### Preparing Your Dataset
-To train a model, prepare a dataset in the [DeepMD-kit format](https://docs.deepmodeling.com/projects/deepmd/en/r2/data/system.html). Note: Currently only supports periodic systems.
+To train a model, prepare your dataset in the same [DeepMD-kit format](https://docs.deepmodeling.com/projects/deepmd/en/r2/data/system.html). Note: Currently only supports periodic systems.
 
 
 ### Training a Model
@@ -46,7 +46,7 @@ train(
       model_type='energy',             # Model type: 'energy' for energy models, 'atomic' for Wannier models
       rcut=6.0,                        # Cutoff radius
       save_path='trained_model.pkl',   # Path to save the trained model
-      train_data_path='dataset/path/', # Path to the training dataset
+      train_data_path='dataset/path/', # Path to the training dataset, or you can use a list of paths
       step=1000000,                    # Number of training steps
 )
 ```
@@ -58,10 +58,10 @@ The default hyperparameters should be an okay baseline, but you can adjust addit
 To run a simulation, prepare the following numpy arrays:
 
 1. `initial_position`: shape `(n, 3)` where `n` is the number of atoms.
-2. `box` (Å): shape `(1,)`, `(3,)` or `(3, 3)`.
+2. `box`: shape `(1,)`, `(3,)` or `(3, 3)`.
 3. `type_idx`: shape `(n,)`, indicates the type of each atom (similar to `type.raw` in the training dataset).
 
-Then, use the following code to run the simulation:
+Then, an example of running a simulation is as follows:
 
 ```python
 from deepmd_jax.md import Simulate
@@ -69,7 +69,7 @@ from deepmd_jax.md import Simulate
 sim = Simulate(
     model_path='trained_model.pkl',
     box=box,                           # Angstroms
-    type_idx=type_idx,                 # the map (i.e. 0 for Oxygen, 1 for Hydrogen) must match the dataset used to train the model
+    type_idx=type_idx,                 # here the map (i.e. 0 for Oxygen, 1 for Hydrogen) must match the dataset used to train the model
     mass=[15.9994, 1.0078],            # Oxygen, Hydrogen
     routine='NVT',                     # 'NVE', 'NVT', 'NPT'
     dt=0.5,                            # femtoseconds
@@ -80,6 +80,8 @@ sim = Simulate(
 trajectory = sim.run(100000)           # Run for 100,000 steps
 ```
 
+Again, check the `Simulate` class for possible additional arguments.
+
 ### Precision Settings
 
 By default, single precision (`float32`) is used for both training and simulation, which I find to be generally sufficient. However, if you need double precision, enable it at the **beginning** of your script with:
@@ -88,5 +90,7 @@ By default, single precision (`float32`) is used for both training and simulatio
 import jax
 jax.config.update('jax_enable_x64', True)
 ```
+
+### 
 
 We're in active development, and if you encounter any issues, please feel free to contact me or open an issue on the GitHub page. Have fun!
