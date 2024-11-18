@@ -80,13 +80,13 @@ class DPModel(nn.Module):
             sel_count = [type_count[i] for i in nsel]
             fit_nselW = [fitting_net(self.params['fit_widths'], use_final=False)(G) for G in split(G_NselAW.reshape(G_NselAW.shape[0],-1),sel_count,0,K=K)]
             T_nsel3W = split(T_Nsel3W, sel_count, 0, K=K)            
-            pred = concat([lax.with_sharding_constraint((f[:,None]*T).sum(-1)[:static_args['type_count'][self.params['nsel'][i]]],
+            pred = concat([lax.with_sharding_constraint((f[:,None]*T).sum(-1)[:type_count[self.params['nsel'][i]]],
                 jax.sharding.PositionalSharding(jax.devices()).replicate()) for i,(f,T) in enumerate(zip(fit_nselW,T_nsel3W))])
         debug = T_NselXW
         return pred * self.params['out_norm'], debug
 
-    def energy_and_force(self, variables, coord_N3, box_33, static_args, nbrs_lists=None):
-        (pred, _), g = value_and_grad(self.apply, argnums=1, has_aux=True)(variables, coord_N3, box_33, static_args, nbrs_lists)
+    def energy_and_force(self, variables, coord_N3, box_33, static_args, nbrs_nm=None):
+        (pred, _), g = value_and_grad(self.apply, argnums=1, has_aux=True)(variables, coord_N3, box_33, static_args, nbrs_nm)
         return pred, -g
     
     def wc_predict(self, variables, coord_N3, box_33, static_args, nbrs_nm=None):

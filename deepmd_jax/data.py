@@ -125,6 +125,12 @@ class DPDataset():
             return [(self.type_count, self.data['energy'].mean())]
         else:
             return sum([subset._get_energy_stats() for subset in self.subsets], [])
+        
+    def get_flattened_data(self):
+        if self.is_leaf:
+            return [{'data':self.data, 'type_count':self.type_count, 'lattice_args':self.lattice_args}]
+        else:
+            return sum([subset.get_flattened_data() for subset in self.subsets], [])
 
 def compute_lattice_candidate(boxes, rcut): # boxes (nframes,3,3)
     N = 2  # This algorithm is heuristic and subject to change. Increase N in case of missing neighbors.
