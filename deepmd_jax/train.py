@@ -40,7 +40,7 @@ def train(
     dplr_q_wc: float = None,
     dplr_beta: float = 0.4,
     dplr_resolution: float = 0.2,
-    lr_limit: float = 5e-7,
+    lr_limit: float = 1e-6,
     beta2: float = 0.99,
     decay_steps: int = 5000,
     getstat_bs: int = 64,
@@ -59,7 +59,7 @@ def train(
             save_path: path to save the trained model.
             train_data: path to training data (str) or list of paths to training data (List[str]).
             val_data: path to validation data (str) or list of paths to validation data (List[str]).
-            step: number of training steps.
+            step: number of training steps. Depending on dataset size, expect 1e5-1e7 for energy models and 1e5-1e6 for wannier models.
             mp: whether to use message passing model for more accuracy at a higher cost.
             atomic_sel: Selects the atom types for prediction. Only used when model_type == 'atomic'.
             embed_widths: Widths of the embedding neural network.
@@ -134,16 +134,16 @@ def train(
     if type(train_data_path) == str:
         train_data_path = [train_data_path]
     train_data = DPDataset(train_data_path,
-                                labels,
-                                {'atomic_sel':atomic_sel})
+                           labels,
+                           {'atomic_sel':atomic_sel})
     train_data.compute_lattice_candidate(rcut)
     use_val_data = val_data_path is not None
     if use_val_data:
         if type(val_data_path) == str:
             val_data_path = [val_data_path]
         val_data = DPDataset(val_data_path,
-                                  labels,
-                                  {'atomic_sel':atomic_sel})
+                             labels,
+                             {'atomic_sel':atomic_sel})
         val_data.compute_lattice_candidate(rcut)
     else:
         val_data = None
@@ -202,11 +202,11 @@ def train(
     }
     if model_type == 'dplr':
         dplr_params = {
-            'wannier_model': {'model': wc_model, 'variables': wc_variables},
-            'q_atoms': dplr_q_atoms,
-            'q_wc': dplr_q_wc,
-            'beta': dplr_beta,
-            'resolution': dplr_resolution,
+            'dplr_wannier_model_and_variables': (wc_model, wc_variables),
+            'dplr_q_atoms': dplr_q_atoms,
+            'dplr_q_wc': dplr_q_wc,
+            'dplr_beta': dplr_beta,
+            'dplr_resolution': dplr_resolution,
         }
         params.update(dplr_params)
     model = DPModel(params)
@@ -359,18 +359,18 @@ def train(
 
 def test(
     model_path: str,
-    data_path: Union[str, List[str]],
+    data_path: str,
     batch_size: int = 1,
 ):
     '''
-        Testing a trained model on a dataset.
+        Testing a trained model on a **single** dataset.
         Input arguments:
             model_path: path to the trained model.
             data_path: path to the data for evaluation.
             batch_size: Increase for potentially faster evaluation, but requires more memory.
     '''
-    if type(data_path) == list and len(data_path) > 1:
-        raise ValueError('Data_path should be a single path for evaluation.')
+    if type(data_path) == list:
+        raise ValueError('Data_path should be a single string path for now.')
 
     if jax.device_count() > 1:
         print('# Note: Currently only one device will be used for evaluation.')
@@ -406,20 +406,24 @@ def test(
         batch, type_count, lattice_args = test_data.get_batch(bs)
         remaining -= bs
         static_args = nn.FrozenDict({'type_count': type_count, 'lattice': lattice_args})
-        pred = evaluate_fn(variables, batch['coord'], batch['box'], static_args)[0]
+        pred = evaluate_fn(variables, batch['coord'], batch['box'], static_args)
         if model.params['type'] == 'energy':
             predictions['energy'].append(pred[0])
             predictions['force'].append(pred[1])
             ground_truth['energy'].append(batch['energy'])
             ground_truth['force'].append(batch['force'])
         else:
-            predictions[model.params['atomic_data_prefix']].append(pred)
+            predictions[model.params['atomic_data_prefix']].append(pred[0])
             ground_truth[model.params['atomic_data_prefix']].append(batch[model.params['atomic_data_prefix']])
     rmse = {}
     for key in predictions.keys():
         predictions[key] = np.concatenate(predictions[key], axis=0)
         ground_truth[key] = np.concatenate(ground_truth[key], axis=0)
         rmse[key] = (((predictions[key] - ground_truth[key]) ** 2).mean() ** 0.5).item()
+    # reorder force back; will delete in future when reordering is moved into dpmodel.py
+    if model.params['type'] == 'energy':
+        ground_truth['force'] = ground_truth['force'][:, test_data.type.argsort(kind='stable').argsort(kind='stable')]
+        predictions['force'] = predictions['force'][:, test_data.type.argsort(kind='stable').argsort(kind='stable')]
     return rmse, predictions, ground_truth
         
 def evaluate(
@@ -434,19 +438,33 @@ def evaluate(
         Input arguments:
             model_path: path to the trained model.
             coord: atomic coordinates of shape (n_frames, n_atoms, 3).
-            box: simulation box of shape (n_frames, 3, 3).
+            box: simulation box of shape (n_frames) + (,) or (1,) or (3,) or (9), or (3,3).
             type_idx: atomic type indices of shape (Natoms,)
             batch_size: Increase for potentially faster evaluation, but requires more memory.
     '''
     # input shape check
     try:
         assert coord.ndim == 3 and coord.shape[2] == 3
-        assert box.ndim == 3 and box.shape[1] == box.shape[2] == 3
-        assert type_idx.ndim == 1
+        assert type_idx.ndim == 1 and box.ndim in [1, 2, 3]
         assert coord.shape[1] == type_idx.shape[0]
         assert coord.shape[0] == box.shape[0]
+        if box.ndim == 1:
+            box = box[:, None, None] * jnp.eye(3)
+        elif box.ndim == 2:
+            if box.shape[1] == 1:
+                box = box[:, None] * jnp.eye(3)
+            elif box.shape[1] == 3:
+                box = jax.vmap(jnp.diag)(box)
+            else:
+                box = box.reshape(box.shape[0], 3, 3)
+        elif box.ndim == 3:
+            assert box.shape[1] == 3 and box.shape[2] == 3
     except:
-        raise ValueError('Input shapes are incorrect.')
+        raise ValueError('Input shapes are incorrect: \n' + 
+                         'coord: (n_frames, n_atoms, 3) \n' +
+                         'box: (n_frames) + (,) or (1,) or (3,) or (9), or (3,3) \n' +
+                         'type_idx (n_atoms).')
+    
     model, _ = load_model(model_path, replicate=False)
 
     # create dataset in temp directory and use test() to evaluate
@@ -460,16 +478,16 @@ def evaluate(
         np.save(box_path, box)
         with open(type_idx_path, "w") as f:
             f.write("\n".join(np.array(type_idx, dtype=int).astype(str)))
-            if model.params['type'] == 'atomic':
-                atomic_path = os.path.join(set_dir, model.params['atomic_data_prefix'] + ".npy")
-                label_count = np.isin(type_idx, model.params['nsel']).sum()
-                np.save(atomic_path, np.zeros((coord.shape[0], label_count, 3)))
-            elif model.params['type'] == 'energy':
-                energy_path = os.path.join(set_dir, "energy.npy")
-                force_path = os.path.join(set_dir, "force.npy")
-                np.save(energy_path, np.zeros(coord.shape[0]))
-                np.save(force_path, np.zeros((coord.reshape(coord.shape[0], -1)).shape))
-            _, predictions, _ = test(model_path, temp_dir, batch_size)
+        if model.params['type'] == 'atomic':
+            atomic_path = os.path.join(set_dir, model.params['atomic_data_prefix'] + ".npy")
+            label_count = np.isin(type_idx, model.params['nsel']).sum()
+            np.save(atomic_path, np.zeros((coord.shape[0], label_count, 3)))
+        elif model.params['type'] == 'energy':
+            energy_path = os.path.join(set_dir, "energy.npy")
+            force_path = os.path.join(set_dir, "force.npy")
+            np.save(energy_path, np.zeros(coord.shape[0]))
+            np.save(force_path, np.zeros((coord.reshape(coord.shape[0], -1)).shape))
+        _, predictions, _ = test(model_path, temp_dir, batch_size)
 
     return predictions
     

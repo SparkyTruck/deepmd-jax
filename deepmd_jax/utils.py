@@ -230,12 +230,15 @@ def save_model(path, model, variables):
         pickle.dump({'model':model, 'variables':variables}, file)
     print('# Model saved to \'%s\'.' % path)
 
-def load_model(path):
+def load_model(path, replicate=True):
     sharding = jax.sharding.PositionalSharding(jax.devices()).replicate()
     with open(path, 'rb') as file:
         m = pickle.load(file)
     print('# Model loaded from \'%s\'.' % path)
-    return m['model'], jax.device_put(m['variables'], sharding)
+    if replicate:
+        return m['model'], jax.device_put(m['variables'], sharding)
+    else:
+        return m['model'], m['variables']
 
 def save_dataset(target_path, labeled_data):
     os.makedirs(target_path, exist_ok=True)

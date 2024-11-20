@@ -5,7 +5,7 @@ import numpy as np
 import flax.linen as nn
 from time import time
 from .data import compute_lattice_candidate
-from .utils import split, concat, load_model, norm_ortho_box
+from .utils import split, concat, load_model, norm_ortho_box, get_p3mlr_fn, get_p3mlr_grid_size
 from typing import Callable
 from functools import partial
 
@@ -222,7 +222,6 @@ class Simulation:
     step: int = 0
     report_interval: int = 100
     _step_chunk_size: int = 100
-    _dr_buffer_neighbor: float = 1.
     _dr_buffer_lattice: float = 1.
     _neighbor_buffer_ratio: float = 1.2
     _neighbor_update_profile: jax.Array = jnp.array([0.])
@@ -245,6 +244,7 @@ class Simulation:
                  seed=0,
                  model_deviation_paths=[],
                  use_neighbor_list_when_possible=True,
+                 neighbor_skin: float = 0.8,
                  tau_t=100.,
                  tau_p=1000.,
                  chain_length_t=3,
@@ -296,6 +296,7 @@ class Simulation:
         self._step_chunk_size = max(10, min(100, 100000 // self._natoms))
         self._model_deviation_paths = model_deviation_paths
         self._use_model_deviation = len(model_deviation_paths) > 0
+        self._neighbor_skin = neighbor_skin
         # If orthorhombic, keep box as (3,); else keep (3,3)
         box = jnp.array(box)
         if box.size == 1:
@@ -398,6 +399,18 @@ class Simulation:
 
         if model_and_variables is None:
             model_and_variables = (self._model, self._variables)
+        model, variables = model_and_variables
+        if model.params['type'] == 'dplr':
+            wc_model, wc_variables = model.params['dplr_wannier_model_and_variables']
+            p3mlr_fn = get_p3mlr_fn(
+                            np.diag(self._current_box),
+                            model.params['dplr_beta'],
+                            resolution=model.params['dplr_resolution'],
+                        )
+            qatoms = jnp.array(np.repeat(model.params['dplr_q_atoms'],
+                                         self._type_count))
+            qwc = jnp.array(np.repeat(model.params['dplr_q_wc'],
+                                      [self._type_count[i] for i in wc_model.params['nsel']]))
 
         def energy_fn(coord, nbrs_nm, perturbation=1., **kwargs):
             '''
@@ -413,8 +426,10 @@ class Simulation:
             # NPT is computed in fractional coordinates; but we need real space forces returned by grad(energy_fn)
             if 'NPT' in self._routine:
                 coord = jax.lax.stop_gradient(coord @ box) + coord - jax.lax.stop_gradient(coord)
-            # Atoms are reordered and grouped by type in neural network inputs, perturbation used in pressure calculation
-            coord = coord[self._type_idx.argsort(kind='stable')] * perturbation
+            # Atoms are reordered and grouped by type in neural network inputs
+            coord = coord[self._type_idx.argsort(kind='stable')]
+            # perturbation = 1, required by jax-md pressure calculation
+            coord = coord * perturbation
             box = box * perturbation
             # Ensure coord and box is replicated on all devices
             sharding = jax.sharding.PositionalSharding(jax.devices()).replicate()
@@ -422,8 +437,19 @@ class Simulation:
             box = jax.lax.with_sharding_constraint(box, sharding)
 
             # Energy calculation
-            if True: # model type is energy
-                E = self._model.apply(self._variables, coord, box, self._static_args, nbrs_nm)[0]
+            E = model.apply(variables,
+                            coord,
+                            box,
+                            self._static_args,
+                            nbrs_nm)[0]
+            if model.params['type'] == 'dplr':
+                wc = wc_model.wc_predict(wc_variables,
+                                         coord,
+                                         box,
+                                         self._static_args,
+                                         nbrs_nm)
+                E = E + p3mlr_fn(jnp.concatenate([coord, wc]),
+                                 jnp.concatenate([qatoms, qwc]))
             return E
 
         return energy_fn
@@ -435,7 +461,7 @@ class Simulation:
         if self._current_box.shape == (3,3):
             return False
         else:
-            return self._current_box.min() > 2 * (self._model.params['rcut'] + self._dr_buffer_neighbor)
+            return self._current_box.min() > 2 * (self._model.params['rcut'] + self._neighbor_skin)
 
     def _get_static_args(self, position, use_neighbor_list=True):
         '''
@@ -536,9 +562,9 @@ class Simulation:
             Initial construction, or reconstruction when dr_buffer_neighbor or neighbor_buffer_ratio changes.
         '''
         self._typed_nbr_fn = typed_neighbor_list(self._current_box,
-                                                self._type_idx,
-                                                self._model.params['rcut'] + self._dr_buffer_neighbor,
-                                                self._neighbor_buffer_ratio)
+                                                 self._type_idx,
+                                                 self._model.params['rcut'] + self._neighbor_skin,
+                                                 self._neighbor_buffer_ratio)
         self._typed_nbrs = self._typed_nbr_fn.allocate(self._getRealPosition(position),
                                                        box=self._current_box)
     
@@ -548,7 +574,7 @@ class Simulation:
             '''
                 Check if there is any overflow that requires recompilation. Jit-compatible.
                 Error code is a binary combination:
-                    1: Box shrunk too much with nbrs: Increase self._dr_buffer_neighbor
+                    1: Box shrunk too much with nbrs: Increase self._neighbor_skin
                     2: Neighbor list buffer overflow: Reallocate neighbor list
                     4: Neighbor list buffer overflow the previous step/chunk
                     8: Lattice overflow: Increase lattice candidate/neighbor count
@@ -558,7 +584,7 @@ class Simulation:
             if self._static_args['use_neighbor_list']:
                 if "NPT" in self._routine:
                     error_code += (1 - state.box[0] / typed_nbrs.reference_box[0]) > \
-                                    0.75 * self._dr_buffer_neighbor / self._model.params['rcut']
+                                    0.75 * self._neighbor_skin / self._model.params['rcut']
                 error_code += 2 * (typed_nbrs.did_buffer_overflow > 0)
             is_nan = jnp.isnan(state.position).any() | jnp.isnan(state.velocity).any()
             is_inf = jnp.isinf(state.position).any() | jnp.isinf(state.velocity).any()
@@ -574,7 +600,7 @@ class Simulation:
         '''
         FLAG_4 = False
         if self._error_code & 1: # Box shrunk too much
-            self._dr_buffer_neighbor += 0.4
+            self._neighbor_skin += 0.4
             if self._check_if_use_neighbor_list():
                 self._construct_nbr_and_nbr_fn()
             else:
@@ -623,7 +649,7 @@ class Simulation:
             scale = typed_nbrs.reference_box[0] / box[0]
             scaled_position = (position % box) * scale
             scaled_position = scaled_position[self._type_idx.argsort(kind='stable')]
-            rcut, dr = self._model.params['rcut'], self._dr_buffer_neighbor
+            rcut, dr = self._model.params['rcut'], self._neighbor_skin
             safe_scale = scale * 1.02 if "NPT" in self._routine else scale
             allowed_movement = ((rcut + dr) - rcut * safe_scale) / 2
             max_movement = norm_ortho_box(

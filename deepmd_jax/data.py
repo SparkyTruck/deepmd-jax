@@ -19,7 +19,7 @@ class DPDataset():
         else:
             self.is_leaf = True
             self.type = np.genfromtxt(paths[0] + '/type.raw').astype(int)
-            self.data = {l: np.concatenate(sum([[np.load(set+l+'.npy') for set in glob(path+'/set.*/')]
+            self.data = {l: np.concatenate(sum([[np.load(set+l+'.npy') for set in sorted(glob(path+'/set.*/'))]
                                                 for path in paths], [])) for l in labels}
             self.natoms = len(self.type)
             self.nframes = len(self.data['coord'])
@@ -142,5 +142,5 @@ def compute_lattice_candidate(boxes, rcut): # boxes (nframes,3,3)
     is_neighbor = jnp.linalg.norm((lattice_cand[:,None]-trial_points)[None] @ boxes[:,None], axis=-1) < rcut  # (nframes,l,t)
     lattice_cand = np.array(lattice_cand[is_neighbor.any((0,2))])
     lattice_max = is_neighbor.sum(1).max().item()
-    print('# Lattice vectors for neighbor images: Max %d out of %d condidates.' % (lattice_max, len(lattice_cand)))
+    print('# Lattice vectors for neighbor images: Max %d out of %d candidates.' % (lattice_max, len(lattice_cand)))
     return {'lattice_cand': tuple(map(tuple, lattice_cand)), 'lattice_max': lattice_max, 'ortho': ortho}
