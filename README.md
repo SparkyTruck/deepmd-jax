@@ -42,7 +42,7 @@ Once your dataset is ready, train a model like this:
 ```python
 from deepmd_jax.train import train
 
-# training a energy-force model
+# training an energy-force model
 train(
       model_type='energy',                   # Model type
       rcut=6.0,                              # Cutoff radius
@@ -50,7 +50,7 @@ train(
       train_data_path='/energy/force/data/', # Path (or a list of paths) to the training dataset
       step=1000000,                          # Number of training steps
 )
-# training a Wannier model; default data file prefix is "atomic_dipole.npy".
+# training a Wannier model; default data file prefix is "atomic_dipole.npy"
 train(
       model_type='atomic',                   # Model type
       rcut=6.0,                              # Cutoff radius
@@ -59,9 +59,9 @@ train(
       train_data_path='/wannier/data/',      # Path (or a list of paths) to the training dataset
       step=100000,                           # Number of training steps
 )
-# training a DPLR model: train Wannier first, then DPLR
+# training a DPLR model: train Wannier first and then DPLR
 train(
-      'dplr',                                # Model type
+      model_type='dplr',                     # Model type
       rcut = 6.0,                            # Cutoff radius
       save_path = 'dplr_model.pkl',          # Path to save the trained model
       dplr_wannier_model_path='wannier.pkl', # Path to the trained Wannier model
@@ -72,7 +72,7 @@ train(
 )
 ```
 
-There are additional default hyperparameters regarding the model architecture and training process. The default should be an okay baseline, but you can adjust additional arguments in `train()`, such as `mp=True` to use DP-MP, and `batch_size`, `embed_widths`, etc.
+There are additional hyperparameters regarding the model architecture and training process. The default should be an okay baseline, but you can adjust additional arguments in `train()`, such as `mp=True` to use DP-MP, and `batch_size`, `embed_widths`, etc.
 
 ### Evaluating a Model
 
@@ -82,9 +82,6 @@ from deepmd_jax.train import test, evaluate
 # use test() on a dataset
 rmse, predictions, ground_truth = test(model_path, data_path)
 # use evaluate() on a batch of configurations where no ground truth is needed
-# coords: (n_frames, n_atoms, 3)
-# boxes: (n_frames) + (,) or (1,) or (3,) or (9), or (3,3)
-# type_idx: (n_atoms,)
 predictions = evaluate(model_path, coords, boxes, type_idx)
 ```
 
@@ -115,7 +112,7 @@ sim = Simulation(
 trajectory = sim.run(100000)           # Run for 100,000 steps
 ```
 
-Again, check the `Simulate` class for additional arguments and methods.
+Again, check the `Simulation` class for additional arguments and methods.
 
 ### Precision Settings
 
@@ -128,7 +125,7 @@ jax.config.update('jax_enable_x64', True)
 
 ### Units
 
-The default units are Angstrom, eV, femtosecond, and their derived units. The only exceptions are the parameters `temperature` (Kelvin), `pressure` (bar), and `mass` (Dalton) when initializing `Simulate()`.
+The default units are Angstrom, eV, femtosecond, and their derived units. The only exceptions are the parameters `temperature` (Kelvin), `pressure` (bar), and `mass` (Dalton) when initializing `Simulation()`.
 
 ## Roadmap
 
