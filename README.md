@@ -112,7 +112,7 @@ sim = Simulation(
 trajectory = sim.run(100000)           # Run for 100,000 steps
 ```
 
-Again, check the `Simulation` class for additional arguments and methods.
+You can heck the `Simulation` class for additional arguments and configurations.
 
 ### Precision Settings
 
@@ -141,5 +141,5 @@ A tentative to-do list (in no particular order):
 Future considerations:
 - [ ] Enhanced sampling. (v0.3)
 
-This project is in active development, and if you encounter any issues, please feel free to contact me or open an issue on the GitHub page. Have fun! 🚀
+This project is in active development, and if you encounter any issues, please feel free to contact me or open an issue on the GitHub page. You are also welcome to make custom modifications and pull requests. Have fun! 🚀
 
