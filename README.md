@@ -42,29 +42,50 @@ Once your dataset is ready, train a model like this:
 ```python
 from deepmd_jax.train import train
 
+# training a energy-force model
 train(
-      model_type='energy',             # Model type: 'energy', 'atomic', 'dplr'
-      rcut=6.0,                        # Cutoff radius
-      save_path='trained_model.pkl',   # Path to save the trained model
-      train_data_path='dataset/path/', # Path (or a list of paths) to the training dataset
-      step=1000000,                    # Number of training steps
+      model_type='energy',                   # Model type
+      rcut=6.0,                              # Cutoff radius
+      save_path='model.pkl',                 # Path to save the trained model
+      train_data_path='/energy/force/data/', # Path (or a list of paths) to the training dataset
+      step=1000000,                          # Number of training steps
+)
+# training a Wannier model; default data file prefix is "atomic_dipole.npy".
+train(
+      model_type='atomic',                   # Model type
+      rcut=6.0,                              # Cutoff radius
+      atomic_sel=[0]                         # indicating Wannier centers are associated to atoms of type 0
+      save_path='wannier.pkl',               # Path to save the trained model
+      train_data_path='/wannier/data/',      # Path (or a list of paths) to the training dataset
+      step=100000,                           # Number of training steps
+)
+# training a DPLR model: train Wannier first, then DPLR
+train(
+      'dplr',                                # Model type
+      rcut = 6.0,                            # Cutoff radius
+      save_path = 'dplr_model.pkl',          # Path to save the trained model
+      dplr_wannier_model_path='wannier.pkl', # Path to the trained Wannier model
+      train_data_path='/energy/force/data/', # Path (or a list of paths) to the training dataset
+      step=1000000,                          # Number of training steps
+      dplr_q_atoms=[6, 1],                   # Charge of atoms of each type
+      dplr_q_wc = [-8],                      # Charge of Wannier centers of each atomic_sel type
 )
 ```
 
-The default hyperparameters should be an okay baseline, but you can adjust additional arguments in `train()`, such as `mp=True` to use DP-MP, and `lr`, `batch_size`, `embed_widths`, etc.
+There are additional default hyperparameters regarding the model architecture and training process. The default should be an okay baseline, but you can adjust additional arguments in `train()`, such as `mp=True` to use DP-MP, and `batch_size`, `embed_widths`, etc.
 
 ### Evaluating a Model
 
-You can evaluate the model on a dataset with `test()`:
+You can evaluate the model with `test()` or `evaluate()`:
 ```python
-from deepmd_jax.train import test
+from deepmd_jax.train import test, evaluate
+# use test() on a dataset
 rmse, predictions, ground_truth = test(model_path, data_path)
-```
-
-Or use `evaluate()` on a set of configurations, where no ground truth is needed:
-```python
-from deepmd_jax.train import evaluate
-predictions = evaluate(model_path, coord, box, type_idx)
+# use evaluate() on a batch of configurations where no ground truth is needed
+# coords: (n_frames, n_atoms, 3)
+# boxes: (n_frames) + (,) or (1,) or (3,) or (9), or (3,3)
+# type_idx: (n_atoms,)
+predictions = evaluate(model_path, coords, boxes, type_idx)
 ```
 
 ### Running a Simulation
@@ -72,18 +93,18 @@ predictions = evaluate(model_path, coord, box, type_idx)
 To run a simulation, prepare the following numpy arrays:
 
 1. `initial_position`: shape `(n, 3)` where `n` is the number of atoms.
-2. `box`: shape `(1,)`, `(3,)` or `(3, 3)`.
+2. `box`: shape `(,)`, `(1,)`, `(3,)` or `(3, 3)`.
 3. `type_idx`: shape `(n,)`, indicates the type of each atom (similar to `type.raw` in the training dataset).
 
 Then, an example of running a simulation is as follows:
 
 ```python
-from deepmd_jax.md import Simulate
+from deepmd_jax.md import Simulation
 
-sim = Simulate(
-    model_path='trained_model.pkl',
+sim = Simulation(
+    model_path='trained_model.pkl',    # Has to be an 'energy' or 'dplr' model
     box=box,                           # Angstroms
-    type_idx=type_idx,                 # index-element map (i.e. 0 - Oxygen, 1 - Hydrogen) must match the dataset used to train the model
+    type_idx=type_idx,                 # here the index-element map (e.g. 0-Oxygen, 1-Hydrogen) must match the dataset used to train the model
     mass=[15.9994, 1.0078],            # Oxygen, Hydrogen
     routine='NVT',                     # 'NVE', 'NVT', 'NPT'
     dt=0.5,                            # femtoseconds
@@ -113,9 +134,10 @@ The default units are Angstrom, eV, femtosecond, and their derived units. The on
 
 A tentative to-do list (in no particular order):
 - [ ] Optimize training and simulation when neighbor lists are not used.
-- [ ] Misc: data, dpmodel, utils code cleanup; Glob data path, optimize compute lattice; move reorder inside dpmodel; train starting from a trained model; training seed control; print log redirect.
+- [ ] Misc: data, dpmodel, utils code cleanup; Glob data path, flatten subset, optimize compute lattice, optimize print output; move reorder inside dpmodel; train starting from a trained model; training seed control; print log redirect; Model deviation.
 - [ ] Multi-host large scale simulation support.
-- [ ] Misc simulation features: Custom energy functions, time-dependent potentials, temperature and pressure control, fix atoms, more thermostats.
+- [ ] Misc simulation features: Custom energy functions, time-dependent potentials, temperature and pressure control, fix atoms, more thermostats, remove center of mass motion.
+- [ ] Non-orthorhomibic neighbor list; Non-isotropic fluctuation in NPT.
 - [ ] DWIR support.
 - [ ] Further tune NN architecture and training hyperparameters (v0.2.1).
 

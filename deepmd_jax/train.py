@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import time, datetime
 import flax.linen as nn
 from functools import partial
-from .utils import get_p3mlr_fn, get_p3mlr_grid_size, load_model, save_model, compress_model
+from .utils import get_p3mlr_fn, get_p3mlr_grid_size, load_model, save_model, compress_model, save_dataset
 from .data import DPDataset
 from .dpmodel import DPModel
 from typing import Union, List
@@ -37,7 +37,7 @@ def train(
     l_pref_f: float = 1,
     dplr_wannier_model_path: str = None,
     dplr_q_atoms: List[float] = None,
-    dplr_q_wc: float = None,
+    dplr_q_wc: List[float] = None,
     dplr_beta: float = 0.4,
     dplr_resolution: float = 0.2,
     lr_limit: float = 1e-6,
@@ -78,7 +78,7 @@ def train(
             l_pref_f: limit prefactor for force loss.
             dplr_wannier_model_path: path to the Deep Wannier model, only used in 'dplr'.
             dplr_q_atoms: charge of atomic cores for each atom type, only used in 'dplr'.
-            dplr_q_wc: charge of wannier center/centroid, only used in 'dplr'.
+            dplr_q_wc: charge of wannier center/centroid for each type in atomic_sel of the wannier model, only used in 'dplr'.
             dplr_beta: inverse spread of the smoothed point charge distribution, only used in 'dplr'.
             dplr_resolution: higher resolution means denser grid: grid length = resolution / beta; only used in 'dplr'.
             lr_limit: learning rate at end of training.
@@ -98,7 +98,7 @@ def train(
 
     # width check
     if fit_widths is None:
-        if model_type == 'energy' or model_type == 'dplr':
+        if model_type != 'atomic':
             fit_widths = [128, 128, 128]
         elif model_type == 'atomic':
             width = embed_mp_widths[-1] if mp else embed_widths[-1]
@@ -128,11 +128,13 @@ def train(
         labels = ['coord', 'box', 'force', 'energy']
     elif model_type == 'atomic':
         labels = ['coord', 'box', atomic_data_prefix]
-        assert atomic_sel is not None, ' Must provided atomic_sel for model_type "atomic".'
+        assert type(atomic_sel) == list, ' Must provide atomic_sel properly for model_type "atomic".'
     else:
-        raise ValueError('Model_type should be "energy", "atomic", or "dplr".')
+        raise ValueError('model_type should be "energy", "atomic", or "dplr".')
     if type(train_data_path) == str:
         train_data_path = [train_data_path]
+    else:
+        train_data_path = [[path] for path in train_data_path]
     train_data = DPDataset(train_data_path,
                            labels,
                            {'atomic_sel':atomic_sel})
@@ -141,6 +143,8 @@ def train(
     if use_val_data:
         if type(val_data_path) == str:
             val_data_path = [val_data_path]
+        else:
+            val_data_path = [[path] for path in val_data_path]
         val_data = DPDataset(val_data_path,
                              labels,
                              {'atomic_sel':atomic_sel})
@@ -151,9 +155,15 @@ def train(
     # for dplr, convert dataset to short-range
     if model_type == 'dplr':
 
-        if dplr_wannier_model_path is None:
-            raise ValueError('Must first train a Wannier model and provide dplr_wannier_model_path for "dplr".')
+        if type(dplr_wannier_model_path) is not str:
+            raise ValueError('Must properly provide dplr_wannier_model_path (path to your trained Wannier model) for model_type "dplr".')
+        if type(dplr_q_atoms) is not list:
+            raise ValueError('Must properly provide dplr_q_atoms for model_type "dplr".')
+        if type(dplr_q_wc) is not list:
+            raise ValueError('Must properly provide dplr_q_wc for model_type "dplr".')
         wc_model, wc_variables = load_model(dplr_wannier_model_path, replicate=False)
+        if len(dplr_q_wc) != len(wc_model.params['nsel']):
+            raise ValueError('dplr_q_wc must correspond to atomic_sel of the Wannier model.')
         subsets = train_data.get_flattened_data()
         if use_val_data:
             subsets += val_data.get_flattened_data()
@@ -186,18 +196,18 @@ def train(
     # construct model
     params = {
         'type': model_type,
-        'atomic_data_prefix': None if model_type == 'energy' else atomic_data_prefix,
+        'atomic_data_prefix': None if model_type != 'atomic' else atomic_data_prefix,
         'embed_widths': embed_widths[:-1] if mp else embed_widths,
         'embedMP_widths': embed_widths[-1:] + embed_mp_widths if mp else None,
         'fit_widths': fit_widths,
         'axis': axis_neurons,
-        'Ebias': train_data.fit_energy() if model_type == 'energy' else None,
+        'Ebias': train_data.fit_energy() if model_type != 'atomic' else None,
         'rcut': rcut,
         'use_2nd': tensor_2nd,
         'use_mp': mp,
         'atomic': model_type == 'atomic',
         'nsel': atomic_sel if model_type == 'atomic' else None,
-        'out_norm': 1. if model_type == 'energy' else train_data.get_atomic_label_scale(),
+        'out_norm': 1. if model_type != 'atomic' else train_data.get_atomic_label_scale(),
         **train_data.get_stats(rcut, getstat_bs),
     }
     if model_type == 'dplr':
@@ -228,7 +238,7 @@ def train(
     
     # initialize optimizer
     if lr is None:
-        lr = 0.002 if model_type == 'energy' else 0.01
+        lr = 0.002 if model_type != 'atomic' else 0.01
     if step < decay_steps * 10:
         decay_steps = max(step // 10, 1)
     lr_scheduler = optax.exponential_decay(
@@ -245,7 +255,7 @@ def train(
 
     # define training step
     loss_fn, loss_and_grad_fn = model.get_loss_fn()
-    if model_type == 'energy':
+    if model_type != 'atomic':
         state = {'loss_avg': 0., 'le_avg': 0., 'lf_avg': 0., 'iteration': 0}
     else:
         state = {'loss_avg': 0., 'iteration': 0}
@@ -253,7 +263,7 @@ def train(
     @partial(jax.jit, static_argnames=('static_args',))
     def train_step(batch, variables, opt_state, state, static_args):
         r = lr_scheduler(state['iteration']) / lr
-        if model_type == 'energy':
+        if model_type != 'atomic':
             pref = {'e': s_pref_e*r + l_pref_e*(1-r),
                     'f': s_pref_f*r + l_pref_f*(1-r)}
             (loss_total, (loss_e, loss_f)), grads = loss_and_grad_fn(variables,
@@ -276,7 +286,7 @@ def train(
     # define validation step
     @partial(jax.jit, static_argnames=('static_args',))
     def val_step(batch, variables, static_args):
-        if model_type == 'energy':
+        if model_type != 'atomic':
             pref = {'e': 1, 'f': 1}
             _, (loss_e, loss_f) = loss_fn(variables,
                                           batch,
@@ -313,11 +323,11 @@ def train(
         beta_smoothing = print_loss_smoothing * (1 - (1-1/print_loss_smoothing)**(iteration+1))
         line = f'Iter {iteration:7d}'
         line += f' L {(state["loss_avg"] / beta_smoothing) ** 0.5:7.5f}'
-        if model_type == 'energy':
+        if model_type != 'atomic':
             line += f' LE {(state["le_avg"] / beta_smoothing) ** 0.5:7.5f}'
             line += f' LF {(state["lf_avg"] / beta_smoothing) ** 0.5:7.5f}'
         if use_val_data:
-            if model_type == 'energy':
+            if model_type != 'atomic':
                 line += f' LEval {np.array([l[0] for l in loss_val]).mean() ** 0.5:7.5f}'
                 line += f' LFval {np.array([l[1] for l in loss_val]).mean() ** 0.5:7.5f}'
             else:
@@ -327,7 +337,7 @@ def train(
 
     # training loop
     tic = time.time()
-    for iteration in range(step+1):
+    for iteration in range(int(step+1)):
         if use_val_data and iteration % print_every == 0:
             val_batch = get_batch_val()
             loss_val = []
@@ -475,13 +485,13 @@ def evaluate(
         type_idx_path = os.path.join(temp_dir, "type.raw")
         os.makedirs(set_dir, exist_ok=True)
         np.save(coord_path, coord.reshape(coord.shape[0], -1))
-        np.save(box_path, box)
+        np.save(box_path, box.reshape(box.shape[0], -1))
         with open(type_idx_path, "w") as f:
             f.write("\n".join(np.array(type_idx, dtype=int).astype(str)))
         if model.params['type'] == 'atomic':
             atomic_path = os.path.join(set_dir, model.params['atomic_data_prefix'] + ".npy")
             label_count = np.isin(type_idx, model.params['nsel']).sum()
-            np.save(atomic_path, np.zeros((coord.shape[0], label_count, 3)))
+            np.save(atomic_path, np.zeros((coord.shape[0], label_count * 3)))
         elif model.params['type'] == 'energy':
             energy_path = os.path.join(set_dir, "energy.npy")
             force_path = os.path.join(set_dir, "force.npy")

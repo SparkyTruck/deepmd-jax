@@ -156,7 +156,7 @@ def typed_neighbor_list(box, type_idx, rcut, buffer_ratio=1.2):
                         1 + (knbr * buffer_ratio + 
                             np.maximum(20 - knbr,0) * max(buffer_ratio-1.2,0)))
         knbr = list(knbr.astype(int))
-        print(f'# Neighborlist allocated with size {np.array(knbr) - 1}, rcut_with_buffer = {rcut}, buffer_ratio = {buffer_ratio}')
+        print(f'# Neighborlist allocated with size {np.array(knbr) - 1}, rcut_plus_skin = {rcut}, buffer_ratio = {buffer_ratio}')
         # infer a total buffer from the max neighbors of each type
         total_buffer_ratio = (sum(knbr)+1.01) / test_nbr.idx.shape[1]
         # Allocate the neighbor list with the inferred buffer ratio
@@ -271,6 +271,7 @@ class Simulation:
             seed: random seed for jax random number generator, e.g. in velocity initialization
             model_deviation_paths: a list of deepmd models for deviation calculation used in active learning
             use_neighbor_list_when_possible: if False, neighbor list will be disabled (for debug use)
+            neighbor_skin: buffer radius for neighbor list
             tau: Nose-Hoover thermostat/barostat relaxation time (fs)
             chain_length: Nose-Hoover thermostat/barostat chain length
             chain_steps: Nose-Hoover thermostat/barostat chain steps
@@ -401,9 +402,11 @@ class Simulation:
             model_and_variables = (self._model, self._variables)
         model, variables = model_and_variables
         if model.params['type'] == 'dplr':
+            if self._current_box.size > 3:
+                raise NotImplementedError("dplr model currently only supports orthorhombic box")
             wc_model, wc_variables = model.params['dplr_wannier_model_and_variables']
             p3mlr_fn = get_p3mlr_fn(
-                            np.diag(self._current_box),
+                            self._current_box,
                             model.params['dplr_beta'],
                             resolution=model.params['dplr_resolution'],
                         )
