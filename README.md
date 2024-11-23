@@ -132,8 +132,9 @@ The default units are Angstrom, eV, femtosecond, and their derived units. The on
 A tentative to-do list (in no particular order):
 - [ ] Optimize training and simulation when neighbor lists are not used.
 - [ ] Misc: data, dpmodel, utils code cleanup; Glob data path, flatten subset, optimize compute lattice, optimize print output; move reorder inside dpmodel; train starting from a trained model; training seed control; print log redirect; Model deviation.
+- [ ] Fix atoms/dummy atoms; Distributing the MD part.
 - [ ] Multi-host large scale simulation support.
-- [ ] Misc simulation features: Custom energy functions, time-dependent potentials, temperature and pressure control, fix atoms, more thermostats, remove center of mass motion.
+- [ ] Misc simulation features: Custom energy functions, time-dependent potentials, temperature and pressure control, more thermostats, remove center of mass motion.
 - [ ] Non-orthorhomibic neighbor list; Non-isotropic fluctuation in NPT.
 - [ ] DWIR support.
 - [ ] Further tune NN architecture and training hyperparameters (v0.2.1).
