@@ -658,6 +658,7 @@ class Simulation:
             scale = typed_nbrs.reference_box[0] / box[0]
             scaled_position = (position % box) * scale
             scaled_position = scaled_position[self._type_idx.argsort(kind='stable')]
+            scaled_position = reorder_by_device(scaled_position, self._type_count)
             rcut, dr = self._model.params['rcut'], self._neighbor_skin
             safe_scale = scale * 1.02 if "NPT" in self._routine else scale
             allowed_movement = ((rcut + dr) - rcut * safe_scale) / 2
