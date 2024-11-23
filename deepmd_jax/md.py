@@ -130,7 +130,7 @@ def typed_neighbor_list(box, type_idx, rcut, buffer_ratio=1.2):
         coord = coord[type_idx.argsort(kind='stable')]
         coord = (coord.astype(jnp.float32) % box) * scale
         # shrink by 1e-7 from the boundary to avoid numerical issues
-        coord = coord * (1-2e-7) + 1e-7 * reference_box
+        coord = coord * (1-5e-7)
         # reorder and partition to multiple devices
         coord = reorder_by_device(coord, type_count)
         return coord
@@ -223,7 +223,6 @@ class Simulation:
     report_interval: int = 100
     _step_chunk_size: int = 100
     _dr_buffer_lattice: float = 1.
-    _neighbor_buffer_ratio: float = 1.2
     _neighbor_update_profile: jax.Array = jnp.array([0.])
     _error_code: int = 0
     _is_initial_state: bool = True
@@ -244,7 +243,8 @@ class Simulation:
                  seed=0,
                  model_deviation_paths=[],
                  use_neighbor_list_when_possible=True,
-                 neighbor_skin: float = 0.8,
+                 neighbor_skin: float = None,
+                 neighbor_buffer_ratio: float = 1.2,
                  tau_t=100.,
                  tau_p=1000.,
                  chain_length_t=3,
@@ -272,6 +272,7 @@ class Simulation:
             model_deviation_paths: a list of deepmd models for deviation calculation used in active learning
             use_neighbor_list_when_possible: if False, neighbor list will be disabled (for debug use)
             neighbor_skin: buffer radius for neighbor list
+            neighbor_buffer_ratio: capacity of neighbor list = neighbor_buffer_ratio * max_neighbors
             tau: Nose-Hoover thermostat/barostat relaxation time (fs)
             chain_length: Nose-Hoover thermostat/barostat chain length
             chain_steps: Nose-Hoover thermostat/barostat chain steps
@@ -297,7 +298,11 @@ class Simulation:
         self._step_chunk_size = max(10, min(100, 100000 // self._natoms))
         self._model_deviation_paths = model_deviation_paths
         self._use_model_deviation = len(model_deviation_paths) > 0
-        self._neighbor_skin = neighbor_skin
+        if neighbor_skin is None:
+            self._neighbor_skin = 0.5 if "NPT" in self._routine else 0.3
+        else:
+            self._neighbor_skin = neighbor_skin
+        self._neighbor_buffer_ratio = neighbor_buffer_ratio
         # If orthorhombic, keep box as (3,); else keep (3,3)
         box = jnp.array(box)
         if box.size == 1:
@@ -329,7 +334,7 @@ class Simulation:
             initial_position = initial_position @ jnp.linalg.inv(box33)
             self._routine_fn = jax_md.simulate.npt_nose_hoover
             if pressure is None:
-                raise ValueError("Missing Extra argument 'pressure' (in bar) for routine 'NPT'")
+                raise ValueError("Missing argument 'pressure' (in bar) for routine 'NPT'")
             self._routine_args = {
                 'pressure': pressure * PRESS_UNIT_CONVERSION,
                 'kT': self._temperature * TEMP_UNIT_CONVERSION,
@@ -464,7 +469,7 @@ class Simulation:
         if self._current_box.shape == (3,3):
             return False
         else:
-            return self._current_box.min() > 2 * (self._model.params['rcut'] + self._neighbor_skin)
+            return self._current_box.min() > 2 * (self._model.params['rcut'] + self._neighbor_skin) * (1.02 if "NPT" in self._routine else 1.)
 
     def _get_static_args(self, position, use_neighbor_list=True):
         '''
@@ -577,7 +582,7 @@ class Simulation:
             '''
                 Check if there is any overflow that requires recompilation. Jit-compatible.
                 Error code is a binary combination:
-                    1: Box shrunk too much with nbrs: Increase self._neighbor_skin
+                    1: Box shrunk too much with nbrs: Increase self._neighbor_skin or disable neighbor list
                     2: Neighbor list buffer overflow: Reallocate neighbor list
                     4: Neighbor list buffer overflow the previous step/chunk
                     8: Lattice overflow: Increase lattice candidate/neighbor count
@@ -586,8 +591,9 @@ class Simulation:
             error_code = 0
             if self._static_args['use_neighbor_list']:
                 if "NPT" in self._routine:
-                    error_code += (1 - state.box[0] / typed_nbrs.reference_box[0]) > \
-                                    0.75 * self._neighbor_skin / self._model.params['rcut']
+                    error_code += (((1 - state.box[0] / typed_nbrs.reference_box[0]) > \
+                                    0.8 * self._neighbor_skin / (self._model.params['rcut'] + self._neighbor_skin))
+                                    | (state.box[0] < 2 * (self._model.params['rcut'] + self._neighbor_skin) * 1.02))
                 error_code += 2 * (typed_nbrs.did_buffer_overflow > 0)
             is_nan = jnp.isnan(state.position).any() | jnp.isnan(state.velocity).any()
             is_inf = jnp.isinf(state.position).any() | jnp.isinf(state.velocity).any()
@@ -659,7 +665,7 @@ class Simulation:
                                     scaled_position - typed_nbrs.reference_position,
                                     typed_nbrs.reference_box
                                 ).max()
-            update_required = max_movement > allowed_movement
+            update_required = max_movement > allowed_movement - typed_nbrs.reference_box[0] * 1e-6
             profile = profile * (1 - 1/100) + 1/100 * update_required
             typed_nbrs = jax.lax.cond(
                                 update_required,
@@ -687,7 +693,7 @@ class Simulation:
             # soft update neighbor list before a step
             if self._static_args['use_neighbor_list']:
                 typed_nbrs, profile = self._soft_update_nbrs(typed_nbrs,
-                                                             self._getRealPosition(state.position),
+                                                             self._getRealPosition(state.position, current_box),
                                                              current_box,
                                                              profile)
 
@@ -812,18 +818,19 @@ class Simulation:
                     (steps, elapsed_time // 3600, (elapsed_time % 3600) // 60, elapsed_time % 60))
         print('# Performance: %.3f ns/day, %.3f step/μs/atom' % (nanosecond_per_day, steps_per_microsecond_per_atom))
 
-    def _getRealPosition(self, position=None):
+    def _getRealPosition(self, position=None, box=None):
         '''
             Returns the real space position (Å) of the atoms.
         '''
+        box = self._current_box if (box is None) else box
         if position is None:
             position = self._state.position
         if not "NPT" in self._routine:
             return position
-        elif self._current_box.size == 3:
-            return position * self._current_box
+        elif box.size == 3:
+            return position * box
         else:
-            return position @ self._current_box
+            return position @ box
         
     def getPosition(self):
         '''
