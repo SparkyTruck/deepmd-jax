@@ -3,6 +3,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import flax.linen as nn
+import gc
 from time import time
 from .data import compute_lattice_candidate
 from .utils import split, concat, load_model, norm_ortho_box, get_p3mlr_fn, get_p3mlr_grid_size
@@ -733,13 +734,14 @@ class Simulation:
         traj_dtype = np.float64 if jax.config.read('jax_enable_x64') else np.float32
         # preallocate space for trajectory
         try:
+            safe_buffer = np.zeros((traj_length, 2*self._natoms+16, 3), dtype=traj_dtype)
+            del safe_buffer
+            gc.collect()
             self._position_trajectory = np.zeros((traj_length, self._natoms, 3), dtype=traj_dtype)
             self._velocity_trajectory = np.zeros((traj_length, self._natoms, 3), dtype=traj_dtype)
             self._box_trajectory = np.zeros((traj_length,) + self._current_box.shape, dtype=traj_dtype)
-            safe_buffer = np.zeros((200, self._natoms, 3), dtype=traj_dtype)
         except MemoryError:
             raise MemoryError("Trajectory too large to fit in CPU RAM. Split into multiple run(steps) and save/postprocess the segment after each run.")
-        del safe_buffer
         if self._is_initial_state:
             self._position_trajectory[0] = self.getPosition()
             self._velocity_trajectory[0] = self.getVelocity()
