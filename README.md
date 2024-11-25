@@ -103,7 +103,7 @@ sim = Simulation(
     box=box,                           # Angstroms
     type_idx=type_idx,                 # here the index-element map (e.g. 0-Oxygen, 1-Hydrogen) must match the dataset used to train the model
     mass=[15.9994, 1.0078],            # Oxygen, Hydrogen
-    routine='NVT',                     # 'NVE', 'NVT', 'NPT'
+    routine='NVT',                     # 'NVE', 'NVT', 'NPT' (Nosé-Hoover)
     dt=0.5,                            # femtoseconds
     initial_position=initial_position, # Angstroms
     temperature=300,                   # Kelvin
@@ -112,7 +112,7 @@ sim = Simulation(
 trajectory = sim.run(100000)           # Run for 100,000 steps
 ```
 
-You can heck the `Simulation` class for additional arguments and configurations.
+You can check the `Simulation` class for additional initialization arguments, like print control, thermostat parameters, etc. There are also some methods of the `Simulation` class like `getEnergy`, `getForces`, `getPosition`, `setPosition`, etc.
 
 ### Precision Settings
 
