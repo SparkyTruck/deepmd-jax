@@ -734,7 +734,7 @@ class Simulation:
         traj_dtype = np.float64 if jax.config.read('jax_enable_x64') else np.float32
         # preallocate space for trajectory
         try:
-            safe_buffer = np.zeros((traj_length, 2*self._natoms+16, 3), dtype=traj_dtype)
+            safe_buffer = np.zeros((traj_length, 3*self._natoms, 3), dtype=traj_dtype)
             del safe_buffer
             gc.collect()
             self._position_trajectory = np.zeros((traj_length, self._natoms, 3), dtype=traj_dtype)
