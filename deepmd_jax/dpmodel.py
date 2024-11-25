@@ -80,7 +80,8 @@ class DPModel(nn.Module):
             sel_count = [type_count[i] for i in nsel]
             fit_nselW = [fitting_net(self.params['fit_widths'], use_final=False)(G) for G in split(G_NselAW.reshape(G_NselAW.shape[0],-1),sel_count,0,K=K)]
             T_nsel3W = split(T_Nsel3W, sel_count, 0, K=K)            
-            pred = concat([lax.with_sharding_constraint((f[:,None]*T).sum(-1)[:type_count[self.params['nsel'][i]]],
+            real_type_count = tuple(static_args['type_count']) + (0,) * (len(type_count) - len(static_args['type_count']))
+            pred = concat([lax.with_sharding_constraint((f[:,None]*T).sum(-1)[:real_type_count[self.params['nsel'][i]]],
                 jax.sharding.PositionalSharding(jax.devices()).replicate()) for i,(f,T) in enumerate(zip(fit_nselW,T_nsel3W))])
         debug = T_NselXW
         return pred * self.params['out_norm'], debug

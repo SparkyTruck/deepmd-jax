@@ -39,7 +39,7 @@ def train(
     dplr_q_atoms: List[float] = None,
     dplr_q_wc: List[float] = None,
     dplr_beta: float = 0.4,
-    dplr_resolution: float = 0.2,
+    dplr_resolution: float = 5,
     lr_limit: float = 1e-6,
     beta2: float = 0.99,
     decay_steps: int = 5000,
@@ -80,7 +80,7 @@ def train(
             dplr_q_atoms: charge of atomic cores for each atom type, only used in 'dplr'.
             dplr_q_wc: charge of wannier center/centroid for each type in atomic_sel of the wannier model, only used in 'dplr'.
             dplr_beta: inverse spread of the smoothed point charge distribution, only used in 'dplr'.
-            dplr_resolution: higher resolution means denser grid: grid length = resolution / beta; only used in 'dplr'.
+            dplr_resolution: higher resolution means denser grid: resolution = 1 / (grid length * beta); only used in 'dplr'.
             lr_limit: learning rate at end of training.
             beta2: adam optimizer parameter.
             decay_steps: learning rate exponentially decays every decay_steps.

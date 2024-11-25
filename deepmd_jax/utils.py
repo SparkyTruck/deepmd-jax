@@ -183,11 +183,11 @@ class linear_norm(nn.Module):
     def __call__(self, x):
         return (nn.Dense(self.width, kernel_init=linear_init, use_bias=False)(x) * self.param('norm',ones_init,(1,)))
 
-def get_p3mlr_grid_size(box3, beta, resolution=0.2): # resolution=0.1 for better accuracy
-    M = tuple((box3*beta/resolution).astype(int))
+def get_p3mlr_grid_size(box3, beta, resolution=5): # resolution=10 for better accuracy
+    M = tuple((box3*beta*resolution).astype(int))
     return M
 
-def get_p3mlr_fn(box3, beta, M=None, resolution=0.2): # PPPM long range with TSC assignment
+def get_p3mlr_fn(box3, beta, M=None, resolution=5): # PPPM long range with TSC assignment
     if M is None:
         M = get_p3mlr_grid_size(box3, beta, resolution)
     K = jax.device_count()
@@ -217,12 +217,11 @@ def get_p3mlr_fn(box3, beta, M=None, resolution=0.2): # PPPM long range with TSC
         grid = grid.at[tuple(all_idx)].add((q_N*fr_27N).reshape(-1))
         return grid
     def p3mlr_fn(coord_N3, q_N): # coord in Angstrom, q in elementary charge, returns energy in eV
-        if K > 1:
-            coord_N3 = lax.with_sharding_constraint(reorder_by_device(coord_N3,(0,len(q_N))), sharding)
-            q_N = lax.with_sharding_constraint(reorder_by_device(q_N,(0,len(q_N))), sharding.reshape(K))
         grid = assign_to_grid(coord_N3, q_N)
         skfactor = jnp.fft.fftn(grid)
-        return (kfactor * (skfactor*skfactor.conj()).real).sum()
+        # the following step may cause a bit speed loss under multi-gpu, but I haven't figured out why
+        E = (kfactor * (skfactor*skfactor.conj()).real).sum()
+        return E
     return p3mlr_fn
 
 def save_model(path, model, variables):

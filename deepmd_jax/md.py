@@ -220,8 +220,7 @@ class Simulation:
     '''
 
     step: int = 0
-    report_interval: int = 100
-    _step_chunk_size: int = 100
+    _step_chunk_size: int = 200
     _dr_buffer_lattice: float = 1.
     _neighbor_update_profile: jax.Array = jnp.array([0.])
     _error_code: int = 0
@@ -236,7 +235,7 @@ class Simulation:
                  dt,
                  initial_position,
                  initial_velocity=None,
-                 report_interval=100,
+                 report_interval=200,
                  temperature=None,
                  pressure=None,
                  debug=False,

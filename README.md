@@ -132,15 +132,16 @@ The default units are Angstrom, eV, femtosecond, and their derived units. The on
 A tentative to-do list (in no particular order):
 - [ ] Optimize training and simulation when neighbor lists are not used.
 - [ ] Misc: data, dpmodel, utils code cleanup; Glob data path, flatten subset, optimize compute lattice, optimize print output; move reorder inside dpmodel; train starting from a trained model; training seed control; print log redirect; Model deviation.
-- [ ] Fix atoms/dummy atoms; Distributing the MD part.
-- [ ] Multi-host large scale simulation support.
+- [ ] Fix atoms/dummy atoms; Optimize multi-gpu sharding for the MD part.
 - [ ] Misc simulation features: Custom energy functions, time-dependent potentials, temperature and pressure control, more thermostats, remove center of mass motion.
 - [ ] Non-orthorhomibic neighbor list; Non-isotropic fluctuation in NPT.
+- [ ] Optimize NPT speed and memory usage (could be a jax-md issue), multi-gpu efficiency; Optimize p3m multi-gpu.
 - [ ] DWIR support.
 - [ ] Further tune NN architecture and training hyperparameters (v0.2.1).
 
-Future considerations:
-- [ ] Enhanced sampling. (v0.3)
+Future considerations: (v0.3)
+- [ ] Enhanced sampling. 
+- [ ] Multi-host large scale simulation support.
 
 This project is in active development, and if you encounter any issues, please feel free to contact me or open an issue on the GitHub page. You are also welcome to make custom modifications and pull requests. Have fun! 🚀
 
