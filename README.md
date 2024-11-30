@@ -14,7 +14,7 @@ Currently allows **NVE/NVT/NPT simulations** on **multiple GPUs** based on a bac
 
 ## Installation
 
-Requires **CUDA 12** for GPU support (latest CUDA subversion preferred, but not mandatory). We recommend using a conda environment:
+Requires **CUDA 12** for GPU support. We recommend using a conda environment:
 
 ```
 conda create -n deepmd-jax python=3.12
