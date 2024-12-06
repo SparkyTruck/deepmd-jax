@@ -13,13 +13,13 @@ Also, you can try the **DP-MP** architecture for enhanced accuracy.
 Currently allows **NVE/NVT/NPT simulations** on **multiple GPUs** based on a backend of [jax-md](https://github.com/jax-md/jax-md).
 
 ## Installation
-
+Note: You need to first have **CUDA 12** installed for GPU support.
 ```
 git clone https://github.com/SparkyTruck/deepmd-jax.git
 cd deepmd-jax
 pip install -e .
 ```
-Note: You need to first have **CUDA 12** installed for GPU support.
+
 
 ## Quick Start
 
