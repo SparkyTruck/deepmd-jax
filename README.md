@@ -14,7 +14,6 @@ Currently allows **NVE/NVT/NPT simulations** on **multiple GPUs** based on a bac
 
 ## Installation
 
-Simply clone the repo and install it in your working directory:
 ```
 git clone https://github.com/SparkyTruck/deepmd-jax.git
 cd deepmd-jax
