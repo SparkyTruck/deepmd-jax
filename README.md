@@ -105,6 +105,33 @@ trajectory = sim.run(100000)           # Run for 100,000 steps
 
 You can check the `Simulation` class for additional initialization arguments, like print control, thermostat parameters, etc. There are also some methods of the `Simulation` class like `getEnergy`, `getForces`, `getPosition`, `setPosition`, etc.
 
+If you want to print the trajectories on the fly, you can use the `TrajDumpSimulation` instead of `Simulation`:
+```python
+from deepmd_jax.md import TrajDump, TrajDumpSimulation
+
+sim = TrajDumpSimulation(
+    model_path="model.pkl",  # Has to be an 'energy' or 'dplr' model
+    box=box,  # Angstroms
+    type_idx=type_idx,  # here the index-element map (e.g. 0-Oxygen, 1-Hydrogen) must match the dataset used to train the model
+    mass=[15.9994, 1.0078, 195.08],  # Oxygen, Hydrogen
+    routine="NVT",  # 'NVE', 'NVT', 'NPT' (Nosé-Hoover)
+    dt=0.5,  # femtoseconds
+    initial_position=initial_position,  # Angstroms
+    temperature=330,  # Kelvin
+    report_interval=100,  # Report every 100 steps
+)
+# print positions and velocities every 10 steps in xyz format
+sim.run(
+      n_steps,
+      [
+      TrajDump(atoms, "pos_traj.xyz", 10, append=True),
+      TrajDump(atoms, "vel_traj.xyz", 10, vel=True, append=True),
+      ],
+)
+# Run for 100,000 steps
+trajectory = sim.run(100000)
+```
+
 ### Precision Settings
 
 By default, single precision `float32` is used for both training and simulation, which I find to be generally sufficient. However, if you need double precision, enable it at the **beginning** of your script with:
