@@ -215,6 +215,7 @@ def typed_neighbor_list(box, type_idx, rcut, buffer_ratio=1.2):
                                     (idx.max(axis=1)<type_idx_each[-1]*K).any()
                                     for idx in nbrs_idx
                                     ]).any()
+        nbrs_nm = [[n[:,:-1] for n in nbrs_m] for nbrs_m in nbrs_nm]
         return nbrs_nm, overflow
     
     return typed_neighbor_list_fn(allocate=allocate_fn, update=update_fn)
