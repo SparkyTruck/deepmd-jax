@@ -118,13 +118,13 @@ class typed_neighbor_list_fn():
     allocate: Callable = jax_md.dataclasses.static_field()
     update: Callable = jax_md.dataclasses.static_field()
 
-def typed_neighbor_list(box, type_idx, rcut, buffer_ratio=1.2):
+def typed_neighbor_list(box, type_idx, type_count, rcut, buffer_ratio=1.2):
     '''
         Returns a typed neighbor list function that can be used to allocate and update neighbor lists.
         allocate_fn() and update_fn() accept real space coordinates but processes internally in fractional coordinates.
     '''
     type_idx = np.array(type_idx, dtype=int)
-    type_count = tuple(np.bincount(type_idx))
+    type_count = tuple(type_count)
     reference_box = box.astype(jnp.float32) # box at creation of typed_neighbor_list_fn; pass only this box to jax_md.neighbor_list
     type_mask_fns = get_type_mask_fns(type_count)
     idx_mask_fn = get_idx_mask_fn(type_count)
@@ -396,7 +396,7 @@ class Simulation:
         self._pressure_fn = pressure_fn
         if self._use_model_deviation:
             self._deviation_energy_fns = [
-                self._get_energy_fn(load_model(path)) for path in self.model_deviation_paths
+                self._get_energy_fn(load_model(path)) for path in self._model_deviation_paths
             ]
         self._init_fn, self._apply_fn = self._routine_fn(self._energy_fn,
                                                      self._shift_fn,
@@ -577,6 +577,7 @@ class Simulation:
         '''
         self._typed_nbr_fn = typed_neighbor_list(self._current_box,
                                                  self._type_idx,
+                                                 self._type_count,
                                                  self._model.params['rcut'] + self._neighbor_skin,
                                                  self._neighbor_buffer_ratio)
         self._typed_nbrs = self._typed_nbr_fn.allocate(self._getRealPosition(position),
