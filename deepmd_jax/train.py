@@ -21,7 +21,7 @@ def train(
     step: int = 1000000,
     mp: bool = False,
     atomic_sel: List[int] = None,
-    embed_widths: List[int] = [32,64,64],
+    embed_widths: List[int] = [32,32,64],
     embed_mp_widths: List[int] = [64,64,64],
     fit_widths: List[int] = None,
     axis_neurons: int=12,
