@@ -85,7 +85,7 @@ def get_relative_coord(coord_N3, box_33, type_count, lattice_args, nbrs_nm=None)
                             x_N3M = x_N3MX.reshape(N,3,-1)
                         else:
                             r_NMX = jnp.linalg.norm(jnp.where(jnp.abs(x_N3MX) > 1e-15, x_N3MX, 1e-15), axis=1)
-                            idx_NMY = r_NMX.argpartition(lattice_args['lattice_max'], axis=-1)[:,:,:lattice_args['lattice_max']]
+                            idx_NMY = jnp.argpartition(r_NMX, lattice_args['lattice_max'], axis=-1)[:,:,:lattice_args['lattice_max']]
                             x_N3M = jnp.take_along_axis(x_N3MX, idx_NMY[:,None], axis=-1).reshape(N,3,-1)
                     r_NM = jnp.linalg.norm(jnp.where(jnp.abs(x_N3M) > 1e-15, x_N3M, 1e-15), axis=1)
                 else:
