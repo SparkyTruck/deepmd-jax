@@ -1001,8 +1001,8 @@ class TrajDumpSimulation(Simulation):
         """
         print(f"# Running {steps} steps...")
         self._offset = self.step - int(self._is_initial_state)
-        self._tic_of_this_run = time.time()
-        self._tic_between_report = time.time()
+        self._tic_of_this_run = time()
+        self._tic_between_report = time()
         self._error_code = 0
         self._print_report()
         self._is_initial_state = False
@@ -1061,5 +1061,5 @@ class TrajDumpSimulation(Simulation):
                     cell = np.concatenate([np.array(box_traj[-1]), [90, 90, 90]])
                     dump.write(pos_traj[-1] if not dump.vel else vel_traj[-1], cell)
 
-        self._print_run_profile(steps, time.time() - self._tic_of_this_run)
+        self._print_run_profile(steps, time() - self._tic_of_this_run)
         self._keep_nbr_or_lattice_up_to_date()
