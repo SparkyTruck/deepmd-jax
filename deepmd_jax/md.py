@@ -259,6 +259,7 @@ class Simulation:
                  chain_steps_p=1,
                  sy_steps_t=1,
                  sy_steps_p=1,
+                 fixed_indices: Optional[List[int]] = None,
                 ):
         '''
             Initialize a Simulation instance.
@@ -283,6 +284,7 @@ class Simulation:
             chain_length: Nose-Hoover thermostat/barostat chain length
             chain_steps: Nose-Hoover thermostat/barostat chain steps
             sy_steps: Nose-Hoover thermostat/barostat number of Suzuki-Yoshida steps (must be 1,3,5,7)
+            fixed_indices: zero-based indices of atoms that should remain fixed (constrained position) in the simulation.
             ############################
             Usage:
                 sim = Simulation(...)
@@ -358,6 +360,12 @@ class Simulation:
             raise NotImplementedError("routine currently limited to 'NVE', 'NVT', 'NPT'")
         print(f"# Initialized {self._routine} simulation with {self._natoms} atoms")
 
+        # Create mask for constraining atoms
+        mask = np.ones((self._natoms, 3), dtype=np.float32)
+        if fixed_indices is not None:
+            mask[fixed_indices] = 0.0
+        self._fixed_mask = jnp.array(mask)
+
         # Initialize neighbor list if needed
         if self._static_args['use_neighbor_list']:
             self._construct_nbr_and_nbr_fn(initial_position)
@@ -383,7 +391,10 @@ class Simulation:
             Neighbor list functions are generated in _construct_nbr_and_nbr_fn separately.
         '''
         self._energy_fn = self._get_energy_fn()
-        self._force_fn = lambda coord, **kwargs: -jax.grad(self._energy_fn)(coord, **kwargs)
+        self._force_fn = lambda coord, **kwargs: self._fixed_mask * -jax.grad(
+            self._energy_fn
+        )(coord, **kwargs)
+        
         def pressure_fn(state, box, nbrs_nm):
             KE = jax_md.quantity.kinetic_energy(momentum=state.momentum, mass=state.mass)
             return jax_md.quantity.pressure(
