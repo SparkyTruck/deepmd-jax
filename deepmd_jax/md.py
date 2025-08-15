@@ -321,8 +321,18 @@ class Simulation:
             self._initial_box = box
         self._current_box = self._initial_box
         self._static_args = self._get_static_args(initial_position, use_neighbor_list_when_possible)
-        self._displacement_fn, self._shift_fn = jax_md.space.periodic_general(self._initial_box,
-                                                                              fractional_coordinates="NPT" in self._routine)
+        self._displacement_fn, shift = jax_md.space.periodic_general(
+            self._initial_box, fractional_coordinates="NPT" in self._routine
+        )
+
+        # Create mask for constraining atoms
+        mobile = np.ones((self._natoms, 3), dtype=np.float32)
+        if fixed_indices is not None:
+            mobile[fixed_indices] = 0.0
+        mobile = jnp.array(mobile)
+
+        # Define masked shift function
+        self._shift_fn = lambda x, dx: jnp.where(mobile[:, None], shift(x, dx), x)
 
         # Initialize according to routine;
         if self._routine == "NVE":
@@ -360,12 +370,6 @@ class Simulation:
             raise NotImplementedError("routine currently limited to 'NVE', 'NVT', 'NPT'")
         print(f"# Initialized {self._routine} simulation with {self._natoms} atoms")
 
-        # Create mask for constraining atoms
-        mask = np.ones((self._natoms, 3), dtype=np.float32)
-        if fixed_indices is not None:
-            mask[fixed_indices] = 0.0
-        self._fixed_mask = jnp.array(mask)
-
         # Initialize neighbor list if needed
         if self._static_args['use_neighbor_list']:
             self._construct_nbr_and_nbr_fn(initial_position)
@@ -391,9 +395,7 @@ class Simulation:
             Neighbor list functions are generated in _construct_nbr_and_nbr_fn separately.
         '''
         self._energy_fn = self._get_energy_fn()
-        self._force_fn = lambda coord, **kwargs: self._fixed_mask * -jax.grad(
-            self._energy_fn
-        )(coord, **kwargs)
+        self._force_fn = lambda coord, **kwargs: -jax.grad(self._energy_fn)(coord, **kwargs)
         
         def pressure_fn(state, box, nbrs_nm):
             KE = jax_md.quantity.kinetic_energy(momentum=state.momentum, mass=state.mass)
