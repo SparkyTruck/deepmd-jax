@@ -326,7 +326,7 @@ class Simulation:
         )
 
         # Create mask for constraining atoms
-        mobile = np.ones((self._natoms, 3), dtype=np.float32)
+        mobile = np.ones(self._natoms)
         if fixed_indices is not None:
             mobile[fixed_indices] = 0.0
         mobile = jnp.array(mobile)
