@@ -332,7 +332,7 @@ class Simulation:
         mobile = jnp.array(mobile)
 
         # Define masked shift function
-        self._shift_fn = lambda x, dx: jnp.where(mobile[:, None], shift(x, dx), x)
+        self._shift_fn = lambda x, dx, **kwargs: jnp.where(mobile[:, None], shift(x, dx, **kwargs), x)
 
         # Initialize according to routine;
         if self._routine == "NVE":
