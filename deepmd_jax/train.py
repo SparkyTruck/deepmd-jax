@@ -94,7 +94,7 @@ def train(
     
     TIC = time.time()
     if jax.device_count() > 1:
-        print('# Note: Currently only one device will be used for training.')
+        print('# Note: Currently only one device will be used for training.', flush=True)
 
     # width check
     if fit_widths is None:
@@ -114,7 +114,7 @@ def train(
                 raise ValueError('embed_mp_widths[i] must divide or be divisible by embed_mp_widths[i+1]')
     for i in range(len(fit_widths)-1):
         if fit_widths[i+1] != fit_widths[i] != 0:
-            print('# Warning: it is recommended to use the same width for all layers in the fitting network.')
+            print('# Warning: it is recommended to use the same width for all layers in the fitting network.', flush=True)
     if model_type == 'atomic':
         if mp:
             if embed_mp_widths[-1] != fit_widths[-1]:
@@ -220,7 +220,7 @@ def train(
         }
         params.update(dplr_params)
     model = DPModel(params)
-    print('# Model params:', model.params)
+    print('# Model params:', model.params, flush=True)
 
     # initialize model variables
     batch, type_count, lattice_args = train_data.get_batch(1)
@@ -234,7 +234,7 @@ def train(
                     static_args,
                 )
     print('# Model initialized with parameter count %d.' %
-           sum(i.size for i in jax.tree_util.tree_flatten(variables)[0]))
+           sum(i.size for i in jax.tree_util.tree_flatten(variables)[0]), flush=True)
     
     # initialize optimizer
     if lr is None:
@@ -251,7 +251,7 @@ def train(
     optimizer = optax.adam(learning_rate = lr_scheduler,
                            b2 = beta2)
     opt_state = optimizer.init(variables)
-    print('# Optimizer initialized with initial lr = %.1e. Starting training...' % lr)
+    print('# Optimizer initialized with initial lr = %.1e. Starting training...' % lr, flush=True)
 
     # define training step
     loss_fn, loss_and_grad_fn = model.get_loss_fn()
@@ -301,9 +301,9 @@ def train(
         
     # configure batch size
     if batch_size is None:
-        print(f'# Auto batch size = int({label_bs}/nlabels_per_frame)')
+        print(f'# Auto batch size = int({label_bs}/nlabels_per_frame)', flush=True)
     else:
-        print(f'# Batch size = {batch_size}')
+        print(f'# Batch size = {batch_size}', flush=True)
     def get_batch_train():
         if batch_size is None:
             return train_data.get_batch(label_bs, 'label')
@@ -333,7 +333,7 @@ def train(
             else:
                 line += f' Lval {np.array(loss_val).mean() ** 0.5:7.5f}'
         line += f' Time {time.time() - tic:.2f}s'
-        print(line)
+        print(line, flush=True)
 
     # training loop
     tic = time.time()
@@ -365,7 +365,7 @@ def train(
                                                 compress_Ngrids,
                                                 compress_r_min)
     save_model(save_path, model, variables)
-    print(f'# Training finished in {datetime.timedelta(seconds=int(time.time() - TIC))}.')
+    print(f'# Training finished in {datetime.timedelta(seconds=int(time.time() - TIC))}.', flush=True)
 
 def test(
     model_path: str,
