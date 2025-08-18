@@ -220,6 +220,35 @@ def typed_neighbor_list(box, type_idx, type_count, rcut, buffer_ratio=1.2):
     
     return typed_neighbor_list_fn(allocate=allocate_fn, update=update_fn)
 
+
+def nvt_with_fixed_atoms(nvt_init_fn, nvt_apply_fn, mobile_mask):
+    """Wrap NVT init/step functions to handle fixed atoms correctly."""
+    mobile = mobile_mask[:, None].astype(jnp.float32)  # (N, 1)
+    dof = int(3 * jnp.sum(mobile_mask))
+
+    def init_fn(key, R, *args, **kwargs):
+        state = nvt_init_fn(key, R, *args, **kwargs)
+        # Zero fixed atom velocities
+        state = state.set(momentum=state.momentum * mobile)
+        # Fix thermostat DOF
+        if hasattr(state, "chain"):
+            state = state.set(chain=state.chain.set(degrees_of_freedom=dof))
+        return state
+
+    def apply_fn(state, *args, **kwargs):
+        # Ensure thermostat DOF is correct before step
+        if hasattr(state, "chain"):
+            state = state.set(chain=state.chain.set(degrees_of_freedom=dof))
+
+        state = nvt_apply_fn(state, *args, **kwargs)
+
+        # Zero fixed momenta after thermostat update
+        state = state.set(momentum=state.momentum * mobile)
+        return state
+
+    return init_fn, apply_fn
+
+
 class Simulation:
     '''
         A deepmd-based simulation class that wraps jax_md.simulate routines.
@@ -321,18 +350,17 @@ class Simulation:
             self._initial_box = box
         self._current_box = self._initial_box
         self._static_args = self._get_static_args(initial_position, use_neighbor_list_when_possible)
-        self._displacement_fn, shift = jax_md.space.periodic_general(
+        self._displacement_fn, self._shift_fn = jax_md.space.periodic_general(
             self._initial_box, fractional_coordinates="NPT" in self._routine
         )
 
         # Create mask for constraining atoms
         mobile = np.ones(self._natoms)
         if fixed_indices is not None:
-            mobile[fixed_indices] = 0.0
-        mobile = jnp.array(mobile)
-
-        # Define masked shift function
-        self._shift_fn = lambda x, dx, **kwargs: jnp.where(mobile[:, None], shift(x, dx, **kwargs), x)
+            mobile[fixed_indices] = 0
+            self._mobile = jnp.array(mobile, dtype=bool)
+        else: 
+            self._mobile = None
 
         # Initialize according to routine;
         if self._routine == "NVE":
@@ -411,10 +439,18 @@ class Simulation:
             self._deviation_energy_fns = [
                 self._get_energy_fn(load_model(path)) for path in self._model_deviation_paths
             ]
-        self._init_fn, self._apply_fn = self._routine_fn(self._energy_fn,
+        init_fn, apply_fn = self._routine_fn(self._energy_fn,
                                                      self._shift_fn,
                                                      self._dt,
                                                      **self._routine_args)
+        
+        # If fixing atoms and using NVT, use the wrapper
+        if self._routine == "NVT" and self._mobile is not None:
+            self._init_fn, self._apply_fn = nvt_with_fixed_atoms(init_fn, apply_fn, self._mobile)
+        else: 
+            self._init_fn = init_fn
+            self._apply_fn = apply_fn
+
         self._report_fn = self._generate_report_fn()
         self._soft_update_nbrs = self._get_soft_update_nbrs_fn()
         self._check_hard_overflow = self._get_check_hard_overflow_fn()
