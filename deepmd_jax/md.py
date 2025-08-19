@@ -350,7 +350,7 @@ class Simulation:
             self._initial_box = box
         self._current_box = self._initial_box
         self._static_args = self._get_static_args(initial_position, use_neighbor_list_when_possible)
-        self._displacement_fn, self._shift_fn = jax_md.space.periodic_general(
+        self._displacement_fn, shift = jax_md.space.periodic_general(            
             self._initial_box, fractional_coordinates="NPT" in self._routine
         )
 
@@ -361,6 +361,13 @@ class Simulation:
             self._mobile = jnp.array(mobile, dtype=bool)
         else: 
             self._mobile = None
+
+        def _shift_fn_wrapper(x, dx, **kwargs):
+            if mobile is not None:
+                return jnp.where(mobile[:, None], shift(x, dx, **kwargs), x)
+            else:
+                return shift(x, dx, **kwargs)
+        self._shift_fn = _shift_fn_wrapper
 
         # Initialize according to routine;
         if self._routine == "NVE":
