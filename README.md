@@ -32,8 +32,10 @@ Once your dataset is ready, train a model like this:
 
 ```python
 from deepmd_jax.train import train
+```
 
-# training an energy-force model
+#### training an energy-force model
+```python
 train(
       model_type='energy',                   # Model type
       rcut=6.0,                              # Cutoff radius
@@ -41,16 +43,24 @@ train(
       train_data_path='/energy/force/data/', # Path (or a list of paths) to the training dataset
       step=1000000,                          # Number of training steps
 )
-# training a Wannier model; default data file prefix is "atomic_dipole.npy"
+```
+
+#### training a Wannier model
+```python
 train(
       model_type='atomic',                   # Model type
       rcut=6.0,                              # Cutoff radius
-      atomic_sel=[0]                         # indicating Wannier centers are associated to atoms of type 0
+      atomic_sel=[0],                        # indicating Wannier centers are associated to atoms of type 0
       save_path='wannier.pkl',               # Path to save the trained model
       train_data_path='/wannier/data/',      # Path (or a list of paths) to the training dataset
       step=100000,                           # Number of training steps
 )
-# training a DPLR model: train Wannier first and then DPLR
+# default data file prefix for Wannier centroids is "atomic_dipole.npy"
+```
+
+#### training a DPLR model:
+```python
+# train Wannier first and then train DPLR
 train(
       model_type='dplr',                     # Model type
       rcut = 6.0,                            # Cutoff radius
@@ -63,7 +73,7 @@ train(
 )
 ```
 
-There are additional hyperparameters regarding the model architecture and training process. The default should be an okay baseline, but you can adjust additional arguments in `train()`, such as `mp=True` to use DP-MP, and `batch_size`, `embed_widths`, etc.
+In `train()`, set `mp=True` to enable DP-MP for better accuracy; the default values for the other arguments in `train()` like learning rate, batch size, model width, etc. are usually a solid baseline.
 
 ### Evaluating a Model
 
@@ -147,19 +157,25 @@ The default units are Angstrom, eV, femtosecond, and their derived units. The on
 
 ## Roadmap
 
-A tentative to-do list (in no particular order):
-- [ ] Optimize training and simulation when neighbor lists are not used.
-- [ ] Misc: data, dpmodel, utils code cleanup; Glob data path, flatten subset, optimize compute lattice, optimize print output; move reorder inside dpmodel; train starting from a trained model; training seed control; print log redirect; Model deviation; evaluate DPLR; 
-- [ ] Fix atoms/dummy atoms; Optimize multi-gpu sharding for the MD part.
-- [ ] Misc simulation features: Custom energy functions, time-dependent potentials, temperature and pressure control, more thermostats, remove center of mass motion; pair correlation function;
-- [ ] Non-orthorhomibic neighbor list; Non-isotropic fluctuation in NPT.
-- [ ] Optimize NPT speed and memory usage (could be a jax-md issue), multi-gpu efficiency; Optimize p3m multi-gpu.
+To-do list:
+- [ ] Fix atoms/dummy atoms; Optimize multi-gpu sharding.
+- [ ] Model deviation API; evaluate DPLR;
+- [ ] Misc simulation features: Temperature and pressure control, more thermostats, remove center of mass motion; 
+- [ ] Optimize NPT speed and memory usage (could be a jax-md issue)
 - [ ] DWIR support (iterative refinement).
-- [ ] Further tune NN architecture and training hyperparameters (v0.2.1).
 
-Future considerations: (v0.3)
+Planned features: (v0.3)
 - [ ] Enhanced sampling. 
-- [ ] Multi-host large scale simulation support.
+- [ ] PIMD.
+- [ ] Non-orthorhomibic neighbor list; Non-isotropic fluctuation in NPT.
+- [ ] Misc: data, dpmodel, utils code cleanup; Glob data path, flatten subset, optimize compute lattice, optimize print output; pair correlation function; move reorder inside dpmodel; train starting from a trained model; training seed control; 
 
 This project is in active development, and if you encounter any issues, please feel free to contact me or open an issue on the GitHub page. You are also welcome to make custom modifications and pull requests. Have fun! 🚀
+
+## Troubleshooting
+
+In certain HPC environments, if jax doesn't see a GPU when there is one, you may need to `module load` a latest CUDA 12 version. To solve this problem in jupyter notebooks, you can install a kernel with the right environment variables set. For example:
+```bash
+python -m ipykernel install --user --name deepmd-jax-cuda12 --display-name "Python (deepmd-jax-cuda12)" --env LD_LIBRARY_PATH ""
+```
 

@@ -6,19 +6,6 @@ import flax.linen as nn
 import pickle, os
 from scipy.interpolate import PPoly, BPoly
 
-# Global system settings
-def initialize():
-    import warnings
-    warnings.simplefilter(action='ignore', category=UserWarning)
-    warnings.simplefilter(action='ignore', category=FutureWarning)
-    # jax.config.update("jax_traceback_filtering", "off")
-    # jax.config.update("jax_log_compiles", True)
-    jax.config.update('jax_default_matmul_precision', 'float32')
-    np.set_printoptions(precision=4, suppress=True)
-    print('# DeepMD-jax: Starting on %d device(s):' % jax.device_count(), jax.devices())
-
-initialize()
-
 @jax.jit
 def norm_ortho_box(coord, box):
     '''
