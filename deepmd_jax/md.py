@@ -9,7 +9,7 @@ import flax.linen as nn
 import gc
 from time import time
 from ase import io, Atoms
-
+from jax.sharding import PartitionSpec as PSpec
 from .data import compute_lattice_candidate
 from .utils import split, concat, load_model, norm_ortho_box, get_p3mlr_fn, get_p3mlr_grid_size
 from typing import Callable
@@ -32,8 +32,7 @@ def reorder_by_device(coord, type_count):
                         ).reshape(K,-1,*c.shape[1:])
                     for c in split(coord,type_count)
                 ], axis=1).reshape(-1, *coord.shape[1:])
-    sharding = jax.sharding.PositionalSharding(jax.devices())
-    return jax.lax.with_sharding_constraint(coord, sharding.replicate())
+    return jax.lax.with_sharding_constraint(coord, PSpec())
 
 def get_mask_by_device(type_count):
     '''
@@ -49,8 +48,7 @@ def get_mask_by_device(type_count):
                 ],
             axis=1).reshape(-1)
     # ensure mask is sharded by device
-    sharding = jax.sharding.PositionalSharding(jax.devices())
-    return jax.lax.with_sharding_constraint(mask, sharding)
+    return jax.lax.with_sharding_constraint(mask, PSpec('atom'))
 
 def get_type_mask_fns(type_count):
     '''
@@ -68,9 +66,7 @@ def get_type_mask_fns(type_count):
     for i in range(len(type_count)):
         # filter neighbor atoms by type i; idx = nbrs.idx returned by jax_md
         def mask_fn(idx, i=i): 
-            # ensure idx is sharded by device
-            sharding = jax.sharding.PositionalSharding(jax.devices()).reshape(K,1)
-            idx = jax.lax.with_sharding_constraint(idx, sharding)
+            idx = jax.lax.with_sharding_constraint(idx, PSpec('atom'))
             valid_center_atom = full_mask[:,None]
             valid_type_neighbor_atom = idx%N_each >= type_idx_each[i]
             valid_type_neighbor_atom *= idx%N_each < type_idx_each[i+1]
@@ -88,9 +84,7 @@ def get_idx_mask_fn(type_count):
     full_mask = get_mask_by_device(type_count)
     idx_mask_out = np.arange(len(full_mask))[~np.array(full_mask)]
     def idx_mask_fn(idx):
-        # ensure idx is sharded by device
-        sharding = jax.sharding.PositionalSharding(jax.devices()).reshape(jax.device_count(),1)
-        idx = jax.lax.with_sharding_constraint(idx, sharding)
+        idx = jax.lax.with_sharding_constraint(idx, PSpec('atom'))
         filter = full_mask[:,None] * jnp.isin(idx, idx_mask_out, invert=True)
         return jnp.where(filter, idx, len(full_mask))
     return idx_mask_fn
@@ -196,8 +190,7 @@ def typed_neighbor_list(box, type_idx, type_count, rcut, buffer_ratio=1.2):
 
         # ensure idx is sharded by device
         K = jax.device_count()
-        sharding = jax.sharding.PositionalSharding(jax.devices()).reshape(K, 1)
-        nbr_idx = jax.lax.with_sharding_constraint(nbrs.idx, sharding)
+        nbr_idx = jax.lax.with_sharding_constraint(nbrs.idx, PSpec('atom'))
         # take knbr[i] smallest indices for type i
         nbrs_idx = [-jax.lax.top_k(-fn(nbr_idx), k)[0]
                     for fn,k in zip(type_mask_fns, knbr)]
@@ -446,9 +439,8 @@ class Simulation:
             coord = coord * perturbation
             box = box * perturbation
             # Ensure coord and box is replicated on all devices
-            sharding = jax.sharding.PositionalSharding(jax.devices()).replicate()
-            coord = jax.lax.with_sharding_constraint(coord, sharding)
-            box = jax.lax.with_sharding_constraint(box, sharding)
+            coord = jax.lax.with_sharding_constraint(coord, PSpec())
+            box = jax.lax.with_sharding_constraint(box, PSpec())
 
             # Energy calculation
             E = model.apply(variables,

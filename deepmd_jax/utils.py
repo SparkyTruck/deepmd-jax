@@ -5,6 +5,10 @@ import numpy as np
 import flax.linen as nn
 import pickle, os
 from scipy.interpolate import PPoly, BPoly
+from jax.sharding import Mesh, PartitionSpec as PSpec
+from jax.experimental import mesh_utils
+mesh = Mesh(mesh_utils.create_device_mesh((len(jax.devices()),)), ('atom',))
+jax.set_mesh(mesh)
 
 @jax.jit
 def norm_ortho_box(coord, box):
@@ -177,8 +181,6 @@ def get_p3mlr_grid_size(box3, beta, resolution=5): # resolution=10 for better ac
 def get_p3mlr_fn(box3, beta, M=None, resolution=5): # PPPM long range with TSC assignment
     if M is None:
         M = get_p3mlr_grid_size(box3, beta, resolution)
-    K = jax.device_count()
-    sharding = jax.sharding.PositionalSharding(jax.devices()).reshape(K,1)
     cube_idx = (jnp.stack(jnp.meshgrid(*([jnp.array([-1,0,1])]*3),indexing='ij'))).reshape(3,27)
     MM = jnp.array(M).reshape(3,1,1,1)
     kgrid = jnp.stack(jnp.meshgrid(*[jnp.arange(m) for m in M], indexing='ij'))
@@ -217,12 +219,11 @@ def save_model(path, model, variables):
     print('# Model saved to \'%s\'.' % path)
 
 def load_model(path, replicate=True):
-    sharding = jax.sharding.PositionalSharding(jax.devices()).replicate()
     with open(path, 'rb') as file:
         m = pickle.load(file)
     print('# Model loaded from \'%s\'.' % path)
     if replicate:
-        return m['model'], jax.device_put(m['variables'], sharding)
+        return m['model'], jax.device_put(m['variables'], PSpec())
     else:
         return m['model'], m['variables']
 
@@ -329,8 +330,7 @@ def reorder_by_device(coord, type_count):
                         ).reshape(K,-1,*c.shape[1:])
                     for c in split(coord,type_count)
                 ], axis=1).reshape(-1, *coord.shape[1:])
-    sharding = jax.sharding.PositionalSharding(jax.devices())
-    return jax.lax.with_sharding_constraint(coord, sharding.replicate())
+    return jax.lax.with_sharding_constraint(coord, PSpec())
 
 def get_mask_by_device(type_count):
     '''
@@ -346,5 +346,4 @@ def get_mask_by_device(type_count):
                 ],
             axis=1).reshape(-1)
     # ensure mask is sharded by device
-    sharding = jax.sharding.PositionalSharding(jax.devices())
-    return jax.lax.with_sharding_constraint(mask, sharding)
+    return jax.lax.with_sharding_constraint(mask, PSpec('atom'))

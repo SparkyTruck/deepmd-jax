@@ -3,6 +3,7 @@ import jax
 from jax import vmap, value_and_grad, lax
 import flax.linen as nn
 from .utils import *
+from jax.sharding import PartitionSpec as PSpec
 
 class DPModel(nn.Module):
     params: dict
@@ -54,8 +55,7 @@ class DPModel(nn.Module):
             T_2_nD = [[(t[:,:,None]*t[:,:,:4,None]).sum(1).reshape(-1,4*C) for t in T] for T in T_2_n4C]
             T_2_n3C = [[t[:,1:] for t in T] for T in T_2_n4C]
             if nbrs_nm is not None:
-                sharding = jax.sharding.PositionalSharding(jax.devices()).replicate()
-                T_2_nD, T_2_n3C = lax.with_sharding_constraint([T_2_nD, T_2_n3C], sharding)
+                T_2_nD, T_2_n3C = lax.with_sharding_constraint([T_2_nD, T_2_n3C], PSpec())
             F_nselmE = [[(linear_norm(E)(T_2_nD[0][i])[:,None]
                       + (linear_norm(E)(T_2_nD[1][j])[nbrs_nm[i][j]] if nbrs_nm is not None else
                          jnp.repeat(linear_norm(E)(T_2_nD[1][j]),L,axis=0))
@@ -82,7 +82,7 @@ class DPModel(nn.Module):
             T_nsel3W = split(T_Nsel3W, sel_count, 0, K=K)            
             real_type_count = tuple(static_args['type_count']) + (0,) * (len(type_count) - len(static_args['type_count']))
             pred = concat([lax.with_sharding_constraint((f[:,None]*T).sum(-1)[:real_type_count[self.params['nsel'][i]]],
-                jax.sharding.PositionalSharding(jax.devices()).replicate()) for i,(f,T) in enumerate(zip(fit_nselW,T_nsel3W))])
+                            PSpec()) for i,(f,T) in enumerate(zip(fit_nselW,T_nsel3W))])
         debug = T_NselXW
         return pred * self.params['out_norm'], debug
 
@@ -94,7 +94,6 @@ class DPModel(nn.Module):
         wc_relative = self.apply(variables, coord_N3, box_33, static_args, nbrs_nm)[0]
         coord_ref = [c for i,c in enumerate(split(coord_N3, static_args['type_count'])) if i in self.params['nsel']]
         return concat(coord_ref) + wc_relative
-        # return lax.with_sharding_constraint(concat(coord_ref) + wc_relative, jax.sharding.PositionalSharding(jax.devices()[0])
     
     def get_loss_fn(self):
         if self.params['atomic'] is False:
