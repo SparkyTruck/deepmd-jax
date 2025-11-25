@@ -13,7 +13,6 @@ Also, you can try the **DP-MP** architecture for enhanced accuracy.
 Currently allows **NVE/NVT/NPT simulations** on **multiple GPUs** based on a backend of [jax-md](https://github.com/jax-md/jax-md).
 
 ## Installation
-Note: You need to first have **CUDA 12** installed for GPU support.
 ```
 git clone https://github.com/SparkyTruck/deepmd-jax.git
 cd deepmd-jax
@@ -28,13 +27,12 @@ To train a model, prepare your dataset in the same [DeepMD-kit format](https://d
 
 
 ### Training a Model
-Once your dataset is ready, train a model like this:
 
 ```python
 from deepmd_jax.train import train
 ```
 
-#### training an energy-force model
+#### Training an energy-force model
 ```python
 train(
       model_type='energy',                   # Model type
@@ -45,7 +43,7 @@ train(
 )
 ```
 
-#### training a Wannier model
+#### Training a Wannier model
 ```python
 train(
       model_type='atomic',                   # Model type
@@ -58,7 +56,7 @@ train(
 # default data file prefix for Wannier centroids is "atomic_dipole.npy"
 ```
 
-#### training a DPLR model:
+#### Training a DPLR model:
 ```python
 # train Wannier first and then train DPLR
 train(
@@ -110,7 +108,11 @@ sim = Simulation(
     temperature=300,                   # Kelvin
 )
 
-trajectory = sim.run(100000)           # Run for 100,000 steps
+trajectory = sim.run(10000)            # Run for 10,000 steps
+print(trajectory['position'].shape)    # (100001, n, 3)
+# you can split into multiple runs if needed
+trajectory = sim.run(10000)            # Continue to run another 10,000 steps
+print(trajectory['position'].shape)    # (100000, n, 3), does not include the initial position
 ```
 
 You can check the `Simulation` class for additional initialization arguments, like print control, thermostat parameters, etc. There are also some methods of the `Simulation` class like `getEnergy`, `getForces`, `getPosition`, `setPosition`, etc.
@@ -166,7 +168,7 @@ To-do list:
 
 Planned features: (v0.3)
 - [ ] Enhanced sampling. 
-- [ ] PIMD.
+- [ ] Path-Integral MD.
 - [ ] Non-orthorhomibic neighbor list; Non-isotropic fluctuation in NPT.
 - [ ] Misc: data, dpmodel, utils code cleanup; Glob data path, flatten subset, optimize compute lattice, optimize print output; pair correlation function; move reorder inside dpmodel; train starting from a trained model; training seed control; 
 
@@ -174,7 +176,7 @@ This project is in active development, and if you encounter any issues, please f
 
 ## Troubleshooting
 
-In certain HPC environments, if jax doesn't see a GPU when there is one, you may need to `module load` a latest CUDA 12 version. To solve this problem in jupyter notebooks, you can install a kernel with the right environment variables set. For example:
+In certain HPC environments, if jax doesn't see a GPU when there is one, you may need to `module load` a latest CUDA 12 version. To solve this environment problem in jupyter notebooks, you can install a kernel with the right environment variables set. For example:
 ```bash
 python -m ipykernel install --user --name deepmd-jax-cuda12 --display-name "Python (deepmd-jax-cuda12)" --env LD_LIBRARY_PATH ""
 ```
