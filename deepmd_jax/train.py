@@ -21,7 +21,7 @@ def train(
     step: int = 1000000,
     mp: bool = False,
     atomic_sel: List[int] = None,
-    embed_widths: List[int] = [32,32,64],
+    embed_widths: List[int] = [32,64,64],
     embed_mp_widths: List[int] = [64,64,64],
     fit_widths: List[int] = None,
     axis_neurons: int=12,
@@ -386,7 +386,7 @@ def test(
         print('# Note: Currently only one device will be used for evaluation.')
     
     model, variables = load_model(model_path, replicate=False)
-    if model.params['type'] == 'energy':
+    if model.params['type'] == 'energy' or model.params['type'] == 'dplr':
         labels = ['coord', 'box', 'force', 'energy']
         atomic_sel = None
     elif model.params['type'] == 'atomic':
@@ -400,38 +400,95 @@ def test(
     test_data.compute_lattice_candidate(model.params['rcut'])
     test_data.pointer = 0
     remaining = test_data.nframes
-    if model.params['type'] == 'energy':
+
+    # Create evaluation functions based on model type    
+    if model.params['type'] == 'energy' or model.params['type'] == 'dplr':
+        # Use standard vmap for energy/dplr models
         evaluate_fn = model.energy_and_force
+        evaluate_fn = jax.jit(jax.vmap(evaluate_fn,
+                                   in_axes=(None,0,0,None)),
+                                   static_argnames=('static_args',))          
         predictions = {'energy': [], 'force': []}
         ground_truth = {'energy': [], 'force': []}
+     
     else:
-        evaluate_fn = model.apply
+        # For atomic model, create a batched evaluation function
+        def batched_atomic_evaluate(vars, coords, boxes, static_args):
+            def evaluate_single(coord, box):
+                pred, _ = model.apply(vars, coord, box, static_args)
+                return pred
+            return jax.vmap(evaluate_single)(coords, boxes)
+        
+        evaluate_fn = jax.jit(batched_atomic_evaluate, static_argnames=('static_args',))
         predictions = {model.params['atomic_data_prefix']: []}
         ground_truth = {model.params['atomic_data_prefix']: []}
-    evaluate_fn = jax.jit(jax.vmap(evaluate_fn,
-                                   in_axes=(None,0,0,None)),
-                                   static_argnames=('static_args',))
+    
+    if model.params['type'] == 'dplr':
+        wc_model, wc_variables = model.params['dplr_wannier_model_and_variables']
+        dplr_q_atoms = model.params['dplr_q_atoms']
+        dplr_q_wc = model.params['dplr_q_wc']
+        dplr_beta = model.params['dplr_beta']
+        dplr_resolution = model.params['dplr_resolution']
+        
+        def calculate_lr_contribution(coord, box, type_count, lattice_args):
+            """Calculate long-range interaction contributions"""
+            if len(type_count) < len(dplr_q_atoms):
+                # Pad type_count if needed
+                padded_type_count = list(type_count) + [0] * (len(dplr_q_atoms) - len(type_count))
+                type_count = tuple(padded_type_count)
+            
+            static_args = nn.FrozenDict({'type_count': type_count, 'lattice': lattice_args})
+            sel_type_count = tuple(np.array(type_count)[wc_model.params['nsel']])
+            qatoms = np.repeat(dplr_q_atoms, type_count)
+            qwc = np.repeat(dplr_q_wc, sel_type_count)
+            
+            def lr_energy(coord, box, Ngrid):
+                wc = wc_model.wc_predict(wc_variables, coord, box, static_args)
+                p3mlr_fn = get_p3mlr_fn(jnp.diag(box), dplr_beta, Ngrid)
+                return p3mlr_fn(jnp.concatenate([coord, wc]), jnp.concatenate([qatoms, qwc]))
+            
+            @partial(jax.jit, static_argnums=(2,))
+            def lr_energy_and_force(coord, box, Ngrid):
+                e, negf = jax.value_and_grad(lr_energy)(coord, box, Ngrid)
+                return e, -negf
+            
+            Ngrid = get_p3mlr_grid_size(np.diag(box), dplr_beta, resolution=dplr_resolution)
+            e_lr, f_lr = lr_energy_and_force(coord, box, Ngrid)
+            return e_lr, f_lr
+
     while remaining > 0:
         bs = min(batch_size, remaining)
         batch, type_count, lattice_args = test_data.get_batch(bs)
         remaining -= bs
         static_args = nn.FrozenDict({'type_count': type_count, 'lattice': lattice_args})
         pred = evaluate_fn(variables, batch['coord'], batch['box'], static_args)
-        if model.params['type'] == 'energy':
+
+        # Add long-range contributions for DPLR model
+        if model.params['type'] == 'dplr':
+            pred_energy, pred_force = pred
+            # Calculate long-range contribution for each structure
+            for i in range(bs):
+                e_lr, f_lr = calculate_lr_contribution(batch['coord'][i], batch['box'][i], type_count, lattice_args)
+                pred_energy = pred_energy.at[i].add(e_lr)
+                pred_force = pred_force.at[i].add(f_lr)
+            pred = (pred_energy, pred_force)
+
+        if model.params['type'] == 'energy' or model.params['type'] == 'dplr':
             predictions['energy'].append(pred[0])
             predictions['force'].append(pred[1])
             ground_truth['energy'].append(batch['energy'])
             ground_truth['force'].append(batch['force'])
         else:
             predictions[model.params['atomic_data_prefix']].append(pred[0])
-            ground_truth[model.params['atomic_data_prefix']].append(batch[model.params['atomic_data_prefix']])
+            ground_truth[model.params['atomic_data_prefix']].append(batch['atomic'])
+            
     rmse = {}
     for key in predictions.keys():
         predictions[key] = np.concatenate(predictions[key], axis=0)
         ground_truth[key] = np.concatenate(ground_truth[key], axis=0)
         rmse[key] = (((predictions[key] - ground_truth[key]) ** 2).mean() ** 0.5).item()
     # reorder force back; will delete in future when reordering is moved into dpmodel.py
-    if model.params['type'] == 'energy':
+    if model.params['type'] == 'energy' or model.params['type'] == 'dplr':
         ground_truth['force'] = ground_truth['force'][:, test_data.type.argsort(kind='stable').argsort(kind='stable')]
         predictions['force'] = predictions['force'][:, test_data.type.argsort(kind='stable').argsort(kind='stable')]
     return rmse, predictions, ground_truth
@@ -492,7 +549,7 @@ def evaluate(
             atomic_path = os.path.join(set_dir, model.params['atomic_data_prefix'] + ".npy")
             label_count = np.isin(type_idx, model.params['nsel']).sum()
             np.save(atomic_path, np.zeros((coord.shape[0], label_count * 3)))
-        elif model.params['type'] == 'energy':
+        elif model.params['type'] == 'energy' or model.params['type'] == 'dplr':
             energy_path = os.path.join(set_dir, "energy.npy")
             force_path = os.path.join(set_dir, "force.npy")
             np.save(energy_path, np.zeros(coord.shape[0]))
@@ -500,7 +557,3 @@ def evaluate(
         _, predictions, _ = test(model_path, temp_dir, batch_size)
 
     return predictions
-    
-
-
-          
