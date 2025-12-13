@@ -679,6 +679,22 @@ class Simulation:
 
         return soft_update_nbrs
 
+    def _unwrap_positions(self, previous_position, current_position, box):
+        '''
+            Unwrap positions to avoid discontinuities in trajectory.
+        '''
+        if "NPT" in self._routine:
+            current_position = previous_position + (current_position - previous_position + 0.5) % 1 - 0.5
+        else:
+            if box.size == 3:
+                current_position = previous_position + (current_position - previous_position + box/2) % box - box/2
+            else:
+                fractional_prev = previous_position @ jnp.linalg.inv(box)
+                fractional_curr = current_position @ jnp.linalg.inv(box)
+                fractional_curr = fractional_prev + (fractional_curr - fractional_prev + 0.5) % 1 - 0.5
+                current_position = fractional_curr @ box
+        return current_position
+        
     def _get_inner_step(self):
         '''
             Returns a jitted function that performs multiple simulation steps.
@@ -688,6 +704,7 @@ class Simulation:
                 Performs a single simulation step.
             '''
             state, typed_nbrs, error_code, profile = states
+            previous_state_position = state.position
             current_box = state.box if "NPT" in self._routine else self._initial_box
 
             # soft update neighbor list before a step
@@ -705,7 +722,10 @@ class Simulation:
                                 state,
                                 nbrs_nm=typed_nbrs.nbrs_nm if typed_nbrs else None,
                             )
-
+            new_position = self._unwrap_positions(previous_state_position,
+                                                  state.position,
+                                                  state.box if "NPT" in self._routine else self._current_box)
+            state = state.set(position=new_position)
             return ((state, typed_nbrs, error_code, profile),
                     (state.position * state.box if "NPT" in self._routine else state.position,
                      state.velocity, 
@@ -744,7 +764,7 @@ class Simulation:
         try:
             safe_buffer = np.zeros((traj_length, 10*self._natoms, 3), dtype=traj_dtype)
         except MemoryError:
-            print("# Warning: Large trajectories may exhaust CPU RAM. It is safer to split into multiple shorter runs and save/postprocess the segment after each run.")
+            print("# Warning: A long trajectory may exhaust CPU RAM. It is safer to split into multiple shorter runs and save/postprocess the segment after each run.")
         if self._is_initial_state:
             self._position_trajectory[0] = self.getPosition()
             self._velocity_trajectory[0] = self.getVelocity()
