@@ -288,7 +288,7 @@ class Simulation:
         self._dt = dt
         self._routine = routine
         self._temperature = temperature
-        self._type_idx = np.array(type_idx.astype(int))
+        self._type_idx = np.array(type_idx).astype(int)
         self._mass = jnp.array(np.array(mass)[np.array(self._type_idx)]) # AMU
         self._model, self._variables = load_model(model_path)
         type_count = np.bincount(self._type_idx)
@@ -733,14 +733,18 @@ class Simulation:
         traj_dtype = np.float64 if jax.config.read('jax_enable_x64') else np.float32
         # preallocate space for trajectory
         try:
-            safe_buffer = np.zeros((traj_length, 3*self._natoms, 3), dtype=traj_dtype)
+            safe_buffer = np.zeros((traj_length, 5*self._natoms, 3), dtype=traj_dtype)
             del safe_buffer
             gc.collect()
             self._position_trajectory = np.zeros((traj_length, self._natoms, 3), dtype=traj_dtype)
             self._velocity_trajectory = np.zeros((traj_length, self._natoms, 3), dtype=traj_dtype)
             self._box_trajectory = np.zeros((traj_length,) + self._current_box.shape, dtype=traj_dtype)
         except MemoryError:
-            raise MemoryError("Trajectory too large to fit in CPU RAM. Split into multiple run(steps) and save/postprocess the segment after each run.")
+            raise MemoryError("Trajectory too large to fit in CPU RAM. Please split into multiple shorter runs and save/postprocess the segment after each run.")
+        try:
+            safe_buffer = np.zeros((traj_length, 10*self._natoms, 3), dtype=traj_dtype)
+        except MemoryError:
+            print("# Warning: Large trajectories may exhaust CPU RAM. It is safer to split into multiple shorter runs and save/postprocess the segment after each run.")
         if self._is_initial_state:
             self._position_trajectory[0] = self.getPosition()
             self._velocity_trajectory[0] = self.getVelocity()
