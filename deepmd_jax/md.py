@@ -244,6 +244,7 @@ class Simulation:
                  use_neighbor_list_when_possible=True,
                  neighbor_skin: float = None,
                  neighbor_buffer_ratio: float = 1.2,
+                 remove_com_motion=False,
                  tau_t=100.,
                  tau_p=1000.,
                  chain_length_t=3,
@@ -272,6 +273,7 @@ class Simulation:
             use_neighbor_list_when_possible: if False, neighbor list will be disabled (for debug use)
             neighbor_skin: buffer radius for neighbor list
             neighbor_buffer_ratio: capacity of neighbor list = neighbor_buffer_ratio * max_neighbors
+            remove_com_motion: explicitly remove center-of-mass velocity at each step; usually unnecessary for DP models; may be useful for DPLR models
             tau: Nose-Hoover thermostat/barostat relaxation time (fs)
             chain_length: Nose-Hoover thermostat/barostat chain length
             chain_steps: Nose-Hoover thermostat/barostat chain steps
@@ -297,6 +299,7 @@ class Simulation:
         self._step_chunk_size = max(10, min(100, 100000 // self._natoms))
         self._model_deviation_paths = model_deviation_paths
         self._use_model_deviation = len(model_deviation_paths) > 0
+        self._remove_com_motion = remove_com_motion
         if neighbor_skin is None:
             self._neighbor_skin = 0.5 if "NPT" in self._routine else 0.3
         else:
@@ -694,6 +697,13 @@ class Simulation:
                 fractional_curr = fractional_prev + (fractional_curr - fractional_prev + 0.5) % 1 - 0.5
                 current_position = fractional_curr @ box
         return current_position
+
+    def remove_com_motion(self):
+        '''
+            Remove center-of-mass velocity from the current state.
+        '''
+        velocity = self._state.velocity - (self._state.velocity * self._state.mass).sum(0) / self._state.mass.sum()
+        self.setVelocity(velocity)
         
     def _get_inner_step(self):
         '''
@@ -726,6 +736,9 @@ class Simulation:
                                                   state.position,
                                                   state.box if "NPT" in self._routine else self._current_box)
             state = state.set(position=new_position)
+            if self._remove_com_motion:
+                velocity = state.velocity - (state.velocity * state.mass).sum(0) / state.mass.sum()
+                state = state.set(momentum=state.mass * velocity)
             return ((state, typed_nbrs, error_code, profile),
                     (state.position * state.box if "NPT" in self._routine else state.position,
                      state.velocity, 
@@ -863,9 +876,11 @@ class Simulation:
         '''
         return np.array(self._getRealPosition())
 
-    def setPosition(self, position):
+    def setPosition(self, position, box=None):
         '''
             Set the position (Å) of the atoms. Must be the same shape as the initial position representing the same atom types.
+            For NVE/NVT, box change is not allowed after initialization.
+            For NPT, box can be changed by providing the 'box' argument (Å).
         '''
         if position.shape != self._state.position.shape:
             raise ValueError("Position must have the same shape as the initial position, or you have to create a new Simulation instance.")
@@ -889,7 +904,7 @@ class Simulation:
         '''
         self._state = self._state.set(momentum=self._state.mass * velocity)
 
-    def setRandomVelocity(self, temperature, remove_drift=True, seed=None):
+    def setRandomVelocity(self, temperature, remove_com_motion=True, seed=None):
         """
             Set velocities from a Maxwell-Boltzmann distribution at a given temperature (K).
         """
@@ -898,9 +913,9 @@ class Simulation:
         key = jax.random.PRNGKey(seed)
         velocity = jax.random.normal(key, shape=self._state.velocity.shape, dtype=self._state.velocity.dtype)
         velocity *= jnp.sqrt(TEMP_UNIT_CONVERSION * temperature / self._state.mass)
-        if remove_drift:
-            velocity -= (velocity * self._state.mass).sum(0) / self._state.mass.sum()
         self.setVelocity(velocity)
+        if remove_com_motion:
+            self.remove_com_motion()
 
     def getBox(self):
         '''
