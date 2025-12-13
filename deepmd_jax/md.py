@@ -889,6 +889,19 @@ class Simulation:
         '''
         self._state = self._state.set(momentum=self._state.mass * velocity)
 
+    def setRandomVelocity(self, temperature, remove_drift=True, seed=None):
+        """
+            Set velocities from a Maxwell-Boltzmann distribution at a given temperature (K).
+        """
+        if seed is None:
+            seed = np.random.randint(1, 1e6)
+        key = jax.random.PRNGKey(seed)
+        velocity = jax.random.normal(key, shape=self._state.velocity.shape, dtype=self._state.velocity.dtype)
+        velocity *= jnp.sqrt(TEMP_UNIT_CONVERSION * temperature / self._state.mass)
+        if remove_drift:
+            velocity -= (velocity * self._state.mass).sum(0) / self._state.mass.sum()
+        self.setVelocity(velocity)
+
     def getBox(self):
         '''
             Returns the current box size (Å).
