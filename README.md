@@ -114,7 +114,7 @@ trajectory = sim.run(10000)            # Continue to run another 10,000 steps
 print(trajectory['position'].shape)    # (100000, n, 3), does not include the initial position
 ```
 
-You can check the `Simulation` class in [`md.py`](https://github.com/SparkyTruck/deepmd-jax/blob/main/deepmd_jax/md.py) for additional arguments, like print control, thermostat parameters, etc. There are also some methods of the `Simulation` class like `getEnergy`, `getForces`, `getPosition`, `setPosition`, etc. that you may find useful.
+You can check the `Simulation` class in [`md.py`](https://github.com/SparkyTruck/deepmd-jax/blob/main/deepmd_jax/md.py) for additional arguments, like print control, thermostat parameters, etc. There are also some methods of the `Simulation` class like `getEnergy`, `getForce`, `getPosition`, `setPosition`, etc. that you may find useful.
 
 If you want to print the trajectories on the fly, you can use the `TrajDumpSimulation` instead of `Simulation`:
 ```python
@@ -178,4 +178,4 @@ For jupyter notebooks, you can install a kernel with
 ```bash
 python -m ipykernel install --user --name deepmd-jax-cuda12 --display-name "Python (deepmd-jax-cuda12)" --env LD_LIBRARY_PATH ""
 ```
-In certain HPC environments, an alternative is to `module load` a latest CUDA 12 version. 
+In certain HPC environments, an alternative solution is to `module load` a latest CUDA 12 version. 
