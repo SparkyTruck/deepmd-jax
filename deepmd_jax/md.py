@@ -884,7 +884,27 @@ class Simulation:
         '''
         if position.shape != self._state.position.shape:
             raise ValueError("Position must have the same shape as the initial position, or you have to create a new Simulation instance.")
-        self._state = self._state.set(position=position)
+        if box is not None:
+            if not "NPT" in self._routine:
+                raise ValueError("Box can only be changed in NPT simulations.")
+            box = jnp.array(box)
+            if box.size == 1:
+                box = box.item() * jnp.ones(3)
+            if box.shape != self._current_box.shape:
+                raise ValueError("Box must have the same shape as the initial box.")
+            # assert isotropic fluctuations
+            scale = box[0] / self._current_box[0]
+            if not jnp.allclose(box, self._current_box * scale, rtol=1e-4, atol=1e-6):
+                raise ValueError("Only isotropic box fluctuations are allowed in the current implementation.")
+            self._current_box = jnp.array(box)
+        if not "NPT" in self._routine:
+            self._state = self._state.set(position=position)
+        else:
+            if self._current_box.size == 3:
+                fractional_position = position / self._current_box
+            else:
+                fractional_position = position @ jnp.linalg.inv(self._current_box)
+            self._state = self._state.set(position=fractional_position)
         self._keep_nbr_or_lattice_up_to_date()
         self._state = self._state.set(force=jax.jit(self._force_fn)(
                             self._state.position,
