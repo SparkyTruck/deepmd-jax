@@ -167,31 +167,17 @@ def train(
         subsets = train_data.get_flattened_data()
         if use_val_data:
             subsets += val_data.get_flattened_data()
-
+        print('# Building short-range dataset...', end='')
+        tic_sr = time.time()
         for subset in subsets:
-            data, type_count, lattice_args = subset.values()
-            if not lattice_args['ortho']:
-                raise ValueError('For "dplr" currently only orthorhombic boxes are supported.')
-            sel_type_count = tuple(np.array(type_count)[wc_model.params['nsel']])
-            qatoms = np.repeat(dplr_q_atoms, type_count)
-            qwc = np.repeat(dplr_q_wc, sel_type_count)
-            static_args = nn.FrozenDict({'type_count': type_count, 'lattice': lattice_args})
-
-            def lr_energy(coord, box, Ngrid):
-                wc = wc_model.wc_predict(wc_variables, coord, box, static_args)
-                p3mlr_fn = get_p3mlr_fn(jnp.diag(box), dplr_beta, Ngrid)
-                return p3mlr_fn(jnp.concatenate([coord, wc]), jnp.concatenate([qatoms, qwc]))
-            
-            @partial(jax.jit, static_argnums=(2,))
-            def lr_energy_and_force(coord, box, Ngrid):
-                e, negf = jax.value_and_grad(lr_energy)(coord, box, Ngrid)
-                return e, -negf
-
-            for i in range(len(data['coord'])):
-                Ngrid = get_p3mlr_grid_size(np.diag(data['box'][i]), dplr_beta, resolution=dplr_resolution)
-                e_lr, f_lr = lr_energy_and_force(data['coord'][i], data['box'][i], Ngrid)
-                data['energy'][i] -= e_lr
-                data['force'][i] -= f_lr
+            process_long_range_subset(subset,
+                                    dplr_q_atoms,
+                                    dplr_q_wc,
+                                    dplr_beta,
+                                    dplr_resolution,
+                                    wc_model,
+                                    wc_variables)
+        print(' Done. Time: %d s' % (time.time() - tic_sr))
 
     # construct model
     params = {
@@ -220,7 +206,7 @@ def train(
         }
         params.update(dplr_params)
     model = DPModel(params)
-    print('# Model params:', model.params)
+    print('# Model params:', {k:v for k,v in model.params.items() if k != 'dplr_wannier_model_and_variables'})
 
     # initialize model variables
     batch, type_count, lattice_args = train_data.get_batch(1)
@@ -386,26 +372,35 @@ def test(
         print('# Note: Currently only one device will be used for evaluation.')
     
     model, variables = load_model(model_path, replicate=False)
-    if model.params['type'] == 'energy':
+    if model.params['type'] == 'energy' or model.params['type'] == 'dplr':
         labels = ['coord', 'box', 'force', 'energy']
         atomic_sel = None
     elif model.params['type'] == 'atomic':
         labels = ['coord', 'box', model.params['atomic_data_prefix']]
         atomic_sel = model.params['nsel']
     else:
-        raise ValueError('Model type should be either "energy" or "atomic".')
+        raise ValueError('Model type should be "energy", "atomic", or "dplr".')
     test_data = DPDataset([data_path],
                           labels,
                           {'atomic_sel':atomic_sel})
     test_data.compute_lattice_candidate(model.params['rcut'])
+    if 'dplr' in model.params['type']:
+        subsets = test_data.get_flattened_data()
+        for subset in subsets:
+            process_long_range_subset(subset,
+                                      model.params['dplr_q_atoms'],
+                                      model.params['dplr_q_wc'],
+                                      model.params['dplr_beta'],
+                                      model.params['dplr_resolution'] * 0.6,
+                                      *model.params['dplr_wannier_model_and_variables'])
     test_data.pointer = 0
     remaining = test_data.nframes
-    if model.params['type'] == 'energy':
+    if model.params['type'] == 'energy' or model.params['type'] == 'dplr':
         evaluate_fn = model.energy_and_force
         predictions = {'energy': [], 'force': []}
         ground_truth = {'energy': [], 'force': []}
     else:
-        evaluate_fn = model.apply
+        evaluate_fn = lambda variables, coord, box, static_args: model.apply(variables, coord, box, static_args)
         predictions = {model.params['atomic_data_prefix']: []}
         ground_truth = {model.params['atomic_data_prefix']: []}
     evaluate_fn = jax.jit(jax.vmap(evaluate_fn,
@@ -417,21 +412,21 @@ def test(
         remaining -= bs
         static_args = nn.FrozenDict({'type_count': type_count, 'lattice': lattice_args})
         pred = evaluate_fn(variables, batch['coord'], batch['box'], static_args)
-        if model.params['type'] == 'energy':
+        if model.params['type'] == 'energy' or model.params['type'] == 'dplr':
             predictions['energy'].append(pred[0])
             predictions['force'].append(pred[1])
             ground_truth['energy'].append(batch['energy'])
             ground_truth['force'].append(batch['force'])
         else:
             predictions[model.params['atomic_data_prefix']].append(pred[0])
-            ground_truth[model.params['atomic_data_prefix']].append(batch[model.params['atomic_data_prefix']])
+            ground_truth[model.params['atomic_data_prefix']].append(batch['atomic'])
     rmse = {}
     for key in predictions.keys():
         predictions[key] = np.concatenate(predictions[key], axis=0)
         ground_truth[key] = np.concatenate(ground_truth[key], axis=0)
         rmse[key] = (((predictions[key] - ground_truth[key]) ** 2).mean() ** 0.5).item()
     # reorder force back; will delete in future when reordering is moved into dpmodel.py
-    if model.params['type'] == 'energy':
+    if model.params['type'] == 'energy' or model.params['type'] == 'dplr':
         ground_truth['force'] = ground_truth['force'][:, test_data.type.argsort(kind='stable').argsort(kind='stable')]
         predictions['force'] = predictions['force'][:, test_data.type.argsort(kind='stable').argsort(kind='stable')]
     return rmse, predictions, ground_truth
@@ -501,6 +496,30 @@ def evaluate(
 
     return predictions
     
+def process_long_range_subset(subset, dplr_q_atoms, dplr_q_wc, dplr_beta, dplr_resolution, wc_model, wc_variables):
+    '''
+        subtracting long range energy and force, keeping short range part only, for dplr models.
+    '''
+    data, type_count, lattice_args = subset.values()
+    if not lattice_args['ortho']:
+        raise ValueError('For "dplr" currently only orthorhombic boxes are supported.')
+    sel_type_count = tuple(np.array(type_count)[wc_model.params['nsel']])
+    qatoms = np.repeat(dplr_q_atoms, type_count)
+    qwc = np.repeat(dplr_q_wc, sel_type_count)
+    static_args = nn.FrozenDict({'type_count': type_count, 'lattice': lattice_args})
 
+    def lr_energy(coord, box, Ngrid):
+        wc = wc_model.wc_predict(wc_variables, coord, box, static_args)
+        p3mlr_fn = get_p3mlr_fn(jnp.diag(box), dplr_beta, Ngrid)
+        return p3mlr_fn(jnp.concatenate([coord, wc]), jnp.concatenate([qatoms, qwc]))
+    
+    @partial(jax.jit, static_argnums=(2,))
+    def lr_energy_and_force(coord, box, Ngrid):
+        e, negf = jax.value_and_grad(lr_energy)(coord, box, Ngrid)
+        return e, -negf
 
-          
+    for i in range(len(data['coord'])):
+        Ngrid = get_p3mlr_grid_size(np.diag(data['box'][i]), dplr_beta, resolution=dplr_resolution)
+        e_lr, f_lr = lr_energy_and_force(data['coord'][i], data['box'][i], Ngrid)
+        data['energy'][i] -= e_lr
+        data['force'][i] -= f_lr
