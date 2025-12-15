@@ -391,7 +391,7 @@ def test(
                                       model.params['dplr_q_atoms'],
                                       model.params['dplr_q_wc'],
                                       model.params['dplr_beta'],
-                                      model.params['dplr_resolution'] * 0.6,
+                                      model.params['dplr_resolution'],
                                       *model.params['dplr_wannier_model_and_variables'])
     test_data.pointer = 0
     remaining = test_data.nframes
