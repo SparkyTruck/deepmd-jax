@@ -143,6 +143,39 @@ sim.run(
 trajectory = sim.run(100000)
 ```
 
+### Running with ASE
+
+An ASE calculator is provided and can be used to run energy minimizations or molecular dynamics. This is a minimal example:
+```python
+from deepmd_jax.md import DPJaxCalculator
+from ase import Atoms
+from ase.md.langevin import Langevin
+from ase import units
+
+model_path="./model.pkl"
+data_path='./data'
+initial_position = np.genfromtxt(data_path + "/coord.raw")[0,:].reshape(-1,3)
+box = np.genfromtxt(data_path + "/box.raw")[0,:].reshape(3,3)
+type_idx = np.genfromtxt(data_path + "/type.raw")
+
+calc = DPJaxCalculator(model_path=model_path, type_idx=type_idx)
+
+type_map = {0: "O", 1: "H"}
+symbols = [type_map[i] for i in type_idx]
+atoms = Atoms(
+    symbols=symbols,
+    positions=initial_position,
+    cell=box,
+    pbc=True
+)
+
+atoms.set_calculator(calc)
+
+dyn = Langevin(atoms, timestep=0.5 * units.fs, temperature_K=300, friction=0.01)
+dyn.run(10)  # 10 MD steps
+```
+
+
 ### Precision Settings
 
 By default, single precision `float32` is used for both training and simulation, which I find to be generally sufficient. However, if you need double precision, enable it at the **beginning** of your script with:
