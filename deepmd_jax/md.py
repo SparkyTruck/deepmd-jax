@@ -1172,9 +1172,8 @@ class DPJaxCalculator(Calculator):
                 box = box @ perturbation
             # Ensure coord and box is replicated on all devices
             if len(jax.devices()) > 1:
-                sharding = jax.sharding.PositionalSharding(jax.devices()).replicate()
-                coord = jax.lax.with_sharding_constraint(coord, sharding)
-                box = jax.lax.with_sharding_constraint(box, sharding)
+                coord = jax.lax.with_sharding_constraint(coord, PSpec())
+                box = jax.lax.with_sharding_constraint(box, PSpec())
 
             # Energy calculation
             E = model.apply(variables,
