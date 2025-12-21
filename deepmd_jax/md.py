@@ -1146,22 +1146,22 @@ class DPJaxCalculator(Calculator):
         self._dtype = dtype
 
         self._model, self._variables = load_model(model_path)
+        self._static_args = None
 
         self._type_idx = type_idx.astype(int)
         type_count = np.bincount(self._type_idx)
         self._type_count = np.pad(type_count, (0, self._model.params['ntypes'] - len(type_count)))
 
         self._energy_and_forces_fn = self._get_energy_and_forces_fn()
-        print("Initializing the DPJaxCalculator")
+        print("# Initializing the DPJaxCalculator")
 
     def _get_energy_and_forces_fn(self, model_and_variables=None):
         if model_and_variables is None:
             model_and_variables = (self._model, self._variables)
         model, variables = model_and_variables
 
-        def energy_fn(coord, box, nbrs_nm=None, perturbation=None, **kwargs):
+        def energy_fn(coord, box, static_args, nbrs_nm=None, perturbation=None, **kwargs):
             '''
-                Energy function that can be used in jax_md.simulate routines.
                 You can customize the energy function here, i.e. if you want to add perturbations.
             '''
             # Atoms are reordered and grouped by type in neural network inputs
@@ -1179,22 +1179,25 @@ class DPJaxCalculator(Calculator):
             E = model.apply(variables,
                             coord,
                             box,
-                            self._static_args,
+                            static_args,
                             nbrs_nm)[0]
+            if model.params['type'] == 'dplr':
+                raise NotImplementedError("DPLR model not implemented in the ASE calculator yet.")
             return E
 
-        def stress_fn(coord, box, **kwargs):
+        def stress_fn(coord, box, static_args, **kwargs):
             return jax_md.quantity.stress(
                         energy_fn,
                         coord,
                         box,
+                        static_args=static_args,
                         velocity=None,
                         nbrs_nm=None,
                     ) 
 
-        def e_and_f_and_s(coords, box, **kwargs):
-            e, grad = jax.value_and_grad(energy_fn)(coords, box, **kwargs)
-            stress = stress_fn(coords, box, **kwargs)
+        def e_and_f_and_s(coords, box, static_args, **kwargs):
+            e, grad = jax.value_and_grad(energy_fn)(coords, box, static_args, **kwargs)
+            stress = stress_fn(coords, box, static_args, **kwargs)
             stress_voigt = jnp.array([
                 stress[0, 0],
                 stress[1, 1],
@@ -1207,7 +1210,7 @@ class DPJaxCalculator(Calculator):
             # Also, the off-diagonal components have not been tested
             return e, -grad, -stress_voigt
 
-        return jax.jit(e_and_f_and_s, static_argnames=())
+        return jax.jit(e_and_f_and_s, static_argnames=('static_args',))
 
 
     def _get_static_args(self, position):
@@ -1215,8 +1218,8 @@ class DPJaxCalculator(Calculator):
             Returns a FrozenDict of the complete set of static arguments for jit compilation.
         '''
         box = self._current_box
-        lattice_args = compute_lattice_candidate(box[None], self._model.params['rcut'])
-        static_args = nn.FrozenDict({'type_count':self._type_count, 'lattice':lattice_args, 'use_neighbor_list':False})
+        lattice_args = compute_lattice_candidate(box[None], self._model.params['rcut'], print_info=False)
+        static_args = nn.FrozenDict({'type_count':tuple(self._type_count), 'lattice':lattice_args, 'use_neighbor_list':False})
         return static_args
 
     def calculate(self, atoms=None, properties=None, system_changes=all_changes):
@@ -1239,11 +1242,15 @@ class DPJaxCalculator(Calculator):
         self._natoms = pos.shape[0]
         coords = jnp.array(pos, dtype=self._dtype)
 
-        self._static_args = self._get_static_args(coords)
-
+        static_args = self._get_static_args(coords)
+        if self._static_args != static_args:
+            print('# Lattice vectors for neighbor images: Max %d out of %d candidates.' % (static_args['lattice']['lattice_max'], len(static_args['lattice']['lattice_cand'])))
+        self._static_args = static_args
+        
         E, F, S = self._energy_and_forces_fn(
             coords,
             box,
+            static_args,
             )
 
         # Convert JAX arrays to numpy
