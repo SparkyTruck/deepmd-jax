@@ -8,7 +8,7 @@ setup(
     version='0.2',
     packages=find_packages(),
     install_requires=[
-        'jax[cuda12]',
+        'jax[cuda12]>=0.7.1',
         'flax',
         'optax',
         'jax-md @ git+https://github.com/google/jax-md.git',

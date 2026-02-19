@@ -8,7 +8,7 @@ DeepMD-jax supports:
 - **Deep Wannier (DW)**: Predicting Wannier centers associated to atoms.
 - **DP Long Range (DPLR)**: Incorporate explicit long-range Coulomb interactions.
 
-Also, you can try the **DP-MP** architecture for enhanced accuracy.
+Also, you can try the [**DP-MP**](https://pubs.rsc.org/en/content/articlehtml/2024/cp/d4cp01483a) architecture for enhanced accuracy.
 
 Currently allows **NVE/NVT/NPT simulations** on **multiple GPUs** based on a backend of [jax-md](https://github.com/jax-md/jax-md).
 
@@ -18,7 +18,6 @@ git clone https://github.com/SparkyTruck/deepmd-jax.git
 cd deepmd-jax
 pip install -e .
 ```
-
 
 ## Quick Start
 
@@ -66,12 +65,12 @@ train(
       dplr_wannier_model_path='wannier.pkl', # Path to the trained Wannier model
       train_data_path='/energy/force/data/', # Path (or a list of paths) to the training dataset
       step=1000000,                          # Number of training steps
-      dplr_q_atoms=[6, 1],                   # Charge of atoms of each type
-      dplr_q_wc = [-8],                      # Charge of Wannier centers of each atomic_sel type
+      dplr_q_atoms=[6, 1],                   # Charge of atomic cores of each type (eg. oxygen and hydrogen)
+      dplr_q_wc = [-8],                      # Charge of Wannier centers associated to each atom in atomic_sel type
 )
 ```
 
-In `train()`, set `mp=True` to enable DP-MP for better accuracy; the default values for the other arguments in `train()` like learning rate, batch size, model width, etc. are usually a solid baseline.
+The default values for the other arguments in [`train()`](https://github.com/SparkyTruck/deepmd-jax/blob/main/deepmd_jax/train.py) like learning rate, batch size, model width, etc. are usually a solid baseline. The one parameter you may want to change is `mp=True` to enable DP-MP for better accuracy.
 
 ### Evaluating a Model
 
@@ -115,7 +114,7 @@ trajectory = sim.run(10000)            # Continue to run another 10,000 steps
 print(trajectory['position'].shape)    # (100000, n, 3), does not include the initial position
 ```
 
-You can check the `Simulation` class for additional initialization arguments, like print control, thermostat parameters, etc. There are also some methods of the `Simulation` class like `getEnergy`, `getForces`, `getPosition`, `setPosition`, etc.
+You can check the `Simulation` class in [`md.py`](https://github.com/SparkyTruck/deepmd-jax/blob/main/deepmd_jax/md.py) for additional arguments, like print control, thermostat parameters, etc. There are also some methods of the `Simulation` class like `getEnergy`, `getForce`, `getPosition`, `setPosition`, etc. that you may find useful.
 
 If you want to print the trajectories on the fly, you can use the `TrajDumpSimulation` instead of `Simulation`:
 ```python
@@ -144,6 +143,35 @@ sim.run(
 trajectory = sim.run(100000)
 ```
 
+### Running with ASE
+
+An ASE calculator is provided and can be used to run energy minimizations or molecular dynamics. This is a minimal example with the same `initial_position`, `type_idx`, and `box` of shape `(3, 3)` or `(3,)`:
+```python
+from deepmd_jax.md import DPJaxCalculator
+from ase import Atoms
+from ase.md.langevin import Langevin
+from ase import units
+
+calc = DPJaxCalculator(model_path="./model.pkl", type_idx=type_idx)
+
+type_map = {0: "O", 1: "H"}
+symbols = [type_map[i] for i in type_idx]
+atoms = Atoms(
+    symbols=symbols,
+    positions=initial_position,
+    cell=box,
+    pbc=True
+)
+
+atoms.set_calculator(calc)
+
+dyn = Langevin(atoms, timestep=0.5 * units.fs, temperature_K=300, friction=0.01)
+dyn.run(10)  # 10 MD steps
+```
+
+The ASE calculator may run slower than the built-in `Simulation`, but you can take advantage of the rich ASE features, such as minimization routines, different thermostats, non-isotropic NPT simulations, etc.
+
+
 ### Precision Settings
 
 By default, single precision `float32` is used for both training and simulation, which I find to be generally sufficient. However, if you need double precision, enable it at the **beginning** of your script with:
@@ -161,10 +189,8 @@ The default units are Angstrom, eV, femtosecond, and their derived units. The on
 
 To-do list:
 - [ ] Fix atoms/dummy atoms; Optimize multi-gpu sharding.
-- [ ] Model deviation API; evaluate DPLR;
-- [ ] Misc simulation features: Temperature and pressure control, more thermostats, remove center of mass motion; 
-- [ ] Optimize NPT speed and memory usage (could be a jax-md issue)
-- [ ] DWIR support (iterative refinement).
+- [ ] Model deviation API;
+- [ ] Misc simulation features: Temperature and pressure control, more thermostats;
 
 Planned features: (v0.3)
 - [ ] Enhanced sampling. 
@@ -176,8 +202,9 @@ This project is in active development, and if you encounter any issues, please f
 
 ## Troubleshooting
 
-In certain HPC environments, if jax doesn't see a GPU when there is one, you may need to `module load` a latest CUDA 12 version. To solve this environment problem in jupyter notebooks, you can install a kernel with the right environment variables set. For example:
+If jax doesn't see a GPU when there is one, it could be due to the environment variable `LD_LIBRARY_PATH` not pointing to the right CUDA libraries. The simplest fix is running `unset LD_LIBRARY_PATH` in bash before launching python.
+For jupyter notebooks, you can install a kernel with
 ```bash
 python -m ipykernel install --user --name deepmd-jax-cuda12 --display-name "Python (deepmd-jax-cuda12)" --env LD_LIBRARY_PATH ""
 ```
-
+In certain HPC environments, an alternative solution is to `module load` a latest CUDA 12 version. 

@@ -10,6 +10,8 @@ import gc
 from time import time
 from ase import io, Atoms
 from jax.sharding import PartitionSpec as PSpec
+from ase.calculators.calculator import Calculator, all_changes
+
 from .data import compute_lattice_candidate
 from .utils import split, concat, load_model, norm_ortho_box, get_p3mlr_fn, get_p3mlr_grid_size
 from typing import Callable
@@ -273,6 +275,7 @@ class Simulation:
                  use_neighbor_list_when_possible=True,
                  neighbor_skin: float = None,
                  neighbor_buffer_ratio: float = 1.2,
+                 remove_com_motion=False,
                  tau_t=100.,
                  tau_p=1000.,
                  chain_length_t=3,
@@ -302,6 +305,7 @@ class Simulation:
             use_neighbor_list_when_possible: if False, neighbor list will be disabled (for debug use)
             neighbor_skin: buffer radius for neighbor list
             neighbor_buffer_ratio: capacity of neighbor list = neighbor_buffer_ratio * max_neighbors
+            remove_com_motion: explicitly remove center-of-mass velocity at each step; usually unnecessary for DP models; may be useful for DPLR models
             tau: Nose-Hoover thermostat/barostat relaxation time (fs)
             chain_length: Nose-Hoover thermostat/barostat chain length
             chain_steps: Nose-Hoover thermostat/barostat chain steps
@@ -319,7 +323,7 @@ class Simulation:
         self._dt = dt
         self._routine = routine
         self._temperature = temperature
-        self._type_idx = np.array(type_idx.astype(int))
+        self._type_idx = np.array(type_idx).astype(int)
         self._mass = jnp.array(np.array(mass)[np.array(self._type_idx)]) # AMU
         self._model, self._variables = load_model(model_path)
         type_count = np.bincount(self._type_idx)
@@ -328,6 +332,7 @@ class Simulation:
         self._step_chunk_size = max(10, min(100, 100000 // self._natoms))
         self._model_deviation_paths = model_deviation_paths
         self._use_model_deviation = len(model_deviation_paths) > 0
+        self._remove_com_motion = remove_com_motion
         if neighbor_skin is None:
             self._neighbor_skin = 0.5 if "NPT" in self._routine else 0.3
         else:
@@ -738,6 +743,29 @@ class Simulation:
 
         return soft_update_nbrs
 
+    def _unwrap_positions(self, previous_position, current_position, box):
+        '''
+            Unwrap positions to avoid discontinuities in trajectory.
+        '''
+        if "NPT" in self._routine:
+            current_position = previous_position + (current_position - previous_position + 0.5) % 1 - 0.5
+        else:
+            if box.size == 3:
+                current_position = previous_position + (current_position - previous_position + box/2) % box - box/2
+            else:
+                fractional_prev = previous_position @ jnp.linalg.inv(box)
+                fractional_curr = current_position @ jnp.linalg.inv(box)
+                fractional_curr = fractional_prev + (fractional_curr - fractional_prev + 0.5) % 1 - 0.5
+                current_position = fractional_curr @ box
+        return current_position
+
+    def remove_com_motion(self):
+        '''
+            Remove center-of-mass velocity from the current state.
+        '''
+        velocity = self._state.velocity - (self._state.velocity * self._state.mass).sum(0) / self._state.mass.sum()
+        self.setVelocity(velocity)
+        
     def _get_inner_step(self):
         '''
             Returns a jitted function that performs multiple simulation steps.
@@ -747,6 +775,7 @@ class Simulation:
                 Performs a single simulation step.
             '''
             state, typed_nbrs, error_code, profile = states
+            previous_state_position = state.position
             current_box = state.box if "NPT" in self._routine else self._initial_box
 
             # soft update neighbor list before a step
@@ -764,7 +793,13 @@ class Simulation:
                                 state,
                                 nbrs_nm=typed_nbrs.nbrs_nm if typed_nbrs else None,
                             )
-
+            new_position = self._unwrap_positions(previous_state_position,
+                                                  state.position,
+                                                  state.box if "NPT" in self._routine else self._current_box)
+            state = state.set(position=new_position)
+            if self._remove_com_motion:
+                velocity = state.velocity - (state.velocity * state.mass).sum(0) / state.mass.sum()
+                state = state.set(momentum=state.mass * velocity)
             return ((state, typed_nbrs, error_code, profile),
                     (state.position * state.box if "NPT" in self._routine else state.position,
                      state.velocity, 
@@ -792,14 +827,18 @@ class Simulation:
         traj_dtype = np.float64 if jax.config.read('jax_enable_x64') else np.float32
         # preallocate space for trajectory
         try:
-            safe_buffer = np.zeros((traj_length, 3*self._natoms, 3), dtype=traj_dtype)
+            safe_buffer = np.zeros((traj_length, 5*self._natoms, 3), dtype=traj_dtype)
             del safe_buffer
             gc.collect()
             self._position_trajectory = np.zeros((traj_length, self._natoms, 3), dtype=traj_dtype)
             self._velocity_trajectory = np.zeros((traj_length, self._natoms, 3), dtype=traj_dtype)
             self._box_trajectory = np.zeros((traj_length,) + self._current_box.shape, dtype=traj_dtype)
         except MemoryError:
-            raise MemoryError("Trajectory too large to fit in CPU RAM. Split into multiple run(steps) and save/postprocess the segment after each run.")
+            raise MemoryError("Trajectory too large to fit in CPU RAM. Please split into multiple shorter runs and save/postprocess the segment after each run.")
+        try:
+            safe_buffer = np.zeros((traj_length, 10*self._natoms, 3), dtype=traj_dtype)
+        except MemoryError:
+            print("# Warning: A long trajectory may exhaust CPU RAM. It is safer to split into multiple shorter runs and save/postprocess the segment after each run.")
         if self._is_initial_state:
             self._position_trajectory[0] = self.getPosition()
             self._velocity_trajectory[0] = self.getVelocity()
@@ -898,13 +937,35 @@ class Simulation:
         '''
         return np.array(self._getRealPosition())
 
-    def setPosition(self, position):
+    def setPosition(self, position, box=None):
         '''
             Set the position (Å) of the atoms. Must be the same shape as the initial position representing the same atom types.
+            For NVE/NVT, box change is not allowed after initialization.
+            For NPT, box can be changed by providing the 'box' argument (Å).
         '''
         if position.shape != self._state.position.shape:
             raise ValueError("Position must have the same shape as the initial position, or you have to create a new Simulation instance.")
-        self._state = self._state.set(position=position)
+        if box is not None:
+            if not "NPT" in self._routine:
+                raise ValueError("Box can only be changed in NPT simulations.")
+            box = jnp.array(box)
+            if box.size == 1:
+                box = box.item() * jnp.ones(3)
+            if box.shape != self._current_box.shape:
+                raise ValueError("Box must have the same shape as the initial box.")
+            # assert isotropic fluctuations
+            scale = box[0] / self._current_box[0]
+            if not jnp.allclose(box, self._current_box * scale, rtol=1e-4, atol=1e-6):
+                raise ValueError("Only isotropic box fluctuations are allowed in the current implementation.")
+            self._current_box = jnp.array(box)
+        if not "NPT" in self._routine:
+            self._state = self._state.set(position=position)
+        else:
+            if self._current_box.size == 3:
+                fractional_position = position / self._current_box
+            else:
+                fractional_position = position @ jnp.linalg.inv(self._current_box)
+            self._state = self._state.set(position=fractional_position)
         self._keep_nbr_or_lattice_up_to_date()
         self._state = self._state.set(force=jax.jit(self._force_fn)(
                             self._state.position,
@@ -925,6 +986,19 @@ class Simulation:
         if self._mobile is not None:
             velocity = velocity * self._mobile[:, None]
         self._state = self._state.set(momentum=self._state.mass * velocity)
+
+    def setRandomVelocity(self, temperature, remove_com_motion=True, seed=None):
+        """
+            Set velocities from a Maxwell-Boltzmann distribution at a given temperature (K).
+        """
+        if seed is None:
+            seed = np.random.randint(1, 1e6)
+        key = jax.random.PRNGKey(seed)
+        velocity = jax.random.normal(key, shape=self._state.velocity.shape, dtype=self._state.velocity.dtype)
+        velocity *= jnp.sqrt(TEMP_UNIT_CONVERSION * temperature / self._state.mass)
+        self.setVelocity(velocity)
+        if remove_com_motion:
+            self.remove_com_motion()
 
     def getBox(self):
         '''
@@ -1116,3 +1190,126 @@ class TrajDumpSimulation(Simulation):
 
         self._print_run_profile(steps, time() - self._tic_of_this_run)
         self._keep_nbr_or_lattice_up_to_date()
+
+
+
+class DPJaxCalculator(Calculator):
+    implemented_properties = ["energy", "forces", "stress"]
+
+    def __init__(self, 
+            model_path,
+            type_idx = None, 
+            dtype=jnp.float32,
+            **kwargs):
+
+        self.atoms = None
+        self.use_cache = False
+        self._dtype = dtype
+
+        self._model, self._variables = load_model(model_path)
+        self._static_args = None
+
+        self._type_idx = np.array(type_idx).astype(int)
+        type_count = np.bincount(self._type_idx)
+        self._type_count = np.pad(type_count, (0, self._model.params['ntypes'] - len(type_count)))
+
+        self._energy_and_forces_fn = self._get_energy_and_forces_fn()
+        print("# Initializing the DPJaxCalculator")
+
+    def _get_energy_and_forces_fn(self, model_and_variables=None):
+        if model_and_variables is None:
+            model_and_variables = (self._model, self._variables)
+        model, variables = model_and_variables
+
+        def energy_fn(coord, box, static_args, nbrs_nm=None, perturbation=None, **kwargs):
+            '''
+                You can customize the energy function here, i.e. if you want to add perturbations.
+            '''
+            # Atoms are reordered and grouped by type in neural network inputs
+            coord = coord[self._type_idx.argsort(kind='stable')]
+            # perturbation = 1, required by jax-md stress calculation
+            if perturbation is not None:
+                coord = coord @ perturbation
+                box = box @ perturbation
+            # Ensure coord and box is replicated on all devices
+            if len(jax.devices()) > 1:
+                coord = jax.lax.with_sharding_constraint(coord, PSpec())
+                box = jax.lax.with_sharding_constraint(box, PSpec())
+
+            # Energy calculation
+            E = model.apply(variables,
+                            coord,
+                            box,
+                            static_args,
+                            nbrs_nm)[0]
+            if model.params['type'] == 'dplr':
+                raise NotImplementedError("DPLR model not implemented in the ASE calculator yet.")
+            return E
+
+        def stress_fn(coord, box, static_args, **kwargs):
+            return jax_md.quantity.stress(
+                        energy_fn,
+                        coord,
+                        box,
+                        static_args=static_args,
+                        velocity=None,
+                        nbrs_nm=None,
+                    ) 
+
+        def e_and_f_and_s(coords, box, static_args, **kwargs):
+            e, grad = jax.value_and_grad(energy_fn)(coords, box, static_args, **kwargs)
+            stress = stress_fn(coords, box, static_args, **kwargs)
+            stress_voigt = jnp.array([
+                stress[0, 0],
+                stress[1, 1],
+                stress[2, 2],
+                stress[1, 2],  
+                stress[0, 2], 
+                stress[0, 1], 
+                ], dtype=self._dtype)
+            # Note the minus sign in the stress below, to match ASE's convention
+            # Also, the off-diagonal components have not been tested
+            return e, -grad, -stress_voigt
+
+        return jax.jit(e_and_f_and_s, static_argnames=('static_args',))
+
+
+    def _get_static_args(self, position):
+        '''
+            Returns a FrozenDict of the complete set of static arguments for jit compilation.
+        '''
+        box = self._current_box
+        # it is important to disable_ortho to compute the stress tensor correctly, even for orthogonal boxes
+        lattice_args = compute_lattice_candidate(box[None], self._model.params['rcut'], print_info=False, disable_ortho=True)
+        static_args = nn.FrozenDict({'type_count':tuple(self._type_count), 'lattice':lattice_args, 'use_neighbor_list':False})
+        return static_args
+
+    def calculate(self, atoms=None, properties=None, system_changes=all_changes):
+
+        if atoms is not None:
+            self.atoms = atoms.copy()
+
+        cell = np.asarray(self.atoms.get_cell(complete=True))  # Use complete=True for (3,3)
+        box = jnp.array(cell, dtype=self._dtype)
+        self._current_box = box
+
+        # Get positions and cell from ASE
+        pos = self.atoms.get_positions()  # (N,3), in Å
+        self._natoms = pos.shape[0]
+        coords = jnp.array(pos, dtype=self._dtype)
+
+        static_args = self._get_static_args(coords)
+        if self._static_args != static_args:
+            print('# Lattice vectors for neighbor images: Max %d out of %d candidates.' % (static_args['lattice']['lattice_max'], len(static_args['lattice']['lattice_cand'])))
+        self._static_args = static_args
+        
+        E, F, S = self._energy_and_forces_fn(
+            coords,
+            box,
+            static_args,
+            )
+
+        # Convert JAX arrays to numpy
+        self.results["energy"] = float(E)
+        self.results["forces"] = np.asarray(F)
+        self.results["stress"] = np.asarray(S)
