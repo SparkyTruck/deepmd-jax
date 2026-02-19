@@ -355,8 +355,11 @@ class Simulation:
         else: 
             self._mobile = None
 
+        if self._mobile is not None and self._routine != 'NVT':
+            raise NotImplementedError("Fixing atoms currently limited to NVT")
+
         def _shift_fn_wrapper(x, dx, **kwargs):
-            if mobile is not None:
+            if self._mobile is not None:
                 return jnp.where(mobile[:, None], shift(x, dx, **kwargs), x)
             else:
                 return shift(x, dx, **kwargs)
@@ -919,6 +922,8 @@ class Simulation:
         '''
             Set the velocity (Å/fs) of the atoms. Must be the same shape as the initial position representing the same system.
         '''
+        if self._mobile is not None:
+            velocity = velocity * self._mobile[:, None]
         self._state = self._state.set(momentum=self._state.mass * velocity)
 
     def getBox(self):
