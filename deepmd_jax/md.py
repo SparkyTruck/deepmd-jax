@@ -91,6 +91,35 @@ def get_idx_mask_fn(type_count):
         return jnp.where(filter, idx, len(full_mask))
     return idx_mask_fn
 
+def _nvt_nose_hoover_invariant(energy_fn,
+                    state: jax_md.simulate.NVTNoseHooverState,
+                    kT: float,
+                    **kwargs) -> float:
+    """The conserved quantity for the NVT ensemble with a Nose-Hoover thermostat.
+
+    This function is adapted from jax_md.simulate to define the DOF differently.
+
+    Arguments:
+        energy_fn: The energy function of the Nose-Hoover system.
+        state: The current state of the system.
+        kT: The current goal temperature of the system.
+
+    Returns:
+        The Hamiltonian of the extended NVT dynamics.
+    """
+    PE = energy_fn(state.position, **kwargs)
+    KE = jax_md.simulate.kinetic_energy(state)
+
+    DOF = state.chain.degrees_of_freedom
+    E = PE + KE
+
+    c = state.chain
+
+    E += c.momentum[0] ** 2 / (2 * c.mass[0]) + DOF * kT * c.position[0]
+    for r, p, m in zip(c.position[1:], c.momentum[1:], c.mass[1:]):
+        E += p ** 2 / (2 * m) + kT * r
+    return E
+
 @jax_md.dataclasses.dataclass
 class TypedNeighborList():
     '''
@@ -574,7 +603,7 @@ class Simulation:
                                             self._reporters["KE"](state, nbrs_nm) + \
                                             self._reporters["PE"](state, nbrs_nm)
         elif self._routine == "NVT":
-            self._reporters["Invariant"] = lambda state, nbrs_nm: jax_md.simulate.nvt_nose_hoover_invariant(
+            self._reporters["Invariant"] = lambda state, nbrs_nm: _nvt_nose_hoover_invariant(
                                             self._energy_fn,
                                             state,
                                             self._temperature * TEMP_UNIT_CONVERSION,
