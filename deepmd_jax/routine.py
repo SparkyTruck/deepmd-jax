@@ -56,9 +56,15 @@ def nvt_with_fixed_atoms(nvt_init_fn, nvt_apply_fn, mobile_mask):
         state = nvt_init_fn(key, R, *args, **kwargs)
         # Zero fixed atom velocities
         state = state.set(momentum=state.momentum * mobile)
-        # Fix thermostat DOF
+        # Fix thermostat chain: correct DOF, chain mass Q[0], and stored KE
         if hasattr(state, "chain"):
-            state = state.set(chain=state.chain.set(degrees_of_freedom=dof))
+            KE = jax_md.simulate.kinetic_energy(state)
+            new_mass = state.chain.mass.at[0].multiply(dof / R.size)
+            state = state.set(chain=state.chain.set(
+                degrees_of_freedom=dof,
+                kinetic_energy=KE,
+                mass=new_mass,
+            ))
         return state
 
     def apply_fn(state, *args, **kwargs):
