@@ -533,11 +533,12 @@ class Simulation:
             Returns a set of functions that reports the current state.
             You can customize report functions with the same signature.
         '''
+        _temp_dof_scale = self._natoms / int(np.sum(self._mobile)) if self._mobile is not None else 1
         self._reporters = {
             "Temperature": lambda state, _: jax_md.quantity.temperature(
                                                             velocity=state.velocity,
                                                             mass=state.mass,
-                                                        ) / TEMP_UNIT_CONVERSION,
+                                                        ) / TEMP_UNIT_CONVERSION * _temp_dof_scale,
             "KE": lambda state, _: jax_md.quantity.kinetic_energy(
                                                     velocity=state.velocity,
                                                     mass=state.mass,
