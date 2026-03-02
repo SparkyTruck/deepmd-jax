@@ -162,30 +162,28 @@ def train(
     if hybrid:
         if model_type != 'energy':
             raise ValueError('For hybrid models model_type has to be energy')
-        # Multiple temperatures
+        # Define file names a.k.a. "labels"
         labels_obs = labels + ['observable']
         labels_obs = [item for item in labels_obs if item != 'force']
-        if type(obs_temperature) == list:
-            train_data_obs = []
-            for i in range(len(obs_temperature)):
-                _obs_train_data_path = [[path] for path in obs_train_data_path[i]]
-                single_data_obs = DPDataset(_obs_train_data_path,
-                                            labels_obs,
-                                            {'atomic_sel':atomic_sel})
-                single_data_obs.compute_lattice_candidate(rcut)
-                train_data_obs.append(single_data_obs)
+        # Handle multiple paths to observable data
+        if obs_train_data_path is None:
+            raise ValueError('Must provide obs_train_data_path for hybrid models.')
+        if type(obs_train_data_path) == str:
+            obs_train_data_path = [obs_train_data_path]
+        elif type(obs_train_data_path) == list:
+            pass
         else:
-            if obs_train_data_path is None:
-                raise ValueError('Must provide obs_train_data_path for hybrid models.')
-            elif type(obs_train_data_path) == str:
-                obs_train_data_path = [obs_train_data_path]
-            else:
-                obs_train_data_path = [[path] for path in obs_train_data_path]
-            train_data_obs = DPDataset(obs_train_data_path,
-                                       labels_obs,
-                                       {'atomic_sel':atomic_sel})
-            train_data_obs.compute_lattice_candidate(rcut)
-            train_data_obs = [train_data_obs]
+            raise ValueError('obs_train_data_path not recognized, must be a path or list of paths.')
+        train_data_obs = []
+        for i in range(len(obs_train_data_path)):
+            if type(obs_train_data_path[i]) != str:
+                raise ValueError('Each element of obs_train_data_path must be a string.')
+            single_data_obs = DPDataset([obs_train_data_path[i]],
+                                        labels_obs,
+                                        {'atomic_sel':atomic_sel})
+            single_data_obs.compute_lattice_candidate(rcut)
+            train_data_obs.append(single_data_obs)
+        # Handle multiple obs_target, either numbers or paths to data
         if obs_target is None and hybrid:
             raise ValueError('Must provide obs_target for hybrid models')
         if isinstance(obs_target, (int, float)):
@@ -202,9 +200,12 @@ def train(
                 else:
                     raise ValueError('If obs_target is a list, each item must be a number or a path string.')
             obs_target = parsed_obs_target
+        # Handle multiple temperatures
         if isinstance(obs_temperature, (int, float)):
             obs_temperature = [obs_temperature]
         assert len(obs_temperature) == len(obs_target), 'obs_temperature and obs_target must be of the same length.'
+        assert len(obs_temperature) == len(obs_train_data_path), 'obs_temperature and obs_train_data_path must be of the same length.'
+        assert len(obs_train_data_path) == len(obs_target), 'obs_train_data_path and obs_target must be of the same length.'
 
     use_val_data = val_data_path is not None
     if use_val_data:
