@@ -192,10 +192,19 @@ def train(
             target_observable = [target_observable]
         elif isinstance(target_observable, str):
             target_observable = [np.load(target_observable)]
-        elif isinstance(target_observable, list) and isinstance(target_observable[0], str):
-            target_observable = [np.load(path) for path in target_observable]
+        elif isinstance(target_observable, list):
+            parsed_target_observable = []
+            for item in target_observable:
+                if isinstance(item, str):
+                    parsed_target_observable.append(np.load(item))
+                elif isinstance(item, (int, float)):
+                    parsed_target_observable.append(item)
+                else:
+                    raise ValueError('If target_observable is a list, each item must be a number or a path string.')
+            target_observable = parsed_target_observable
         if isinstance(temperature, (int, float)):
             temperature = [temperature]
+        assert len(temperature) == len(target_observable), 'temperature and target_observable must be of the same length.'
 
     use_val_data = val_data_path is not None
     if use_val_data:
