@@ -86,6 +86,10 @@ class DPModel(nn.Module):
         debug = T_NselXW
         return pred * self.params['out_norm'], debug
 
+    def energy(self, variables, coord_N3, box_33, static_args, nbrs_nm=None):
+        pred, _ = self.apply(variables, coord_N3, box_33, static_args, nbrs_nm)
+        return pred
+
     def energy_and_force(self, variables, coord_N3, box_33, static_args, nbrs_nm=None):
         (pred, _), g = value_and_grad(self.apply, argnums=1, has_aux=True)(variables, coord_N3, box_33, static_args, nbrs_nm)
         return pred, -g
@@ -112,3 +116,22 @@ class DPModel(nn.Module):
                 return ((batch_data['atomic'] - pred)**2).mean()
             loss_and_grad = value_and_grad(loss_atomic)
             return loss_atomic, loss_and_grad
+
+    def get_observable_loss_fn(self):
+        vmap_energy = vmap(self.energy, (None, 0, 0, None))
+        def loss_obs(variables, batch_data, pref, static_args, temperature, target_observable):
+            e = vmap_energy(variables, batch_data['coord'], batch_data['box'], static_args)
+            kb = 8.617333262e-5
+            beta = 1 / (kb * temperature)
+            logweights = - beta * (e - batch_data['energy'])
+            logweights -= jnp.amax(logweights)  # for numerical stability, we displace the exponents of the weights
+            weights = jnp.exp(logweights)
+            observable = batch_data['observable']
+            if len(observable.shape) == 1:
+                observable = observable[:, None]  # ensure observable is 2D
+            obs_avg = jnp.sum(observable * weights[:, None], axis=0) / jnp.sum(weights) # observable reweighted expectation value
+            lobs = jnp.mean((obs_avg - target_observable)**2)
+            return pref['obs']*lobs, (lobs, obs_avg, observable, logweights)
+        loss_and_grad = value_and_grad(loss_obs, has_aux=True)
+        return loss_obs, loss_and_grad
+
