@@ -165,47 +165,80 @@ def train(
         # Define file names a.k.a. "labels"
         labels_obs = labels + ['observable']
         labels_obs = [item for item in labels_obs if item != 'force']
-        # Handle multiple paths to observable data
+        # Validate and normalize obs_train_data_path
         if obs_train_data_path is None:
             raise ValueError('Must provide obs_train_data_path for hybrid models.')
-        if type(obs_train_data_path) == str:
+        if isinstance(obs_train_data_path, str):
             obs_train_data_path = [obs_train_data_path]
-        elif type(obs_train_data_path) == list:
-            pass
+        elif isinstance(obs_train_data_path, list):
+            if len(obs_train_data_path) == 0:
+                raise ValueError('obs_train_data_path list cannot be empty.')
+            # Validate all elements are strings
+            for i, path in enumerate(obs_train_data_path):
+                if not isinstance(path, str):
+                    raise ValueError(f'obs_train_data_path[{i}] must be a string, got {type(path).__name__}')
         else:
-            raise ValueError('obs_train_data_path not recognized, must be a path or list of paths.')
+            raise ValueError(f'obs_train_data_path must be a string or list of strings, got {type(obs_train_data_path).__name__}')
+        # Validate and normalize obs_temperature
+        if obs_temperature is None:
+            raise ValueError('Must provide obs_temperature for hybrid models.')
+        if isinstance(obs_temperature, (int, float)):
+            obs_temperature = [obs_temperature]
+        elif isinstance(obs_temperature, list):
+            if len(obs_temperature) == 0:
+                raise ValueError('obs_temperature list cannot be empty.')
+        else:
+            raise ValueError(f'obs_temperature must be a number or list of numbers, got {type(obs_temperature).__name__}')
+        # Validate temperature values
+        for i, temp in enumerate(obs_temperature):
+            if not isinstance(temp, (int, float)):
+                raise ValueError(f'obs_temperature[{i}] must be a number, got {type(temp).__name__}')
+            if temp <= 0:
+                raise ValueError(f'obs_temperature[{i}] must be positive, got {temp} K')
+        # Validate and normalize obs_target
+        if obs_target is None:
+            raise ValueError('Must provide obs_target for hybrid models')
+        if isinstance(obs_target, (int, float)):
+            obs_target = [obs_target]
+        elif isinstance(obs_target, str):
+            try:
+                obs_target = [np.load(obs_target)]
+            except Exception as e:
+                raise ValueError(f'Failed to load obs_target from file {obs_target}: {e}')
+        elif isinstance(obs_target, list):
+            if len(obs_target) == 0:
+                raise ValueError('obs_target list cannot be empty.')
+            parsed_obs_target = []
+            for i, item in enumerate(obs_target):
+                if isinstance(item, str):
+                    try:
+                        loaded = np.load(item)
+                        parsed_obs_target.append(loaded)
+                    except Exception as e:
+                        raise ValueError(f'Failed to load obs_target[{i}] from file {item}: {e}')
+                elif isinstance(item, (int, float)):
+                    parsed_obs_target.append(item)
+                else:
+                    raise ValueError(f'obs_target[{i}] must be a number or path string, got {type(item).__name__}')
+            obs_target = parsed_obs_target
+        else:
+            raise ValueError(f'obs_target must be a number, file path, or list, got {type(obs_target).__name__}')
+        # Check consistency of lengths
+        n_temps = len(obs_temperature)
+        n_targets = len(obs_target)
+        n_paths = len(obs_train_data_path)
+        if n_temps != n_targets:
+            raise ValueError(f'Length mismatch: obs_temperature has {n_temps} entries, but obs_target has {n_targets} entries. They must be equal.')
+        if n_temps != n_paths:
+            raise ValueError(f'Length mismatch: obs_temperature has {n_temps} entries, but obs_train_data_path has {n_paths} entries. They must be equal.')
+        # Load observable data
         train_data_obs = []
-        for i in range(len(obs_train_data_path)):
-            if type(obs_train_data_path[i]) != str:
-                raise ValueError('Each element of obs_train_data_path must be a string.')
+        for i in range(n_paths):
             single_data_obs = DPDataset([obs_train_data_path[i]],
                                         labels_obs,
                                         {'atomic_sel':atomic_sel})
             single_data_obs.compute_lattice_candidate(rcut)
             train_data_obs.append(single_data_obs)
-        # Handle multiple obs_target, either numbers or paths to data
-        if obs_target is None and hybrid:
-            raise ValueError('Must provide obs_target for hybrid models')
-        if isinstance(obs_target, (int, float)):
-            obs_target = [obs_target]
-        elif isinstance(obs_target, str):
-            obs_target = [np.load(obs_target)]
-        elif isinstance(obs_target, list):
-            parsed_obs_target = []
-            for item in obs_target:
-                if isinstance(item, str):
-                    parsed_obs_target.append(np.load(item))
-                elif isinstance(item, (int, float)):
-                    parsed_obs_target.append(item)
-                else:
-                    raise ValueError('If obs_target is a list, each item must be a number or a path string.')
-            obs_target = parsed_obs_target
-        # Handle multiple temperatures
-        if isinstance(obs_temperature, (int, float)):
-            obs_temperature = [obs_temperature]
-        assert len(obs_temperature) == len(obs_target), 'obs_temperature and obs_target must be of the same length.'
-        assert len(obs_temperature) == len(obs_train_data_path), 'obs_temperature and obs_train_data_path must be of the same length.'
-        assert len(obs_train_data_path) == len(obs_target), 'obs_train_data_path and obs_target must be of the same length.'
 
     use_val_data = val_data_path is not None
     if use_val_data:
