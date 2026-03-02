@@ -80,12 +80,12 @@ train(
       save_path = 'model.pkl',               # Path to save the trained model
       train_data_path='/energy/force/data/', # Path (or a list of paths) to the training dataset
       step=1000000,                          # Number of training steps
-      train_data_path_obs = '/hybrid/data',  # Path (or a list of paths) with observable dataset 
-      temperature = 320,                     # Temperature in Kelvin corresponding to observable dataset
-      target_observable = 1.0,               # Target (empirical) value of the observable
-      batch_size_observable = 100,           # Batch size for observable loss. Usually >> 1 to allow reweighting
-      s_pref_obs = 0.02,                     # Starting value of prefactor in the observable loss term
-      l_pref_obs = 100,                      # Last value of prefactor in the observable loss term
+      obs_train_data_path = '/hybrid/data',  # Path (or a list of paths) with observable dataset 
+      obs_temperature = 320,                 # Temperature in Kelvin corresponding to observable dataset
+      obs_target = 1.0,                      # Target (empirical) value of the observable
+      obs_batch_size = 100,                  # Batch size for observable loss. Usually >> 1 to allow reweighting
+      obs_s_pref = 0.02,                     # Starting value of prefactor in the observable loss term
+      obs_l_pref = 100,                      # Last value of prefactor in the observable loss term
 )
 ```
 

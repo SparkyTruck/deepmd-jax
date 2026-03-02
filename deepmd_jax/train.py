@@ -51,12 +51,12 @@ def train(
     compress_r_min: float = 0.6,
     seed: int = None,
     hybrid: bool = False,
-    s_pref_obs: float = 0.005,
-    l_pref_obs: float = 0.1,
-    train_data_path_obs: Union[str, List[str], List[List[str]]] = None,
-    batch_size_observable: int = 8,
-    temperature: Union[float, list] = None,
-    target_observable: Union[float, str, list, None] = None,
+    obs_s_pref: float = 0.005,
+    obs_l_pref: float = 0.1,
+    obs_train_data_path: Union[str, List[str], List[List[str]]] = None,
+    obs_batch_size: int = 8,
+    obs_temperature: Union[float, list] = None,
+    obs_target: Union[float, str, list, None] = None,
     obs_step_every: int = 1,
 ):
     '''
@@ -101,12 +101,12 @@ def train(
             compress_r_min: A safe lower bound for interatomic distance in the compressed model.
         Input arguments specific for hybrid ab initio and empirical models:
             hybrid: whether to train hybrid ab initio and empirical models.
-            train_data_path_obs: paths to training data with trajectories with observable values.
-            batch_size_observable: training batch size for observable loss in number of frames.
-            s_pref_obs: starting prefactor for observable loss.
-            l_pref_obs: limit prefactor for observable loss.
-            temperature: Temperature of the system (K). Used in the reweighting of observables.
-            target_observable: Target value of the observable to be learned. Can be a float or a path to a .npy file containing (single or multiple) values for each configuration in different lines.
+            obs_train_data_path: paths to training data with trajectories with observable values.
+            obs_batch_size: training batch size for observable loss in number of frames.
+            obs_s_pref: starting prefactor for observable loss.
+            obs_l_pref: limit prefactor for observable loss.
+            obs_temperature: Temperature of the system (K). Used in the reweighting of observables.
+            obs_target: Target value of the observable to be learned. Can be a float or a path to a .npy file containing (single or multiple) values for each configuration in different lines.
             obs_step_every: evaluate and optimize observable loss function every this many steps.
     '''
     
@@ -165,46 +165,46 @@ def train(
         # Multiple temperatures
         labels_obs = labels + ['observable']
         labels_obs = [item for item in labels_obs if item != 'force']
-        if type(temperature) == list:
+        if type(obs_temperature) == list:
             train_data_obs = []
-            for i in range(len(temperature)):
-                _train_data_path_obs = [[path] for path in train_data_path_obs[i]]
-                single_data_obs = DPDataset(_train_data_path_obs,
+            for i in range(len(obs_temperature)):
+                _obs_train_data_path = [[path] for path in obs_train_data_path[i]]
+                single_data_obs = DPDataset(_obs_train_data_path,
                                             labels_obs,
                                             {'atomic_sel':atomic_sel})
                 single_data_obs.compute_lattice_candidate(rcut)
                 train_data_obs.append(single_data_obs)
         else:
-            if train_data_path_obs is None:
-                raise ValueError('Must provide train_data_path_obs for hybrid models.')
-            elif type(train_data_path_obs) == str:
-                train_data_path_obs = [train_data_path_obs]
+            if obs_train_data_path is None:
+                raise ValueError('Must provide obs_train_data_path for hybrid models.')
+            elif type(obs_train_data_path) == str:
+                obs_train_data_path = [obs_train_data_path]
             else:
-                train_data_path_obs = [[path] for path in train_data_path_obs]
-            train_data_obs = DPDataset(train_data_path_obs,
+                obs_train_data_path = [[path] for path in obs_train_data_path]
+            train_data_obs = DPDataset(obs_train_data_path,
                                        labels_obs,
                                        {'atomic_sel':atomic_sel})
             train_data_obs.compute_lattice_candidate(rcut)
             train_data_obs = [train_data_obs]
-        if target_observable is None and hybrid:
-            raise ValueError('Must provide target_observable for hybrid models')
-        if isinstance(target_observable, (int, float)):
-            target_observable = [target_observable]
-        elif isinstance(target_observable, str):
-            target_observable = [np.load(target_observable)]
-        elif isinstance(target_observable, list):
-            parsed_target_observable = []
-            for item in target_observable:
+        if obs_target is None and hybrid:
+            raise ValueError('Must provide obs_target for hybrid models')
+        if isinstance(obs_target, (int, float)):
+            obs_target = [obs_target]
+        elif isinstance(obs_target, str):
+            obs_target = [np.load(obs_target)]
+        elif isinstance(obs_target, list):
+            parsed_obs_target = []
+            for item in obs_target:
                 if isinstance(item, str):
-                    parsed_target_observable.append(np.load(item))
+                    parsed_obs_target.append(np.load(item))
                 elif isinstance(item, (int, float)):
-                    parsed_target_observable.append(item)
+                    parsed_obs_target.append(item)
                 else:
-                    raise ValueError('If target_observable is a list, each item must be a number or a path string.')
-            target_observable = parsed_target_observable
-        if isinstance(temperature, (int, float)):
-            temperature = [temperature]
-        assert len(temperature) == len(target_observable), 'temperature and target_observable must be of the same length.'
+                    raise ValueError('If obs_target is a list, each item must be a number or a path string.')
+            obs_target = parsed_obs_target
+        if isinstance(obs_temperature, (int, float)):
+            obs_temperature = [obs_temperature]
+        assert len(obs_temperature) == len(obs_target), 'obs_temperature and obs_target must be of the same length.'
 
     use_val_data = val_data_path is not None
     if use_val_data:
@@ -319,7 +319,7 @@ def train(
     if hybrid:
         state_obs = {}
         _single_state_obs = {'lobs_avg': 0., 'obs_term_avg': 0., 'obs_mean': 0., 'logweights': [0.], 'ESS': 1. }
-        state_obs = {k: _single_state_obs for k in range(len(train_data_path_obs))}
+        state_obs = {k: _single_state_obs for k in range(len(obs_train_data_path))}
 
     @partial(jax.jit, static_argnames=('static_args',))
     def train_step(batch, variables, opt_state, state, static_args):
@@ -347,13 +347,13 @@ def train(
     @partial(jax.jit, static_argnames=('static_args', 'obs_position'))
     def train_step_obs(batch, variables, opt_state, state_obs, static_args, obs_position=0):
         r = lr_scheduler(state['iteration']) / lr
-        pref = {'obs': s_pref_obs*r + l_pref_obs*(1-r)}
+        pref = {'obs': obs_s_pref*r + obs_l_pref*(1-r)}
         (loss_obs, (loss_obs_raw, obs_avg, obs_batch, logweights)), grads = loss_and_grad_obs(variables,
                                                                                             batch,
                                                                                             pref,
                                                                                             static_args,
-                                                                                            temperature[obs_position],
-                                                                                            target_observable[obs_position])
+                                                                                            obs_temperature[obs_position],
+                                                                                            obs_target[obs_position])
         state_obs[obs_position]['lobs_avg'] = state_obs[obs_position]['lobs_avg'] * (1-1/print_loss_smoothing) + jnp.sqrt(loss_obs_raw) * 1/print_loss_smoothing
         state_obs[obs_position]['obs_term_avg'] = obs_avg
         state_obs[obs_position]['obs_mean'] = np.mean(obs_batch, axis=0)
@@ -386,14 +386,14 @@ def train(
     else:
         print(f'# Batch size = {batch_size}')
     if hybrid:
-        print(f'# Observable loss batch size = {batch_size_observable}')
+        print(f'# Observable loss batch size = {obs_batch_size}')
     def get_batch_train():
         if batch_size is None:
             return train_data.get_batch(label_bs, 'label')
         else:
             return train_data.get_batch(batch_size)
     def get_batch_train_obs(obs_position=0):
-        return train_data_obs[obs_position].get_batch(batch_size_observable)
+        return train_data_obs[obs_position].get_batch(obs_batch_size)
     def get_batch_val():
         ret = []
         for _ in range(val_batch_size_ratio):
@@ -412,7 +412,7 @@ def train(
             line += f' LE {(state["le_avg"] / beta_smoothing) ** 0.5:7.5f}'
             line += f' LF {(state["lf_avg"] / beta_smoothing) ** 0.5:7.5f}'
         if hybrid:
-            for obs_position in range(len(train_data_path_obs)):
+            for obs_position in range(len(obs_train_data_path)):
                 line += f' LOBS{obs_position} {float(state_obs[obs_position]["lobs_avg"]):7.5f}'
                 line += f' ESS{obs_position} {float(state_obs[obs_position]["ESS"]):7.5f}'
                 for obs_item  in range(len(state_obs[obs_position]["obs_term_avg"])):
@@ -451,7 +451,7 @@ def train(
         # training step part 2: observables
         if hybrid and iteration % obs_step_every == 0:
             # observable train step
-            for i in range(len(train_data_path_obs)):
+            for i in range(len(obs_train_data_path)):
                 batch, type_count, lattice_args = get_batch_train_obs(obs_position=i)
                 static_args = nn.FrozenDict({'type_count': tuple(type_count),
                                             'lattice': lattice_args})
