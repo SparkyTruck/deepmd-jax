@@ -30,7 +30,7 @@ def train(
     val_batch_size_ratio: int = 4,
     compress: bool = True,
     print_every: int = 1000,
-    atomic_data_prefix: str = 'atomic_dipole',
+    atomic_data_prefix: str = None,
     s_pref_e: float = 0.02,
     l_pref_e: float = 1,
     s_pref_f: float = 1000,
@@ -45,7 +45,6 @@ def train(
     decay_steps: int = 5000,
     getstat_bs: int = 64,
     label_bs: int = 256,
-    tensor_2nd: bool = True,
     print_loss_smoothing: int = 20,
     compress_Ngrids: int = 1024,
     compress_r_min: float = 0.6,
@@ -63,24 +62,24 @@ def train(
         Entry point for training deepmd-jax models.
 
         Input arguments:
-            model_type: 'energy' (force field), 'atomic' (e,g. Deep Wannier), 'dplr' (long-range)
+            model_type: 'energy' (force field), 'atomic' (e.g. Deep Wannier, predicts per-atom 3-vectors), 'atomic_t2' (predicts per-atom symmetric 3x3 tensors, e.g. polarizability), 'dplr' (long-range)
             rcut: cutoff radius (Angstrom) for the model.
             save_path: path to save the trained model.
             train_data: path to training data (str) or list of paths to training data (List[str]).
             val_data: path to validation data (str) or list of paths to validation data (List[str]).
             step: number of training steps. Depending on dataset size, expect 1e5-1e7 for energy models and 1e5-1e6 for wannier models.
             mp: whether to use message passing model for more accuracy at a higher cost.
-            atomic_sel: Selects the atom types for prediction. Only used when model_type == 'atomic'.
+            atomic_sel: Selects the atom types for prediction. Only used when model_type == 'atomic' or 'atomic_t2'.
             embed_widths: Widths of the embedding neural network.
             embed_mp_widths: Widths of the embedding neural network in message passing. Only used when mp == True.
             fit_widths: Widths of the fitting neural network.
             axis_neurons: Number of axis neurons to project the atomic features before the fitting network. Recommended range: 8-16.
-            lr: learning rate at start. If None, default values (0.002 for 'energy' and 0.01 for 'atomic') is used.
+            lr: learning rate at start. If None, default values (0.002 for 'energy' and 0.01 for 'atomic'/'atomic_t2') is used.
             batch_size: training batch size in number of frames. If None, will be automatically determined by label_bs.
             val_batch_size_ratio: validation batch size / batch_size. Increase for stabler validation loss.
             compress: whether to compress the model after training for faster inference.
             print_every: interval for printing loss and validation.
-            atomic_data_prefix: prefix for .npy label files when model_type == 'atomic'.
+            atomic_data_prefix: prefix for .npy label files. Defaults to 'atomic_dipole' for 'atomic' and 'atomic_polarizability' for 'atomic_t2'.
             s_pref_e: starting prefactor for energy loss.
             l_pref_e: limit prefactor for energy loss.
             s_pref_f: starting prefactor for force loss.
@@ -95,7 +94,6 @@ def train(
             decay_steps: learning rate exponentially decays every decay_steps.
             getstat_bs: batch size for computing model statistics at initialization.
             label_bs: training batch size in number of atoms.
-            tensor_2nd: whether to use 2nd order tensor descriptor for more accuracy.
             print_loss_smoothing: smoothing factor for loss printing.
             compress_Ngrids: Number of intervals used in compression.
             compress_r_min: A safe lower bound for interatomic distance in the compressed model.
@@ -116,9 +114,9 @@ def train(
 
     # width check
     if fit_widths is None:
-        if model_type != 'atomic':
+        if 'atomic' not in model_type:
             fit_widths = [128, 128, 128]
-        elif model_type == 'atomic':
+        else:
             width = embed_mp_widths[-1] if mp else embed_widths[-1]
             fit_widths = [width, width, width]
     for i in range(len(embed_widths)-1):
@@ -133,7 +131,7 @@ def train(
     for i in range(len(fit_widths)-1):
         if fit_widths[i+1] != fit_widths[i] != 0:
             print('# Warning: it is recommended to use the same width for all layers in the fitting network.')
-    if model_type == 'atomic':
+    if 'atomic' in model_type:
         if mp:
             if embed_mp_widths[-1] != fit_widths[-1]:
                 raise ValueError('For atomic mp models, embed_mp_widths[-1] must equal fit_widths[-1].')
@@ -142,13 +140,16 @@ def train(
                 raise ValueError('For atomic models, embed_widths[-1] must equal fit_widths[-1].')
 
     # load dataset
+    if 'atomic' in model_type and atomic_data_prefix is None:
+        atomic_data_prefix = 'atomic_dipole' if model_type == 'atomic' else 'atomic_polarizability'
     if model_type == 'energy' or model_type == 'dplr':
         labels = ['coord', 'box', 'force', 'energy']
-    elif model_type == 'atomic':
+    elif 'atomic' in model_type:
         labels = ['coord', 'box', atomic_data_prefix]
-        assert type(atomic_sel) == list, ' Must provide atomic_sel properly for model_type "atomic".'
+        print(f'# Using {atomic_data_prefix}.npy as dataset labels.')
+        assert type(atomic_sel) == list, ' Must provide atomic_sel properly for model_type "atomic"/"atomic_t2".'
     else:
-        raise ValueError('model_type should be "energy", "atomic", or "dplr".')
+        raise ValueError('model_type should be "energy", "atomic", "atomic_t2", or "dplr".')
     if type(train_data_path) == str:
         train_data_path = [train_data_path]
     else:
@@ -283,19 +284,19 @@ def train(
     # construct model
     params = {
         'type': model_type,
-        'atomic_data_prefix': None if model_type != 'atomic' else atomic_data_prefix,
+        'atomic_data_prefix': atomic_data_prefix if 'atomic' in model_type else None,
         'embed_widths': embed_widths[:-1] if mp else embed_widths,
         'embedMP_widths': embed_widths[-1:] + embed_mp_widths if mp else None,
         'fit_widths': fit_widths,
         'axis': axis_neurons,
-        'Ebias': train_data.fit_energy() if model_type != 'atomic' else None,
+        'Ebias': None if 'atomic' in model_type else train_data.fit_energy(),
         'rcut': rcut,
-        'use_2nd': tensor_2nd,
+        'use_2nd': True,
         'use_mp': mp,
-        'atomic': model_type == 'atomic',
-        'hybrid': hybrid, 
-        'nsel': atomic_sel if model_type == 'atomic' else None,
-        'out_norm': 1. if model_type != 'atomic' else train_data.get_atomic_label_scale(),
+        'atomic': 'atomic' in model_type,
+        'hybrid': hybrid,
+        'nsel': atomic_sel if 'atomic' in model_type else None,
+        'out_norm': train_data.get_atomic_label_scale() if 'atomic' in model_type else 1.,
         **train_data.get_stats(rcut, getstat_bs),
     }
     if model_type == 'dplr':
@@ -326,7 +327,7 @@ def train(
     
     # initialize optimizer
     if lr is None:
-        lr = 0.002 if model_type != 'atomic' else 0.01
+        lr = 0.002 if 'atomic' not in model_type else 0.01
     if step < decay_steps * 10:
         decay_steps = max(step // 10, 1)
     lr_scheduler = optax.exponential_decay(
@@ -346,7 +347,7 @@ def train(
     if hybrid:
         loss_obs, loss_and_grad_obs = model.get_observable_loss_fn()
 
-    if model_type != 'atomic':
+    if 'atomic' not in model_type:
         state = {'loss_avg': 0., 'le_avg': 0., 'lf_avg': 0., 'iteration': 0}
     else:
         state = {'loss_avg': 0., 'iteration': 0}
@@ -358,7 +359,7 @@ def train(
     @partial(jax.jit, static_argnames=('static_args',))
     def train_step(batch, variables, opt_state, state, static_args):
         r = lr_scheduler(state['iteration']) / lr
-        if model_type != 'atomic':
+        if 'atomic' not in model_type:
             pref = {'e': s_pref_e*r + l_pref_e*(1-r),
                     'f': s_pref_f*r + l_pref_f*(1-r)}
             (loss_total, (loss_e, loss_f)), grads = loss_and_grad_fn(variables,
@@ -401,7 +402,7 @@ def train(
     # define validation step
     @partial(jax.jit, static_argnames=('static_args',))
     def val_step(batch, variables, static_args):
-        if model_type != 'atomic':
+        if 'atomic' not in model_type:
             pref = {'e': 1, 'f': 1}
             _, (loss_e, loss_f) = loss_fn(variables,
                                           batch,
@@ -442,7 +443,7 @@ def train(
         beta_smoothing = print_loss_smoothing * (1 - (1-1/print_loss_smoothing)**(iteration+1))
         line = f'Iter {iteration:7d}'
         line += f' L {(state["loss_avg"] / beta_smoothing) ** 0.5:7.5f}'
-        if model_type != 'atomic':
+        if 'atomic' not in model_type:
             line += f' LE {(state["le_avg"] / beta_smoothing) ** 0.5:7.5f}'
             line += f' LF {(state["lf_avg"] / beta_smoothing) ** 0.5:7.5f}'
         if hybrid:
@@ -453,7 +454,7 @@ def train(
                     line += f' OBS_REW_{obs_position}_{obs_item} {float(state_obs[obs_position]["obs_term_avg"][obs_item]):7.5f}'
                     line += f' OBS_{obs_position}_{obs_item} {float(state_obs[obs_position]["obs_mean"][obs_item]):7.5f}'
         if use_val_data:
-            if model_type != 'atomic':
+            if 'atomic' not in model_type:
                 line += f' LEval {np.array([l[0] for l in loss_val]).mean() ** 0.5:7.5f}'
                 line += f' LFval {np.array([l[1] for l in loss_val]).mean() ** 0.5:7.5f}'
             else:

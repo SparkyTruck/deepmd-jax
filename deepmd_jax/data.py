@@ -39,7 +39,11 @@ class DPDataset():
                     self.data[l] = self.data[l].reshape(self.data[l].shape[0],-1,3)
                     self.data[l] = self.data[l][:,self.type.argsort(kind='stable')]
                 if 'atomic' in l:
-                    self.data[l] = self.data[l].reshape(self.data[l].shape[0],-1,3)
+                    try:
+                        self.data[l] = self.data[l].reshape(self.data[l].shape[0],self.nlabels,-1)
+                        assert self.data[l].shape[2] in (3, 9)
+                    except:
+                        raise ValueError('Atomic label must have 3 (vector) or 9 (3x3 tensor) components per atom.')
                     sel_type = self.type[np.in1d(self.type, self.nsel)]
                     self.data[l] = self.data[l][:,sel_type.argsort(kind='stable')]
             self.data['box'] = self.data['box'].reshape(-1,3,3)
