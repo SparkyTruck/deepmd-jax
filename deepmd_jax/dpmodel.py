@@ -108,21 +108,29 @@ class DPModel(nn.Module):
         coord_ref = [c for i,c in enumerate(split(coord_N3, static_args['type_count'])) if i in self.params['nsel']]
         return concat(coord_ref) + wc_relative
     
-    def get_loss_fn(self):
+    def get_loss_fn(self, order='l2'):
         if self.params['atomic'] is False:
             vmap_energy_and_force = vmap(self.energy_and_force, (None, 0, 0, None))
             def loss_ef(variables, batch_data, pref, static_args):
                 e, f = vmap_energy_and_force(variables, batch_data['coord'], batch_data['box'], static_args)
-                le = ((batch_data['energy'] - e)**2).mean() / (f.shape[1])**2
-                lf = ((batch_data['force'] - f)**2).mean()
-                return pref['e']*le + pref['f']*lf, (le, lf)
+                if order == 'l2':
+                    le = ((batch_data['energy'] - e)**2).mean() / (f.shape[1])**2
+                    lf = ((batch_data['force'] - f)**2).mean()
+                    return pref['e']*le + pref['f']*lf, (le, lf)
+                elif order == 'l1-mixed':
+                    le = jnp.abs(batch_data['energy'] - e).mean() / f.shape[1]
+                    lf = (((batch_data['force'] - f)**2).mean(-1)**0.5).mean()
+                    return (pref['e']**0.5)*le + (pref['f']**0.5)*lf, (le, lf)
             loss_and_grad = value_and_grad(loss_ef, has_aux=True)
             return loss_ef, loss_and_grad
         else:
             vmap_apply = vmap(self.apply, (None, 0, 0, None))
             def loss_atomic(variables, batch_data, static_args):
                 pred, _ = vmap_apply(variables, batch_data['coord'], batch_data['box'], static_args)
-                return ((batch_data['atomic'] - pred)**2).mean()
+                if order == 'l2':
+                    return ((batch_data['atomic'] - pred)**2).mean()
+                elif order == 'l1-mixed':
+                    return (((batch_data['atomic'] - pred)**2).mean(-1)**0.5).mean()
             loss_and_grad = value_and_grad(loss_atomic)
             return loss_atomic, loss_and_grad
 

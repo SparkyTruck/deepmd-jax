@@ -5,10 +5,7 @@ import numpy as np
 import flax.linen as nn
 import pickle, os
 from scipy.interpolate import PPoly, BPoly
-from jax.sharding import Mesh, PartitionSpec as PSpec
-from jax.experimental import mesh_utils
-mesh = Mesh(mesh_utils.create_device_mesh((len(jax.devices()),)), ('atom',))
-jax.set_mesh(mesh)
+from jax.sharding import PartitionSpec as PSpec
 
 @jax.jit
 def norm_ortho_box(coord, box):
@@ -283,7 +280,7 @@ def compress_model(model, variables, Ngrids, rmin):
         err2.append(vmap(jacfwd(jacfwd(lambda r: net.apply(var,r[...,None]) - net.apply(newvar,r[...,None],True))))(r))
     err0, err1, err2 = jnp.concatenate(err0,axis=None), jnp.concatenate(err1,axis=None), jnp.concatenate(err2,axis=None)
     print('# Model Compressed: %d embedding nets, %d intervals' % (len(names), Ngrids))
-    print('# Compression (0,1,2)-order error: Mean = (%.2e,%.2e,%.2e), Max = (%.2e,%.2e,%.2e)'
+    print('# Compression (0,1,2)-order error: Mean = (%.1e,%.1e,%.1e), Max = (%.1e,%.1e,%.1e)'
             % (err0.mean(), err1.mean(), err2.mean(), err0.max(), err1.max(), err2.max()))
     return model, variables
 

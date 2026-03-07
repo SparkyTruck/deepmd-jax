@@ -49,6 +49,7 @@ def train(
     compress_Ngrids: int = 1024,
     compress_r_min: float = 0.6,
     seed: int = None,
+    loss: str = 'l1-mixed',
     hybrid: bool = False,
     obs_s_pref: float = 0.005,
     obs_l_pref: float = 0.1,
@@ -62,7 +63,11 @@ def train(
         Entry point for training deepmd-jax models.
 
         Input arguments:
-            model_type: 'energy' (force field), 'atomic' (e.g. Deep Wannier, predicts per-atom 3-vectors), 'atomic_t2' (predicts per-atom symmetric 3x3 tensors, e.g. polarizability), 'dplr' (long-range)
+            model_type:
+                 'energy' (standard force field),
+                 'atomic' (predicts per-atom 3-vectors, e.g. Wannier centroid),
+                 'atomic_t2' (predicts per-atom symmetric 3x3 tensors, e.g. polarizability),
+                 'dplr' (force field w/ long-range electrostatics).
             rcut: cutoff radius (Angstrom) for the model.
             save_path: path to save the trained model.
             train_data: path to training data (str) or list of paths to training data (List[str]).
@@ -97,7 +102,10 @@ def train(
             print_loss_smoothing: smoothing factor for loss printing.
             compress_Ngrids: Number of intervals used in compression.
             compress_r_min: A safe lower bound for interatomic distance in the compressed model.
-        Input arguments specific for hybrid ab initio and empirical models:
+            loss: loss function type, 'l1-mixed' or 'l2'.
+                    'l1-mixed': MAE over configs/atoms, but RMS within each force/atomic vector; more robust to data outliers.
+                    'l2': MSE over all entries. This was the old default.
+        --- Input arguments specific for hybrid ab initio and empirical models:
             hybrid: whether to train hybrid ab initio and empirical models.
             obs_train_data_path: paths to training data with trajectories with observable values.
             obs_batch_size: training batch size for observable loss in number of frames.
@@ -138,6 +146,8 @@ def train(
         else:
             if embed_widths[-1] != fit_widths[-1]:
                 raise ValueError('For atomic models, embed_widths[-1] must equal fit_widths[-1].')
+    assert loss in ('l1-mixed', 'l2'), 'loss must be "l1-mixed" or "l2"'
+    print(f'# Using {loss} loss function.')
 
     # load dataset
     if 'atomic' in model_type and atomic_data_prefix is None:
@@ -343,7 +353,7 @@ def train(
     print('# Optimizer initialized with initial lr = %.1e. Starting training...' % lr)
 
     # define training step
-    loss_fn, loss_and_grad_fn = model.get_loss_fn()
+    loss_fn, loss_and_grad_fn = model.get_loss_fn(order=loss)
     if hybrid:
         loss_obs, loss_and_grad_obs = model.get_observable_loss_fn()
 
@@ -442,10 +452,13 @@ def train(
     def print_step():
         beta_smoothing = print_loss_smoothing * (1 - (1-1/print_loss_smoothing)**(iteration+1))
         line = f'Iter {iteration:7d}'
-        line += f' L {(state["loss_avg"] / beta_smoothing) ** 0.5:7.5f}'
+        L_train = state["loss_avg"] / beta_smoothing
+        line += f' L {L_train if loss == "l1-mixed" else L_train ** 0.5:7.5f}'
         if 'atomic' not in model_type:
-            line += f' LE {(state["le_avg"] / beta_smoothing) ** 0.5:7.5f}'
-            line += f' LF {(state["lf_avg"] / beta_smoothing) ** 0.5:7.5f}'
+            LE_train = state["le_avg"] / beta_smoothing
+            LF_train = state["lf_avg"] / beta_smoothing
+            line += f' LE {LE_train if loss == "l1-mixed" else LE_train ** 0.5:7.5f}'
+            line += f' LF {LF_train if loss == "l1-mixed" else LF_train ** 0.5:7.5f}'
         if hybrid:
             for obs_position in range(len(obs_train_data_path)):
                 line += f' LOBS{obs_position} {float(state_obs[obs_position]["lobs_avg"]):7.5f}'
@@ -455,10 +468,13 @@ def train(
                     line += f' OBS_{obs_position}_{obs_item} {float(state_obs[obs_position]["obs_mean"][obs_item]):7.5f}'
         if use_val_data:
             if 'atomic' not in model_type:
-                line += f' LEval {np.array([l[0] for l in loss_val]).mean() ** 0.5:7.5f}'
-                line += f' LFval {np.array([l[1] for l in loss_val]).mean() ** 0.5:7.5f}'
+                LEval = np.array([l[0] for l in loss_val]).mean()
+                LFval = np.array([l[1] for l in loss_val]).mean()
+                line += f' LEval {LEval if loss == "l1-mixed" else LEval ** 0.5:7.5f}'
+                line += f' LFval {LFval if loss == "l1-mixed" else LFval ** 0.5:7.5f}'
             else:
-                line += f' Lval {np.array(loss_val).mean() ** 0.5:7.5f}'
+                Lval = np.array(loss_val).mean()
+                line += f' Lval {Lval if loss == "l1-mixed" else Lval ** 0.5:7.5f}'
         line += f' Time {time.time() - tic:.2f}s'
         print(line)
 
@@ -474,7 +490,6 @@ def train(
                                              'lattice': lattice_args})
                 loss_val.append(val_step(v_batch, variables, static_args))
 
-        # training step part 1: energy and force
         batch, type_count, lattice_args = get_batch_train()
         static_args = nn.FrozenDict({'type_count': tuple(type_count),
                                      'lattice': lattice_args})
@@ -483,7 +498,8 @@ def train(
                                                  opt_state,
                                                  state,
                                                  static_args)
-        # training step part 2: observables
+        
+        # training step part 2 in hybrid observable training
         if hybrid and iteration % obs_step_every == 0:
             # observable train step
             for i in range(len(obs_train_data_path)):
@@ -578,15 +594,26 @@ def test(
             predictions[model.params['atomic_data_prefix']].append(pred[0])
             ground_truth[model.params['atomic_data_prefix']].append(batch['atomic'])
     rmse = {}
+    mae = {}
+    l1_mixed = {}
     for key in predictions.keys():
         predictions[key] = np.concatenate(predictions[key], axis=0)
         ground_truth[key] = np.concatenate(ground_truth[key], axis=0)
         rmse[key] = (((predictions[key] - ground_truth[key]) ** 2).mean() ** 0.5).item()
+        mae[key] = np.abs(predictions[key] - ground_truth[key]).mean().item()
     # reorder force back; will delete in future when reordering is moved into dpmodel.py
     if model.params['type'] == 'energy' or model.params['type'] == 'dplr':
         ground_truth['force'] = ground_truth['force'][:, test_data.type.argsort(kind='stable').argsort(kind='stable')]
         predictions['force'] = predictions['force'][:, test_data.type.argsort(kind='stable').argsort(kind='stable')]
-    return rmse, predictions, ground_truth
+        natoms = predictions['force'].shape[1]
+        rmse['energy'] /= natoms
+        mae['energy'] /= natoms
+        l1_mixed['energy'] = (np.abs(predictions['energy'] - ground_truth['energy']).mean() / natoms).item()
+        l1_mixed['force'] = (((predictions['force'] - ground_truth['force'])**2).mean(-1)**0.5).mean().item()
+    else:
+        key = model.params['atomic_data_prefix']
+        l1_mixed[key] = (((predictions[key] - ground_truth[key])**2).mean(-1)**0.5).mean().item()
+    return rmse, mae, l1_mixed, predictions, ground_truth
         
 def evaluate(
     model_path: str,
@@ -649,7 +676,7 @@ def evaluate(
             force_path = os.path.join(set_dir, "force.npy")
             np.save(energy_path, np.zeros(coord.shape[0]))
             np.save(force_path, np.zeros((coord.reshape(coord.shape[0], -1)).shape))
-        _, predictions, _ = test(model_path, temp_dir, batch_size)
+        _, _, _, predictions, _ = test(model_path, temp_dir, batch_size)
 
     return predictions
     
