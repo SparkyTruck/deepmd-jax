@@ -548,11 +548,11 @@ def test(
     if model.params['type'] == 'energy' or model.params['type'] == 'dplr':
         labels = ['coord', 'box', 'force', 'energy']
         atomic_sel = None
-    elif model.params['type'] == 'atomic':
+    elif 'atomic' in model.params['type']:
         labels = ['coord', 'box', model.params['atomic_data_prefix']]
         atomic_sel = model.params['nsel']
     else:
-        raise ValueError('Model type should be "energy", "atomic", or "dplr".')
+        raise ValueError('Model type should be "energy", "atomic", "atomic_t2", or "dplr".')
     test_data = DPDataset([data_path],
                           labels,
                           {'atomic_sel':atomic_sel})
@@ -667,10 +667,11 @@ def evaluate(
         np.save(box_path, box.reshape(box.shape[0], -1))
         with open(type_idx_path, "w") as f:
             f.write("\n".join(np.array(type_idx, dtype=int).astype(str)))
-        if model.params['type'] == 'atomic':
+        if 'atomic' in model.params['type']:
             atomic_path = os.path.join(set_dir, model.params['atomic_data_prefix'] + ".npy")
             label_count = np.isin(type_idx, model.params['nsel']).sum()
-            np.save(atomic_path, np.zeros((coord.shape[0], label_count * 3)))
+            label_dim = 9 if model.params['type'] == 'atomic_t2' else 3
+            np.save(atomic_path, np.zeros((coord.shape[0], label_count * label_dim)))
         elif model.params['type'] == 'energy':
             energy_path = os.path.join(set_dir, "energy.npy")
             force_path = os.path.join(set_dir, "force.npy")

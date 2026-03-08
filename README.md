@@ -22,18 +22,14 @@ pip install -e .
 
 ## Quick Start
 
-### Preparing Your Dataset
+### Step 1: Prepare Your Dataset
 To train a model, prepare your dataset in the same [DeepMD-kit format](https://docs.deepmodeling.com/projects/deepmd/en/r2/data/system.html). Note: Currently only supports periodic systems.
 
-
-### Training a Model
+### Step 2: Train a Deep Potential Force Field
 
 ```python
 from deepmd_jax.train import train
-```
 
-#### Training an energy-force model
-```python
 train(
       model_type='energy',                   # Model type
       rcut=6.0,                              # Cutoff radius
@@ -43,67 +39,9 @@ train(
 )
 ```
 
-#### Training a Wannier model
-```python
-train(
-      model_type='atomic',                   # Model type
-      rcut=6.0,                              # Cutoff radius
-      atomic_sel=[0],                        # indicating Wannier centers are associated to atoms of type 0
-      save_path='wannier.pkl',               # Path to save the trained model
-      train_data_path='/wannier/data/',      # Path (or a list of paths) to the training dataset
-      step=100000,                           # Number of training steps
-)
-# default data file prefix for Wannier centroids is "atomic_dipole.npy"
-```
-
-#### Training a DPLR model:
-```python
-# train Wannier first and then train DPLR
-train(
-      model_type='dplr',                     # Model type
-      rcut = 6.0,                            # Cutoff radius
-      save_path = 'dplr_model.pkl',          # Path to save the trained model
-      dplr_wannier_model_path='wannier.pkl', # Path to the trained Wannier model
-      train_data_path='/energy/force/data/', # Path (or a list of paths) to the training dataset
-      step=1000000,                          # Number of training steps
-      dplr_q_atoms=[6, 1],                   # Charge of atomic cores of each type (eg. oxygen and hydrogen)
-      dplr_q_wc = [-8],                      # Charge of Wannier centers associated to each atom in atomic_sel type
-)
-```
-
-#### Training a hybrid ab initio and empirical model:
-```python
-train(
-      model_type='energy',                   # Model type
-      hybrid=True,                           # Set hybrid to true
-      rcut = 6.0,                            # Cutoff radius
-      save_path = 'model.pkl',               # Path to save the trained model
-      train_data_path='/energy/force/data/', # Path (or a list of paths) to the training dataset
-      step=1000000,                          # Number of training steps
-      obs_train_data_path = '/hybrid/data',  # Path (or a list of paths) with observable dataset 
-      obs_temperature = 320,                 # Temperature in Kelvin corresponding to observable dataset
-      obs_target = 1.0,                      # Target (empirical) value of the observable
-      obs_batch_size = 100,                  # Batch size for observable loss. Usually >> 1 to allow reweighting
-      obs_s_pref = 0.02,                     # Starting value of prefactor in the observable loss term
-      obs_l_pref = 100,                      # Last value of prefactor in the observable loss term
-)
-```
-
-
 The default values for the other arguments in [`train()`](https://github.com/SparkyTruck/deepmd-jax/blob/main/deepmd_jax/train.py) like learning rate, batch size, model width, etc. are usually a solid baseline. The one parameter you may want to change is `mp=True` to enable DP-MP for better accuracy.
 
-### Evaluating a Model
-
-You can evaluate the model with `test()` or `evaluate()`:
-```python
-from deepmd_jax.train import test, evaluate
-# use test() on a dataset
-rmse, predictions, ground_truth = test(model_path, data_path)
-# use evaluate() on a batch of configurations where no ground truth is needed
-predictions = evaluate(model_path, coords, boxes, type_idx)
-```
-
-### Running a Simulation
+### Step 3: Perform a Simulation
 
 To run a simulation, prepare the following numpy arrays:
 
@@ -111,13 +49,11 @@ To run a simulation, prepare the following numpy arrays:
 2. `box`: shape `(,)`, `(1,)`, `(3,)` or `(3, 3)`.
 3. `type_idx`: shape `(n,)`, indicates the type of each atom (similar to `type.raw` in the training dataset).
 
-Then, an example of running a simulation is as follows:
-
 ```python
 from deepmd_jax.md import Simulation
 
 sim = Simulation(
-    model_path='trained_model.pkl',    # Has to be an 'energy' or 'dplr' model
+    model_path='model.pkl',            # Has to be an 'energy' or 'dplr' model
     box=box,                           # Angstroms
     type_idx=type_idx,                 # here the index-element map (e.g. 0-Oxygen, 1-Hydrogen) must match the dataset used to train the model
     mass=[15.9994, 1.0078],            # Oxygen, Hydrogen
@@ -136,31 +72,68 @@ print(trajectory['position'].shape)    # (100000, n, 3), does not include the in
 
 You can check the `Simulation` class in [`md.py`](https://github.com/SparkyTruck/deepmd-jax/blob/main/deepmd_jax/md.py) for additional arguments, like print control, thermostat parameters, etc. There are also some methods of the `Simulation` class like `getEnergy`, `getForce`, `getPosition`, `setPosition`, etc. that you may find useful.
 
-If you want to print the trajectories on the fly, you can use the `TrajDumpSimulation` instead of `Simulation`:
-```python
-from deepmd_jax.md import TrajDump, TrajDumpSimulation
+## More Features and Usages
 
-sim = TrajDumpSimulation(
-    model_path="model.pkl",  # Has to be an 'energy' or 'dplr' model
-    box=box,  # Angstroms
-    type_idx=type_idx,  # here the index-element map (e.g. 0-Oxygen, 1-Hydrogen) must match the dataset used to train the model
-    mass=[15.9994, 1.0078, 195.08],  # Oxygen, Hydrogen
-    routine="NVT",  # 'NVE', 'NVT', 'NPT' (Nosé-Hoover)
-    dt=0.5,  # femtoseconds
-    initial_position=initial_position,  # Angstroms
-    temperature=330,  # Kelvin
-    report_interval=100,  # Report every 100 steps
+### Testing a Model
+
+Use `test()` to evaluate a model on a dataset:
+```python
+from deepmd_jax.train import test
+root_mean_sq_err, mean_abs_error, l1_mixed_error, predictions, ground_truth = test(model_path, data_path)
+```
+
+### Evaluating a Model
+
+Use `evaluate()` on a batch of configurations where no ground truth is needed:
+```python
+from deepmd_jax.evaluate import evaluate
+predictions = evaluate(model_path, coords, boxes, type_idx)
+```
+
+### Atom-wise vector prediction (Deep Wannier/Polarizability)
+```python
+train(
+      model_type='atomic',                   # Model type, 'atomic' for 3-vector (Wannier centroid), 'atomic-t2' for 9-vector (polarizability)
+      rcut=6.0,                              # Cutoff radius
+      atomic_sel=[0],                        # indicating Wannier centers are associated to atoms of type 0
+      save_path='wannier.pkl',               # Path to save the trained model
+      train_data_path='/wannier/data/',      # Path (or a list of paths) to the training dataset
+      step=100000,                           # Number of training steps
 )
-# print positions and velocities every 10 steps in xyz format
-sim.run(
-      n_steps,
-      [
-      TrajDump(atoms, "pos_traj.xyz", 10, append=True),
-      TrajDump(atoms, "vel_traj.xyz", 10, vel=True, append=True),
-      ],
+```
+This model predicts an O(3)-equivariant 3-vector or 9-vector (as a flattened symmetric 3x3 matrix) for each atom within the selected type (`atomic_sel`). For `model_type='atomic'`, the argument `atomic_data_prefix` in `train()` is set to `'atomic_dipole'` by default, meaning `"atomic_dipole.npy"` is the expected label filename in your dataset. For `model_type='atomic_t2'`, it defaults to `'atomic_polarizability'`. If you need to specify a different prefix, it needs to be `'atomic_*'`.
+
+### Training a DPLR Model
+```python
+# train a Wannier model first and then train DPLR
+train(
+      model_type='dplr',                     # Model type
+      rcut = 6.0,                            # Cutoff radius
+      save_path = 'dplr_model.pkl',          # Path to save the trained model
+      dplr_wannier_model_path='wannier.pkl', # Path to the trained Wannier model
+      train_data_path='/energy/force/data/', # Path (or a list of paths) to the training dataset
+      step=1000000,                          # Number of training steps
+      dplr_q_atoms=[6, 1],                   # Charge of atomic cores of each type (eg. oxygen and hydrogen)
+      dplr_q_wc = [-8],                      # Charge of Wannier centers associated to each atom in atomic_sel type
 )
-# Run for 100,000 steps
-trajectory = sim.run(100000)
+```
+
+### Training a Hybrid Ab Initio and Empirical Model
+```python
+train(
+      model_type='energy',                   # Model type
+      hybrid=True,                           # Set hybrid to true
+      rcut = 6.0,                            # Cutoff radius
+      save_path = 'model.pkl',               # Path to save the trained model
+      train_data_path='/energy/force/data/', # Path (or a list of paths) to the training dataset
+      step=1000000,                          # Number of training steps
+      obs_train_data_path = '/hybrid/data',  # Path (or a list of paths) with observable dataset
+      obs_temperature = 320,                 # Temperature in Kelvin corresponding to observable dataset
+      obs_target = 1.0,                      # Target (empirical) value of the observable
+      obs_batch_size = 100,                  # Batch size for observable loss. Usually >> 1 to allow reweighting
+      obs_s_pref = 0.02,                     # Starting value of prefactor in the observable loss term
+      obs_l_pref = 100,                      # Last value of prefactor in the observable loss term
+)
 ```
 
 ### Running with ASE
@@ -191,7 +164,6 @@ dyn.run(10)  # 10 MD steps
 
 The ASE calculator may run slower than the built-in `Simulation`, but you can take advantage of the rich ASE features, such as minimization routines, different thermostats, non-isotropic NPT simulations, etc.
 
-
 ### Precision Settings
 
 By default, single precision `float32` is used for both training and simulation, which I find to be generally sufficient. However, if you need double precision, enable it at the **beginning** of your script with:
@@ -205,6 +177,35 @@ jax.config.update('jax_enable_x64', True)
 
 The default units are Angstrom, eV, femtosecond, and their derived units. The only exceptions are the parameters `temperature` (Kelvin), `pressure` (bar), and `mass` (Dalton) when initializing `Simulation()`.
 
+### Printing Trajectories on the Fly
+
+If you want to print the trajectories on the fly, you can use the `TrajDumpSimulation` instead of `Simulation`:
+```python
+from deepmd_jax.md import TrajDump, TrajDumpSimulation
+
+sim = TrajDumpSimulation(
+    model_path="model.pkl",  # Has to be an 'energy' or 'dplr' model
+    box=box,  # Angstroms
+    type_idx=type_idx,  # here the index-element map (e.g. 0-Oxygen, 1-Hydrogen) must match the dataset used to train the model
+    mass=[15.9994, 1.0078, 195.08],  # Oxygen, Hydrogen
+    routine="NVT",  # 'NVE', 'NVT', 'NPT' (Nosé-Hoover)
+    dt=0.5,  # femtoseconds
+    initial_position=initial_position,  # Angstroms
+    temperature=330,  # Kelvin
+    report_interval=100,  # Report every 100 steps
+)
+# print positions and velocities every 10 steps in xyz format
+sim.run(
+      n_steps,
+      [
+      TrajDump(atoms, "pos_traj.xyz", 10, append=True),
+      TrajDump(atoms, "vel_traj.xyz", 10, vel=True, append=True),
+      ],
+)
+# Run for 100,000 steps
+trajectory = sim.run(100000)
+```
+
 ## Roadmap
 
 To-do list:
@@ -213,10 +214,10 @@ To-do list:
 - [ ] Misc simulation features: Temperature and pressure control, more thermostats;
 
 Planned features: (v0.3)
-- [ ] Enhanced sampling. 
+- [ ] Enhanced sampling.
 - [ ] Path-Integral MD.
 - [ ] Non-orthorhomibic neighbor list; Non-isotropic fluctuation in NPT.
-- [ ] Misc: data, dpmodel, utils code cleanup; Glob data path, flatten subset, optimize compute lattice, optimize print output; pair correlation function; move reorder inside dpmodel; train starting from a trained model; training seed control; 
+- [ ] Misc: data, dpmodel, utils code cleanup; Glob data path, flatten subset, optimize compute lattice, optimize print output; pair correlation function; move reorder inside dpmodel; train starting from a trained model; training seed control;
 
 This project is in active development, and if you encounter any issues, please feel free to contact me or open an issue on the GitHub page. You are also welcome to make custom modifications and pull requests. Have fun! 🚀
 
@@ -227,4 +228,4 @@ For jupyter notebooks, you can install a kernel with
 ```bash
 python -m ipykernel install --user --name deepmd-jax-cuda12 --display-name "Python (deepmd-jax-cuda12)" --env LD_LIBRARY_PATH ""
 ```
-In certain HPC environments, an alternative solution is to `module load` a latest CUDA 12 version. 
+In certain HPC environments, an alternative solution is to `module load` a latest CUDA 12 version.
