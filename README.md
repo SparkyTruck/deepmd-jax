@@ -20,6 +20,10 @@ cd deepmd-jax
 pip install -e .
 ```
 
+## Hardware Requirements
+
+It is recommended to have one GPU for training and one or more GPUs for simulation. The RTX 4090/5090 is recommended based on cost-effectiveness for most fp32 jobs.
+
 ## Quick Start
 
 ### Step 1: Prepare Your Dataset
