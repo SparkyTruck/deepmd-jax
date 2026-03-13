@@ -91,6 +91,35 @@ def get_idx_mask_fn(type_count):
         return jnp.where(filter, idx, len(full_mask))
     return idx_mask_fn
 
+def _nvt_nose_hoover_invariant(energy_fn,
+                    state: jax_md.simulate.NVTNoseHooverState,
+                    kT: float,
+                    **kwargs) -> float:
+    """The conserved quantity for the NVT ensemble with a Nose-Hoover thermostat.
+
+    This function is adapted from jax_md.simulate to define the DOF differently.
+
+    Arguments:
+        energy_fn: The energy function of the Nose-Hoover system.
+        state: The current state of the system.
+        kT: The current goal temperature of the system.
+
+    Returns:
+        The Hamiltonian of the extended NVT dynamics.
+    """
+    PE = energy_fn(state.position, **kwargs)
+    KE = jax_md.simulate.kinetic_energy(state)
+
+    DOF = state.chain.degrees_of_freedom
+    E = PE + KE
+
+    c = state.chain
+
+    E += c.momentum[0] ** 2 / (2 * c.mass[0]) + DOF * kT * c.position[0]
+    for r, p, m in zip(c.position[1:], c.momentum[1:], c.mass[1:]):
+        E += p ** 2 / (2 * m) + kT * r
+    return E
+
 @jax_md.dataclasses.dataclass
 class TypedNeighborList():
     '''
@@ -215,6 +244,35 @@ def typed_neighbor_list(box, type_idx, type_count, rcut, buffer_ratio=1.2):
     
     return typed_neighbor_list_fn(allocate=allocate_fn, update=update_fn)
 
+
+def nvt_with_fixed_atoms(nvt_init_fn, nvt_apply_fn, mobile_mask):
+    """Wrap NVT init/step functions to handle fixed atoms correctly."""
+    mobile = mobile_mask[:, None].astype(jnp.float32)  # (N, 1)
+    dof = int(3 * jnp.sum(mobile_mask))
+
+    def init_fn(key, R, *args, **kwargs):
+        state = nvt_init_fn(key, R, *args, **kwargs)
+        # Zero fixed atom velocities
+        state = state.set(momentum=state.momentum * mobile)
+        # Fix thermostat DOF
+        if hasattr(state, "chain"):
+            state = state.set(chain=state.chain.set(degrees_of_freedom=dof))
+        return state
+
+    def apply_fn(state, *args, **kwargs):
+        # Ensure thermostat DOF is correct before step
+        if hasattr(state, "chain"):
+            state = state.set(chain=state.chain.set(degrees_of_freedom=dof))
+
+        state = nvt_apply_fn(state, *args, **kwargs)
+
+        # Zero fixed momenta after thermostat update
+        state = state.set(momentum=state.momentum * mobile)
+        return state
+
+    return init_fn, apply_fn
+
+
 class Simulation:
     '''
         A deepmd-based simulation class that wraps jax_md.simulate routines.
@@ -255,6 +313,7 @@ class Simulation:
                  chain_steps_p=1,
                  sy_steps_t=1,
                  sy_steps_p=1,
+                 fixed_indices: Optional[List[int]] = None,
                 ):
         '''
             Initialize a Simulation instance.
@@ -280,6 +339,7 @@ class Simulation:
             chain_length: Nose-Hoover thermostat/barostat chain length
             chain_steps: Nose-Hoover thermostat/barostat chain steps
             sy_steps: Nose-Hoover thermostat/barostat number of Suzuki-Yoshida steps (must be 1,3,5,7)
+            fixed_indices: zero-based indices of atoms that should remain fixed (constrained position) in the simulation.
             ############################
             Usage:
                 sim = Simulation(...)
@@ -317,8 +377,27 @@ class Simulation:
             self._initial_box = box
         self._current_box = self._initial_box
         self._static_args = self._get_static_args(initial_position, use_neighbor_list_when_possible)
-        self._displacement_fn, self._shift_fn = jax_md.space.periodic_general(self._initial_box,
-                                                                              fractional_coordinates="NPT" in self._routine)
+        self._displacement_fn, shift = jax_md.space.periodic_general(            
+            self._initial_box, fractional_coordinates="NPT" in self._routine
+        )
+
+        # Create mask for constraining atoms
+        mobile = np.ones(self._natoms)
+        if fixed_indices is not None:
+            mobile[fixed_indices] = 0
+            self._mobile = jnp.array(mobile, dtype=bool)
+        else: 
+            self._mobile = None
+
+        if self._mobile is not None and self._routine != 'NVT':
+            raise NotImplementedError("Fixing atoms currently limited to NVT")
+
+        def _shift_fn_wrapper(x, dx, **kwargs):
+            if self._mobile is not None:
+                return jnp.where(mobile[:, None], shift(x, dx, **kwargs), x)
+            else:
+                return shift(x, dx, **kwargs)
+        self._shift_fn = _shift_fn_wrapper
 
         # Initialize according to routine;
         if self._routine == "NVE":
@@ -382,6 +461,7 @@ class Simulation:
         '''
         self._energy_fn = self._get_energy_fn()
         self._force_fn = lambda coord, **kwargs: -jax.grad(self._energy_fn)(coord, **kwargs)
+        
         def pressure_fn(state, box, nbrs_nm):
             KE = jax_md.quantity.kinetic_energy(momentum=state.momentum, mass=state.mass)
             return jax_md.quantity.pressure(
@@ -396,10 +476,18 @@ class Simulation:
             self._deviation_energy_fns = [
                 self._get_energy_fn(load_model(path)) for path in self._model_deviation_paths
             ]
-        self._init_fn, self._apply_fn = self._routine_fn(self._energy_fn,
+        init_fn, apply_fn = self._routine_fn(self._energy_fn,
                                                      self._shift_fn,
                                                      self._dt,
                                                      **self._routine_args)
+        
+        # If fixing atoms and using NVT, use the wrapper
+        if self._routine == "NVT" and self._mobile is not None:
+            self._init_fn, self._apply_fn = nvt_with_fixed_atoms(init_fn, apply_fn, self._mobile)
+        else: 
+            self._init_fn = init_fn
+            self._apply_fn = apply_fn
+
         self._report_fn = self._generate_report_fn()
         self._soft_update_nbrs = self._get_soft_update_nbrs_fn()
         self._check_hard_overflow = self._get_check_hard_overflow_fn()
@@ -515,7 +603,7 @@ class Simulation:
                                             self._reporters["KE"](state, nbrs_nm) + \
                                             self._reporters["PE"](state, nbrs_nm)
         elif self._routine == "NVT":
-            self._reporters["Invariant"] = lambda state, nbrs_nm: jax_md.simulate.nvt_nose_hoover_invariant(
+            self._reporters["Invariant"] = lambda state, nbrs_nm: _nvt_nose_hoover_invariant(
                                             self._energy_fn,
                                             state,
                                             self._temperature * TEMP_UNIT_CONVERSION,
@@ -924,6 +1012,8 @@ class Simulation:
         '''
             Set the velocity (Å/fs) of the atoms. Must be the same shape as the initial position representing the same system.
         '''
+        if self._mobile is not None:
+            velocity = velocity * self._mobile[:, None]
         self._state = self._state.set(momentum=self._state.mass * velocity)
 
     def setRandomVelocity(self, temperature, remove_com_motion=True, seed=None):
