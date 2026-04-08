@@ -3,6 +3,7 @@ import jax.numpy as jnp
 from jax import vmap
 from glob import glob
 from os.path import abspath
+from ase.io import read
 from .utils import shift, get_relative_coord, sr
 
 class DPDataset():
@@ -49,7 +50,7 @@ class DPDataset():
                         assert self.data[l].shape[2] in (3, 9)
                     except:
                         raise ValueError('Atomic label must have 3 (vector) or 9 (3x3 tensor) components per atom.')
-                    sel_type = self.type[np.in1d(self.type, self.nsel)]
+                    sel_type = self.type[np.isin(self.type, self.nsel)]
                     self.data[l] = self.data[l][:,sel_type.argsort(kind='stable')]
             self.data['box'] = self.data['box'].reshape(-1,3,3)
             self.data['coord'] = np.array(vmap(shift)(self.data['coord'], self.data['box']))
@@ -140,6 +141,164 @@ class DPDataset():
             return [{'data':self.data, 'type_count':self.type_count, 'lattice_args':self.lattice_args}]
         else:
             return sum([subset.get_flattened_data() for subset in self.subsets], [])
+
+class EXTXYZDataset():
+    def __init__(self, paths, labels, params={}):
+        if type(paths[0]) == list:
+            self.is_leaf = False
+            self.subsets = [EXTXYZDataset(path, labels, params) for path in paths]
+            self.nframes = sum([subset.nframes for subset in self.subsets])
+            self.ntypes = max([subset.ntypes for subset in self.subsets])
+            [subset.fill_type(self.ntypes) for subset in self.subsets]
+            self.prob = np.array([subset.nframes for subset in self.subsets]) / self.nframes
+            self.type_count = self.count_max()
+            self.valid_types = np.arange(self.ntypes)[self.type_count > 0]
+        else:
+            self.is_leaf = True
+            self.labels = labels
+            self.params = params
+            self.frames = []
+            self.paths = paths
+            for path in paths:
+                atoms_list = read(path, index=':')
+                if not isinstance(atoms_list, list):
+                    atoms_list = [atoms_list]
+                for atoms in atoms_list:
+                    frame = {}
+                    frame['coord'] = np.asarray(atoms.get_positions(), dtype=np.float32)
+                    frame['box'] = np.asarray(atoms.get_cell(), dtype=np.float32)
+                    frame['atomic_numbers'] = np.asarray(atoms.get_atomic_numbers(), dtype=int)
+                    if 'force' in labels:
+                        if 'forces' in atoms.arrays:
+                            frame['force'] = np.asarray(atoms.arrays['forces'], dtype=np.float32)
+                        else:
+                            raise ValueError('Extended xyz file missing forces for frame in %s' % path)
+                    if 'energy' in labels:
+                        energy = atoms.info.get('energy', None)
+                        if energy is None:
+                            raise ValueError('Extended xyz file missing energy for frame in %s' % path)
+                        frame['energy'] = np.asarray(energy, dtype=np.float32)
+                    for l in labels:
+                        if 'atomic' in l and l not in frame:
+                            if l in atoms.arrays:
+                                frame[l] = np.asarray(atoms.arrays[l], dtype=np.float32)
+                            else:
+                                raise ValueError('Atomic label %s not found in frame arrays for %s' % (l, path))
+                    if 'cell' in labels and 'cell' not in frame:
+                        frame['cell'] = frame['box']
+                    if 'type' in labels and 'type' not in frame:
+                        frame['type'] = frame['atomic_numbers']
+                    self.frames.append(frame)
+            # Map atomic numbers to types
+            all_atomic_numbers = set()
+            for frame in self.frames:
+                all_atomic_numbers.update(frame['atomic_numbers'])
+            unique_atomic_numbers = sorted(all_atomic_numbers)
+            self.atomic_to_type = {an: i for i, an in enumerate(unique_atomic_numbers)}
+            self.ntypes = len(unique_atomic_numbers)
+            self.valid_types = np.arange(self.ntypes)
+            for frame in self.frames:
+                frame['type'] = np.array([self.atomic_to_type[an] for an in frame['atomic_numbers']], dtype=int)
+            self.nframes = len(self.frames)
+            self.order = np.arange(self.nframes)
+            self.pointer = self.nframes
+            self.natoms = max([frame['coord'].shape[0] for frame in self.frames]) if self.frames else 0
+            print('# EXTXYZ Dataset loaded: %d frames. Path:' % self.nframes,
+                  ''.join(['\n# \t\'%s\'' % abspath(path) for path in paths]))
+
+    def count_max(self):
+        if self.is_leaf:
+            type_counts = []
+            for frame in self.frames:
+                tc = np.array([(frame['type'] == i).sum() for i in range(self.ntypes)])
+                type_counts.append(tc)
+            return np.array(type_counts).max(0)
+        else:
+            return np.array([subset.count_max() for subset in self.subsets]).max(0)
+
+    def fill_type(self, ntypes):
+        if not self.is_leaf:
+            [subset.fill_type(ntypes) for subset in self.subsets]
+        else:
+            self.ntypes = ntypes
+            self.valid_types = np.arange(self.ntypes)
+
+    def get_batch(self, batch_size, type='frame'):
+        if not self.is_leaf:
+            subset = np.random.choice(len(self.subsets), p=self.prob)
+            return self.subsets[subset].get_batch(batch_size, type)
+        else:
+            batch_size = 1
+            if self.pointer + batch_size > self.nframes:
+                self.pointer = 0
+                np.random.shuffle(self.order)
+            index = self.order[self.pointer]
+            self.pointer += batch_size
+            batch = self.frames[index]
+            # Compute type_count for the single frame based on mapped types
+            types = batch['type']
+            type_count = np.array([(types == i).sum() for i in range(self.ntypes)])
+            return batch, tuple(type_count), self.lattice_args
+
+    def compute_lattice_candidate(self, rcut):
+        if not self.is_leaf:
+            for subset in self.subsets:
+                subset.compute_lattice_candidate(rcut)
+        else:
+            boxes = np.stack([frame['box'] for frame in self.frames])
+            self.lattice_args = compute_lattice_candidate(boxes, rcut)
+
+    def get_flattened_data(self):
+        if self.is_leaf:
+            return [{'data':frame, 'lattice_args':self.lattice_args} for frame in self.frames]
+        else:
+            return sum([subset.get_flattened_data() for subset in self.subsets], [])
+
+    def fit_energy(self):
+        energy_stats = self._get_energy_stats()
+        type_counts, energies = [np.array(x) for x in zip(*energy_stats)]
+        return np.linalg.lstsq(type_counts, energies, rcond=1e-3)[0].astype(np.float32)
+    
+    def get_atomic_label_scale(self):
+        if not self.is_leaf:
+            return (np.array([subset.get_atomic_label_scale() for subset in self.subsets]) * np.array(self.prob)).sum()
+        else:
+            label = [l for l in self.frames[0].keys() if 'atomic' in l][0]
+            all_labels = np.concatenate([frame[label].flatten() for frame in self.frames])
+            return np.std(all_labels)
+
+    def _get_energy_stats(self):
+        if self.is_leaf:
+            return [(np.array([(frame['type'] == i).sum() for i in range(self.ntypes)]), frame['energy']) for frame in self.frames]
+        else:
+            return sum([subset._get_energy_stats() for subset in self.subsets], [])
+
+    def _get_stats(self, rcut, bs):
+        if self.is_leaf:
+            batch, type_count, lattice_args = self.get_batch(bs)
+            coord, box = batch['coord'], batch['box']
+            type_count = np.array(type_count)
+            r_Bnm = vmap(get_relative_coord,(0,0,None,None))(coord, box, type_count, lattice_args)[1]
+            sr_BnM = [sr(jnp.concatenate(r,axis=-1), rcut) for r in r_Bnm]
+            sr_sum = np.array([sr.sum() for sr in sr_BnM])
+            sr_sum2 = np.array([(sr**2).sum() for sr in sr_BnM])
+            sr_count = np.array([(sr>1e-15).sum() for sr in sr_BnM])
+            Nnbrs = (np.concatenate(sr_BnM, axis=1) > 0).sum(2).mean() + 1
+            return np.array([sr_sum, sr_sum2, sr_count, Nnbrs*np.ones_like(sr_sum)]) # (4, ntypes)
+        else:
+            s = np.stack([subset._get_stats(rcut, bs) for subset in self.subsets], axis=-1)
+            return (s * self.prob).sum(-1)
+        
+    def get_stats(self, rcut, bs):
+        self.params = {'ntypes': self.ntypes, 'rcut': rcut}
+        sr_sum, sr_sum2, sr_count, Nnbrs = self._get_stats(rcut, bs)
+        sr_sum, sr_sum2, sr_count = sr_sum[self.valid_types], sr_sum2[self.valid_types], sr_count[self.valid_types]
+        self.params['valid_types'] = self.valid_types
+        self.params['sr_mean'] = sr_sum / sr_count
+        self.params['sr_std'] = np.sqrt(sr_sum2 / sr_count - self.params['sr_mean']**2)
+        self.params['Nnbrs'] = Nnbrs[0]
+        return self.params
+
 
 def compute_lattice_candidate(boxes, rcut, print_info=True, disable_ortho=False): # boxes (nframes,3,3)
     N = 2  # This algorithm is heuristic and subject to change. Increase N in case of missing neighbors.

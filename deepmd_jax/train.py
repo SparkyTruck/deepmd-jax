@@ -6,7 +6,7 @@ import time, datetime
 import flax.linen as nn
 from functools import partial
 from .utils import get_p3mlr_fn, get_p3mlr_grid_size, load_model, save_model, compress_model, save_dataset
-from .data import DPDataset
+from .data import DPDataset, EXTXYZDataset
 from .dpmodel import DPModel
 from typing import Union, List
 import tempfile
@@ -164,9 +164,15 @@ def train(
         train_data_path = [train_data_path]
     else:
         train_data_path = [[path] for path in train_data_path]
-    train_data = DPDataset(train_data_path,
-                           labels,
-                           {'atomic_sel':atomic_sel})
+    first_path = train_data_path[0] if isinstance(train_data_path[0], str) else train_data_path[0][0]
+    if model_type in ('energy', 'dplr') and isinstance(first_path, str) and first_path.lower().endswith(('.xyz', '.extxyz')):
+        train_data = EXTXYZDataset(train_data_path,
+                                   labels,
+                                   {'atomic_sel':atomic_sel})
+    else:
+        train_data = DPDataset(train_data_path,
+                               labels,
+                               {'atomic_sel':atomic_sel})
     train_data.compute_lattice_candidate(rcut)
 
     # Setup for hybrid training
@@ -257,9 +263,15 @@ def train(
             val_data_path = [val_data_path]
         else:
             val_data_path = [[path] for path in val_data_path]
-        val_data = DPDataset(val_data_path,
-                             labels,
-                             {'atomic_sel':atomic_sel})
+        first_val_path = val_data_path[0] if isinstance(val_data_path[0], str) else val_data_path[0][0]
+        if model_type in ('energy', 'dplr') and isinstance(first_val_path, str) and first_val_path.lower().endswith(('.xyz', '.extxyz')):
+            val_data = EXTXYZDataset(val_data_path,
+                                     labels,
+                                     {'atomic_sel':atomic_sel})
+        else:
+            val_data = DPDataset(val_data_path,
+                                 labels,
+                                 {'atomic_sel':atomic_sel})
         val_data.compute_lattice_candidate(rcut)
     else:
         val_data = None
