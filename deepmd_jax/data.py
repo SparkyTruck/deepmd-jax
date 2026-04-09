@@ -161,18 +161,21 @@ class EXTXYZDataset():
                 for atoms in atoms_list:
                     frame = {}
                     frame['coord'] = np.asarray(atoms.get_positions(), dtype=np.float32)
-                    frame['box'] = np.asarray(atoms.get_cell(), dtype=np.float32)
+                    frame['box'] = np.asarray(atoms.get_cell().array, dtype=np.float32)
                     frame['atomic_numbers'] = np.asarray(atoms.get_atomic_numbers(), dtype=int)
                     if 'force' in labels:
-                        if 'forces' in atoms.arrays:
-                            frame['force'] = np.asarray(atoms.arrays['forces'], dtype=np.float32)
-                        else:
+                        try:
+                            frame['force'] = np.asarray(atoms.get_forces(), dtype=np.float32)
+                        except RuntimeError:
                             raise ValueError('Extended xyz file missing forces for frame in %s' % path)
                     if 'energy' in labels:
-                        energy = atoms.info.get('energy', None)
-                        if energy is None:
+                        try:
+                            energy = atoms.get_potential_energy()
+                            if energy is None:
+                                raise ValueError('Extended xyz file missing energy for frame in %s' % path)
+                            frame['energy'] = np.asarray(energy, dtype=np.float32)
+                        except RuntimeError:
                             raise ValueError('Extended xyz file missing energy for frame in %s' % path)
-                        frame['energy'] = np.asarray(energy, dtype=np.float32)
                     for l in labels:
                         if 'atomic' in l and l not in frame:
                             if l in atoms.arrays:
@@ -230,6 +233,15 @@ class EXTXYZDataset():
             index = self.order[self.pointer]
             self.pointer += batch_size
             batch = self.frames[index]
+            batch['coord'] = batch['coord'][None]
+            batch['box'] = batch['box'][None]
+            if 'force' in batch:
+                batch['force'] = batch['force'][None]
+            if 'energy' in batch:
+                batch['energy'] = np.array([batch['energy']])
+            for l in list(batch.keys()):
+                if 'atomic' in l:
+                    batch[l] = batch[l][None]
             # Compute type_count for the single frame based on mapped types
             types = batch['type']
             type_count = np.array([(types == i).sum() for i in range(self.ntypes)])
