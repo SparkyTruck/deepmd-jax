@@ -1,5 +1,3 @@
-from operator import index
-
 import numpy as np
 import jax.numpy as jnp
 from jax import vmap
@@ -52,7 +50,7 @@ class DPDataset():
                         assert self.data[l].shape[2] in (3, 9)
                     except:
                         raise ValueError('Atomic label must have 3 (vector) or 9 (3x3 tensor) components per atom.')
-                    sel_type = self.type[np.isin(self.type, self.nsel)]
+                    sel_type = self.type[np.in1d(self.type, self.nsel)]
                     self.data[l] = self.data[l][:,sel_type.argsort(kind='stable')]
             self.data['box'] = self.data['box'].reshape(-1,3,3)
             self.data['coord'] = np.array(vmap(shift)(self.data['coord'], self.data['box']))
