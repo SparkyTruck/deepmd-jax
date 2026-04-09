@@ -1,3 +1,5 @@
+from operator import index
+
 import numpy as np
 import jax.numpy as jnp
 from jax import vmap
@@ -160,8 +162,9 @@ class EXTXYZDataset():
                     atoms_list = [atoms_list]
                 for atoms in atoms_list:
                     frame = {}
-                    frame['coord'] = np.asarray(atoms.get_positions(), dtype=np.float32)
                     frame['box'] = np.asarray(atoms.get_cell().array, dtype=np.float32)
+                    frame['coord'] = np.asarray(atoms.get_positions(), dtype=np.float32)
+                    frame['coord'] = np.array(shift(frame['coord'], frame['box']))
                     frame['atomic_numbers'] = np.asarray(atoms.get_atomic_numbers(), dtype=int)
                     if 'force' in labels:
                         try:
@@ -184,8 +187,6 @@ class EXTXYZDataset():
                                 raise ValueError('Atomic label %s not found in frame arrays for %s' % (l, path))
                     if 'cell' in labels and 'cell' not in frame:
                         frame['cell'] = frame['box']
-                    if 'type' in labels and 'type' not in frame:
-                        frame['type'] = frame['atomic_numbers']
                     self.frames.append(frame)
             # Map atomic numbers to types
             all_atomic_numbers = set()
@@ -197,6 +198,16 @@ class EXTXYZDataset():
             self.valid_types = np.arange(self.ntypes)
             for frame in self.frames:
                 frame['type'] = np.array([self.atomic_to_type[an] for an in frame['atomic_numbers']], dtype=int)
+                # --- sort atoms by type (same as DPDataset) ---
+                perm = frame['type'].argsort(kind='stable')
+                frame['type'] = frame['type'][perm]
+                frame['coord'] = frame['coord'][perm]
+                if 'force' in frame:
+                    frame['force'] = frame['force'][perm]
+                # reorder atomic labels
+                #for l in frame:
+                #    if 'atomic' in l:
+                #        frame[l] = frame[l][perm]
             self.nframes = len(self.frames)
             self.order = np.arange(self.nframes)
             self.pointer = self.nframes
@@ -232,7 +243,8 @@ class EXTXYZDataset():
                 np.random.shuffle(self.order)
             index = self.order[self.pointer]
             self.pointer += batch_size
-            batch = self.frames[index]
+            batch = {k: v.copy() if isinstance(v, np.ndarray) else v
+                     for k, v in self.frames[index].items()}
             batch['coord'] = batch['coord'][None]
             batch['box'] = batch['box'][None]
             if 'force' in batch:
