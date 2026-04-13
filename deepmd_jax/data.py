@@ -160,31 +160,43 @@ class EXTXYZDataset():
                     atoms_list = [atoms_list]
                 for atoms in atoms_list:
                     frame = {}
-                    frame['box'] = np.asarray(atoms.get_cell().array, dtype=np.float32)
-                    frame['coord'] = np.asarray(atoms.get_positions(), dtype=np.float32)
-                    frame['coord'] = np.array(shift(frame['coord'], frame['box']))
-                    frame['atomic_numbers'] = np.asarray(atoms.get_atomic_numbers(), dtype=int)
-                    if 'force' in labels:
-                        try:
-                            frame['force'] = np.asarray(atoms.get_forces(), dtype=np.float32)
-                        except RuntimeError:
-                            raise ValueError('Extended xyz file missing forces for frame in %s' % path)
-                    if 'energy' in labels:
-                        try:
-                            energy = atoms.get_potential_energy()
-                            if energy is None:
-                                raise ValueError('Extended xyz file missing energy for frame in %s' % path)
-                            frame['energy'] = np.asarray(energy, dtype=np.float32)
-                        except RuntimeError:
-                            raise ValueError('Extended xyz file missing energy for frame in %s' % path)
+                    try:
+                        frame['atomic_numbers'] = np.asarray(atoms.get_atomic_numbers(), dtype=int)
+                    except RuntimeError:
+                        raise ValueError('Extended xyz file missing atomic numbers for frame in %s' % path)
                     for l in labels:
-                        if 'atomic' in l and l not in frame:
+                        if l == 'box':
+                            try:
+                                frame['box'] = np.asarray(atoms.get_cell().array, dtype=np.float32)
+                            except RuntimeError:
+                                raise ValueError('Extended xyz file missing box for frame in %s' % path)
+                        elif l == 'coord':
+                            try:
+                                frame['coord'] = np.asarray(atoms.get_positions(), dtype=np.float32)
+                            except RuntimeError:
+                                raise ValueError('Extended xyz file missing coord for frame in %s' % path)
+                        elif l == 'force':
+                            try:
+                                frame['force'] = np.asarray(atoms.get_forces(), dtype=np.float32)
+                            except RuntimeError:
+                                raise ValueError('Extended xyz file missing forces for frame in %s' % path)
+                        elif l == 'energy':
+                            try:
+                                energy = atoms.get_potential_energy()
+                                if energy is None:
+                                    raise ValueError('Extended xyz file missing energy for frame in %s' % path)
+                                frame['energy'] = np.asarray(energy, dtype=np.float32)
+                            except RuntimeError:
+                                raise ValueError('Extended xyz file missing energy for frame in %s' % path)
+                        else:
                             if l in atoms.arrays:
                                 frame[l] = np.asarray(atoms.arrays[l], dtype=np.float32)
+                            elif l in atoms.info:
+                                frame[l] = np.asarray(atoms.info[l], dtype=np.float32)
                             else:
-                                raise ValueError('Atomic label %s not found in frame arrays for %s' % (l, path))
-                    if 'cell' in labels and 'cell' not in frame:
-                        frame['cell'] = frame['box']
+                                raise ValueError('Atomic label %s not found in frame arrays or info for %s' % (l, path))
+                    if 'coord' in frame and 'box' in frame:
+                        frame['coord'] = np.array(shift(frame['coord'], frame['box']))
                     self.frames.append(frame)
             # Map atomic numbers to types
             all_atomic_numbers = set()
@@ -196,16 +208,12 @@ class EXTXYZDataset():
             self.valid_types = np.arange(self.ntypes)
             for frame in self.frames:
                 frame['type'] = np.array([self.atomic_to_type[an] for an in frame['atomic_numbers']], dtype=int)
-                # --- sort atoms by type (same as DPDataset) ---
                 perm = frame['type'].argsort(kind='stable')
-                frame['type'] = frame['type'][perm]
-                frame['coord'] = frame['coord'][perm]
-                if 'force' in frame:
-                    frame['force'] = frame['force'][perm]
-                # reorder atomic labels
-                #for l in frame:
-                #    if 'atomic' in l:
-                #        frame[l] = frame[l][perm]
+                natoms = len(frame['type'])
+                # Permute all arrays with atom dimension according to sorted types for consistent ordering
+                for k, v in frame.items():
+                    if isinstance(v, np.ndarray) and v.ndim > 0 and v.shape[0] == natoms:
+                        frame[k] = v[perm]
             self.nframes = len(self.frames)
             self.order = np.arange(self.nframes)
             self.pointer = self.nframes
