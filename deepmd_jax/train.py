@@ -165,7 +165,7 @@ def train(
     else:
         train_data_path = [[path] for path in train_data_path]
     first_path = train_data_path[0] if isinstance(train_data_path[0], str) else train_data_path[0][0]
-    if model_type in ('energy', 'dplr') and isinstance(first_path, str) and first_path.lower().endswith(('.xyz', '.extxyz')):
+    if isinstance(first_path, str) and first_path.lower().endswith(('.xyz', '.extxyz')):
         train_data = EXTXYZDataset(train_data_path,
                                    labels,
                                    {'atomic_sel':atomic_sel})
@@ -251,9 +251,14 @@ def train(
         # Load observable data
         train_data_obs = []
         for i in range(n_paths):
-            single_data_obs = DPDataset([obs_train_data_path[i]],
-                                        labels_obs,
-                                        {'atomic_sel':atomic_sel})
+            if isinstance(obs_train_data_path[i], str) and obs_train_data_path[i].lower().endswith(('.xyz', '.extxyz')):
+                single_data_obs = EXTXYZDataset([obs_train_data_path[i]],
+                                           labels_obs,
+                                           {'atomic_sel':atomic_sel})
+            else:
+                single_data_obs = DPDataset([obs_train_data_path[i]],
+                                       labels_obs,
+                                       {'atomic_sel':atomic_sel})
             single_data_obs.compute_lattice_candidate(rcut)
             train_data_obs.append(single_data_obs)
 
@@ -264,7 +269,7 @@ def train(
         else:
             val_data_path = [[path] for path in val_data_path]
         first_val_path = val_data_path[0] if isinstance(val_data_path[0], str) else val_data_path[0][0]
-        if model_type in ('energy', 'dplr') and isinstance(first_val_path, str) and first_val_path.lower().endswith(('.xyz', '.extxyz')):
+        if isinstance(first_val_path, str) and first_val_path.lower().endswith(('.xyz', '.extxyz')):
             val_data = EXTXYZDataset(val_data_path,
                                      labels,
                                      {'atomic_sel':atomic_sel})
