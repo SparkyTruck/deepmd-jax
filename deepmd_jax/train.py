@@ -590,51 +590,124 @@ def test(
                                       *model.params['dplr_wannier_model_and_variables'])
     test_data.pointer = 0
     remaining = test_data.nframes
-    if model.params['type'] == 'energy' or model.params['type'] == 'dplr':
+
+    if model.params['type'] in ['energy', 'dplr']:
         evaluate_fn = model.energy_and_force
+
+        # running stats
+        stats = {
+            'energy': {'sq': 0.0, 'abs': 0.0, 'count': 0},
+            'force': {'sq': 0.0, 'abs': 0.0, 'count': 0},
+            'force_l1_sum': 0.0,
+            'force_l1_count': 0,
+            'energy_l1_sum': 0.0,
+            'energy_l1_count': 0,
+        }
+
+        # optional storage
         predictions = {'energy': [], 'force': []}
         ground_truth = {'energy': [], 'force': []}
+
     else:
+        key = model.params['atomic_data_prefix']
         evaluate_fn = lambda variables, coord, box, static_args: model.apply(variables, coord, box, static_args)
-        predictions = {model.params['atomic_data_prefix']: []}
-        ground_truth = {model.params['atomic_data_prefix']: []}
-    evaluate_fn = jax.jit(jax.vmap(evaluate_fn,
-                                   in_axes=(None,0,0,None)),
-                                   static_argnames=('static_args',))
+
+        stats = {
+            key: {'sq': 0.0, 'abs': 0.0, 'count': 0},
+            'l1_sum': 0.0,
+            'l1_count': 0,
+        }
+
+        predictions = {key: []}
+        ground_truth = {key: []}
+
+    evaluate_fn = jax.jit(
+        jax.vmap(evaluate_fn, in_axes=(None, 0, 0, None)),
+        static_argnames=('static_args',)
+    )
+
     while remaining > 0:
         bs = min(batch_size, remaining)
         batch, type_count, lattice_args = test_data.get_batch(bs)
         remaining -= bs
+
         static_args = nn.FrozenDict({'type_count': type_count, 'lattice': lattice_args})
         pred = evaluate_fn(variables, batch['coord'], batch['box'], static_args)
-        if model.params['type'] == 'energy' or model.params['type'] == 'dplr':
-            predictions['energy'].append(pred[0])
-            predictions['force'].append(pred[1])
-            ground_truth['energy'].append(batch['energy'])
-            ground_truth['force'].append(batch['force'])
+
+        if model.params['type'] in ['energy', 'dplr']:
+            E_pred, F_pred = pred
+            E_true = batch['energy']
+            F_true = batch['force']
+
+            # store if desired
+            predictions['energy'].append(E_pred)
+            predictions['force'].append(F_pred)
+            ground_truth['energy'].append(E_true)
+            ground_truth['force'].append(F_true)
+
+            # --- ENERGY (per-atom normalized) ---
+            natoms = F_pred.shape[1]
+
+            dE = (E_pred - E_true) / natoms
+            stats['energy']['sq'] += (dE**2).sum()
+            stats['energy']['abs'] += np.abs(dE).sum()
+            stats['energy']['count'] += dE.size
+
+            stats['energy_l1_sum'] += np.abs(dE).sum()
+            stats['energy_l1_count'] += dE.size
+
+            # --- FORCES ---
+            diffF = F_pred - F_true
+
+            stats['force']['sq'] += (diffF**2).sum()
+            stats['force']['abs'] += np.abs(diffF).sum()
+            stats['force']['count'] += diffF.size
+
+            # mixed L1 (per-atom norm)
+            per_atom = (diffF**2).mean(-1)**0.5
+            stats['force_l1_sum'] += per_atom.sum()
+            stats['force_l1_count'] += per_atom.size
+
         else:
-            predictions[model.params['atomic_data_prefix']].append(pred[0])
-            ground_truth[model.params['atomic_data_prefix']].append(batch['atomic'])
+            key = model.params['atomic_data_prefix']
+            pred_val = pred[0]
+            true_val = batch['atomic']
+
+            predictions[key].append(pred_val)
+            ground_truth[key].append(true_val)
+
+            diff = pred_val - true_val
+
+            stats[key]['sq'] += (diff**2).sum()
+            stats[key]['abs'] += np.abs(diff).sum()
+            stats[key]['count'] += diff.size
+
+            per_atom = (diff**2).mean(-1)**0.5
+            stats['l1_sum'] += per_atom.sum()
+            stats['l1_count'] += per_atom.size
+
+    # --- FINAL METRICS ---
     rmse = {}
     mae = {}
     l1_mixed = {}
-    for key in predictions.keys():
-        predictions[key] = np.concatenate(predictions[key], axis=0)
-        ground_truth[key] = np.concatenate(ground_truth[key], axis=0)
-        rmse[key] = (((predictions[key] - ground_truth[key]) ** 2).mean() ** 0.5).item()
-        mae[key] = np.abs(predictions[key] - ground_truth[key]).mean().item()
-    # reorder force back; will delete in future when reordering is moved into dpmodel.py
-    if model.params['type'] == 'energy' or model.params['type'] == 'dplr':
-        ground_truth['force'] = ground_truth['force'][:, test_data.type.argsort(kind='stable').argsort(kind='stable')]
-        predictions['force'] = predictions['force'][:, test_data.type.argsort(kind='stable').argsort(kind='stable')]
-        natoms = predictions['force'].shape[1]
-        rmse['energy'] /= natoms
-        mae['energy'] /= natoms
-        l1_mixed['energy'] = (np.abs(predictions['energy'] - ground_truth['energy']).mean() / natoms).item()
-        l1_mixed['force'] = (((predictions['force'] - ground_truth['force'])**2).mean(-1)**0.5).mean().item()
+
+    if model.params['type'] in ['energy', 'dplr']:
+        rmse['energy'] = (stats['energy']['sq'] / stats['energy']['count'])**0.5
+        mae['energy'] = stats['energy']['abs'] / stats['energy']['count']
+
+        rmse['force'] = (stats['force']['sq'] / stats['force']['count'])**0.5
+        mae['force'] = stats['force']['abs'] / stats['force']['count']
+
+        l1_mixed['energy'] = stats['energy_l1_sum'] / stats['energy_l1_count']
+        l1_mixed['force'] = stats['force_l1_sum'] / stats['force_l1_count']
+
     else:
         key = model.params['atomic_data_prefix']
-        l1_mixed[key] = (((predictions[key] - ground_truth[key])**2).mean(-1)**0.5).mean().item()
+
+        rmse[key] = (stats[key]['sq'] / stats[key]['count'])**0.5
+        mae[key] = stats[key]['abs'] / stats[key]['count']
+        l1_mixed[key] = stats['l1_sum'] / stats['l1_count']
+
     return rmse, mae, l1_mixed, predictions, ground_truth
         
 def evaluate(
