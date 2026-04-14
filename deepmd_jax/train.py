@@ -570,9 +570,14 @@ def test(
         atomic_sel = model.params['nsel']
     else:
         raise ValueError('Model type should be "energy", "atomic", "atomic_t2", or "dplr".')
-    test_data = DPDataset([data_path],
-                          labels,
-                          {'atomic_sel':atomic_sel})
+    if isinstance(data_path, str) and data_path.lower().endswith(('.xyz', '.extxyz')):
+        test_data = EXTXYZDataset([data_path],
+                                   labels,
+                                   {'atomic_sel':atomic_sel})
+    else:
+        test_data = DPDataset([data_path],
+                               labels,
+                               {'atomic_sel':atomic_sel})
     test_data.compute_lattice_candidate(model.params['rcut'])
     if 'dplr' in model.params['type']:
         subsets = test_data.get_flattened_data()
