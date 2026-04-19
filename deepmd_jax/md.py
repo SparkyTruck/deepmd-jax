@@ -14,6 +14,7 @@ from ase.calculators.calculator import Calculator, all_changes
 
 from .data import compute_lattice_candidate
 from .utils import split, concat, load_model, norm_ortho_box, get_p3mlr_fn, get_p3mlr_grid_size
+from .routine import *
 from typing import Callable
 from functools import partial
 
@@ -215,6 +216,7 @@ def typed_neighbor_list(box, type_idx, type_count, rcut, buffer_ratio=1.2):
     
     return typed_neighbor_list_fn(allocate=allocate_fn, update=update_fn)
 
+
 class Simulation:
     '''
         A deepmd-based simulation class that wraps jax_md.simulate routines.
@@ -255,6 +257,7 @@ class Simulation:
                  chain_steps_p=1,
                  sy_steps_t=1,
                  sy_steps_p=1,
+                 fixed_indices: Optional[List[int]] = None,
                 ):
         '''
             Initialize a Simulation instance.
@@ -280,6 +283,7 @@ class Simulation:
             chain_length: Nose-Hoover thermostat/barostat chain length
             chain_steps: Nose-Hoover thermostat/barostat chain steps
             sy_steps: Nose-Hoover thermostat/barostat number of Suzuki-Yoshida steps (must be 1,3,5,7)
+            fixed_indices: zero-based indices of atoms that should remain fixed (constrained position) in the simulation.
             ############################
             Usage:
                 sim = Simulation(...)
@@ -317,8 +321,27 @@ class Simulation:
             self._initial_box = box
         self._current_box = self._initial_box
         self._static_args = self._get_static_args(initial_position, use_neighbor_list_when_possible)
-        self._displacement_fn, self._shift_fn = jax_md.space.periodic_general(self._initial_box,
-                                                                              fractional_coordinates="NPT" in self._routine)
+        self._displacement_fn, shift = jax_md.space.periodic_general(            
+            self._initial_box, fractional_coordinates="NPT" in self._routine
+        )
+
+        # Create mask for constraining atoms
+        mobile = np.ones(self._natoms)
+        if fixed_indices is not None:
+            mobile[fixed_indices] = 0
+            self._mobile = jnp.array(mobile, dtype=bool)
+        else: 
+            self._mobile = None
+
+        if self._mobile is not None and (self._routine != 'NVT' and self._routine != 'NVE'):
+            raise NotImplementedError("Fixing atoms currently limited to NVE and NVT routines.")
+
+        def _shift_fn_wrapper(x, dx, **kwargs):
+            if self._mobile is not None:
+                return jnp.where(mobile[:, None], shift(x, dx, **kwargs), x)
+            else:
+                return shift(x, dx, **kwargs)
+        self._shift_fn = _shift_fn_wrapper
 
         # Initialize according to routine;
         if self._routine == "NVE":
@@ -381,7 +404,14 @@ class Simulation:
             Neighbor list functions are generated in _construct_nbr_and_nbr_fn separately.
         '''
         self._energy_fn = self._get_energy_fn()
+        if self._mobile is not None:
+            _inner_energy_fn = self._energy_fn
+            def _constrained_energy_fn(coord, **kwargs):
+                coord = jnp.where(self._mobile[:, None], coord, jax.lax.stop_gradient(coord))
+                return _inner_energy_fn(coord, **kwargs)
+            self._energy_fn = _constrained_energy_fn
         self._force_fn = lambda coord, **kwargs: -jax.grad(self._energy_fn)(coord, **kwargs)
+        
         def pressure_fn(state, box, nbrs_nm):
             KE = jax_md.quantity.kinetic_energy(momentum=state.momentum, mass=state.mass)
             return jax_md.quantity.pressure(
@@ -396,10 +426,19 @@ class Simulation:
             self._deviation_energy_fns = [
                 self._get_energy_fn(load_model(path)) for path in self._model_deviation_paths
             ]
-        self._init_fn, self._apply_fn = self._routine_fn(self._energy_fn,
+        init_fn, apply_fn = self._routine_fn(self._energy_fn,
                                                      self._shift_fn,
                                                      self._dt,
                                                      **self._routine_args)
+        
+        if self._routine == "NVT" and self._mobile is not None:
+            self._init_fn, self._apply_fn = nvt_with_fixed_atoms(init_fn, apply_fn, self._mobile)
+        elif self._routine == "NVE" and self._mobile is not None:
+            self._init_fn, self._apply_fn = nve_with_fixed_atoms(init_fn, apply_fn, self._mobile)
+        else:
+            self._init_fn = init_fn
+            self._apply_fn = apply_fn
+
         self._report_fn = self._generate_report_fn()
         self._soft_update_nbrs = self._get_soft_update_nbrs_fn()
         self._check_hard_overflow = self._get_check_hard_overflow_fn()
@@ -494,11 +533,12 @@ class Simulation:
             Returns a set of functions that reports the current state.
             You can customize report functions with the same signature.
         '''
+        _temp_dof_scale = self._natoms / int(np.sum(self._mobile)) if self._mobile is not None else 1
         self._reporters = {
             "Temperature": lambda state, _: jax_md.quantity.temperature(
                                                             velocity=state.velocity,
                                                             mass=state.mass,
-                                                        ) / TEMP_UNIT_CONVERSION,
+                                                        ) / TEMP_UNIT_CONVERSION * _temp_dof_scale,
             "KE": lambda state, _: jax_md.quantity.kinetic_energy(
                                                     velocity=state.velocity,
                                                     mass=state.mass,
@@ -515,7 +555,7 @@ class Simulation:
                                             self._reporters["KE"](state, nbrs_nm) + \
                                             self._reporters["PE"](state, nbrs_nm)
         elif self._routine == "NVT":
-            self._reporters["Invariant"] = lambda state, nbrs_nm: jax_md.simulate.nvt_nose_hoover_invariant(
+            self._reporters["Invariant"] = lambda state, nbrs_nm: nvt_nose_hoover_invariant(
                                             self._energy_fn,
                                             state,
                                             self._temperature * TEMP_UNIT_CONVERSION,
@@ -704,7 +744,9 @@ class Simulation:
         '''
             Remove center-of-mass velocity from the current state.
         '''
-        velocity = self._state.velocity - (self._state.velocity * self._state.mass).sum(0) / self._state.mass.sum()
+        mask = self._mobile[:, None] if self._mobile is not None else jnp.ones_like(self._state.mass, dtype=bool)
+        mobile_mass = self._state.mass * mask
+        velocity = self._state.velocity - (self._state.velocity * mobile_mass).sum(0) / mobile_mass.sum()
         self.setVelocity(velocity)
         
     def _get_inner_step(self):
@@ -739,7 +781,8 @@ class Simulation:
                                                   state.box if "NPT" in self._routine else self._current_box)
             state = state.set(position=new_position)
             if self._remove_com_motion:
-                velocity = state.velocity - (state.velocity * state.mass).sum(0) / state.mass.sum()
+                mobile_mass = state.mass * (self._mobile[:, None] if self._mobile is not None else jnp.ones_like(state.mass, dtype=bool))
+                velocity = state.velocity - (state.velocity * mobile_mass).sum(0) / mobile_mass.sum()
                 state = state.set(momentum=state.mass * velocity)
             return ((state, typed_nbrs, error_code, profile),
                     (state.position * state.box if "NPT" in self._routine else state.position,
@@ -924,6 +967,8 @@ class Simulation:
         '''
             Set the velocity (Å/fs) of the atoms. Must be the same shape as the initial position representing the same system.
         '''
+        if self._mobile is not None:
+            velocity = velocity * self._mobile[:, None]
         self._state = self._state.set(momentum=self._state.mass * velocity)
 
     def setRandomVelocity(self, temperature, remove_com_motion=True, seed=None):
