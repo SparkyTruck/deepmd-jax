@@ -6,6 +6,16 @@ from os.path import abspath
 from ase.io import read
 from .utils import shift, get_relative_coord, sr
 
+def _classify_path(p):
+    return 'extxyz' if isinstance(p, str) and p.lower().endswith(('.xyz', '.extxyz')) else 'dp'
+
+def _flatten_paths(paths):
+    for p in paths:
+        if isinstance(p, list):
+            yield from _flatten_paths(p)
+        else:
+            yield p
+
 class Dataset():
     def __init__(self, paths, labels, params={}, chemical_types=None, _in_memory=None):
         '''
@@ -29,6 +39,10 @@ class Dataset():
             self._finalize_leaf(_in_memory['type'], _in_memory['data'], labels, params, paths=None)
             return
 
+        formats = {_classify_path(p) for p in _flatten_paths(paths)}
+        if len(formats) > 1:
+            raise ValueError('Mixing DP-directory and extxyz dataset paths is not supported; got both in %s' % (paths,))
+
         if type(paths[0]) == list:
             self.is_leaf = False
             self.subsets = [Dataset(path, labels, params, chemical_types=chemical_types)
@@ -36,7 +50,7 @@ class Dataset():
             self._finalize_non_leaf()
             return
 
-        if isinstance(paths[0], str) and paths[0].lower().endswith(('.xyz', '.extxyz')):
+        if formats == {'extxyz'}:
             self._init_from_extxyz(paths, labels, params)
             return
 
