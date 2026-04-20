@@ -672,7 +672,7 @@ def evaluate(
             label_count = np.isin(type_idx, model.params['nsel']).sum()
             label_dim = 9 if model.params['type'] == 'atomic_t2' else 3
             np.save(atomic_path, np.zeros((coord.shape[0], label_count * label_dim)))
-        elif model.params['type'] == 'energy':
+        elif model.params['type'] in ('energy', 'dplr'):
             energy_path = os.path.join(set_dir, "energy.npy")
             force_path = os.path.join(set_dir, "force.npy")
             np.save(energy_path, np.zeros(coord.shape[0]))
