@@ -359,7 +359,7 @@ class Simulation:
         elif self._routine == "NPT":
             box33 = jnp.diag(self._initial_box) if self._initial_box.shape == (3,) else self._initial_box
             initial_position = initial_position @ jnp.linalg.inv(box33)
-            self._routine_fn = jax_md.simulate.npt_nose_hoover
+            self._routine_fn = npt_nose_hoover
             if pressure is None:
                 raise ValueError("Missing argument 'pressure' (in bar) for routine 'NPT'")
             self._routine_args = {
