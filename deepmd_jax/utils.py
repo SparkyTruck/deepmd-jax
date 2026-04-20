@@ -175,23 +175,37 @@ def get_p3mlr_grid_size(box3, beta, resolution=5): # resolution=10 for better ac
     M = tuple((box3*beta*resolution).astype(int))
     return M
 
-def get_p3mlr_fn(box3, beta, M=None, resolution=5): # PPPM long range with TSC assignment
+def get_p3mlr_fn(box3_ref, beta, M=None, resolution=5): # PPPM long range with TSC assignment
+    '''
+        Returns p3mlr_fn(coord_N3, q_N, box3). box3 is a runtime argument so that
+        gradients w.r.t. an (isotropically scaled, orthorhombic) box flow
+        through correctly — needed for NPT dynamics and stress. Grid size M is
+        chosen from box3_ref and frozen; recreate the function if box drifts
+        enough that M should change.
+    '''
     if M is None:
-        M = get_p3mlr_grid_size(box3, beta, resolution)
+        M = get_p3mlr_grid_size(box3_ref, beta, resolution)
+    M3 = jnp.array(M)
     cube_idx = (jnp.stack(jnp.meshgrid(*([jnp.array([-1,0,1])]*3),indexing='ij'))).reshape(3,27)
-    MM = jnp.array(M).reshape(3,1,1,1)
-    kgrid = jnp.stack(jnp.meshgrid(*[jnp.arange(m) for m in M], indexing='ij'))
-    kgrid = 2*jnp.pi/box3[:,None,None,None] * ((kgrid-MM/2)%MM-MM/2)
-    ksquare = (kgrid ** 2).sum(0)
-    z = kgrid * (box3/jnp.array(M))[:,None,None,None] / 2
-    sinz = jnp.sin(z)
-    w3k = jnp.prod(jnp.where(z==0, 1, (sinz/z)**3), axis=0)
-    Sk = (jnp.prod(1 - sinz**2 + 2/15*sinz**4, axis=0))**2
-    kfactor = (14.399645*2*jnp.pi/jnp.prod(box3)) * jnp.exp(-ksquare/(4*beta**2)) * w3k**2/(Sk*ksquare)
-    kfactor = kfactor.at[0,0,0].set(0.)
-    def assign_to_grid(coord_N3, q_N): 
+    MM = M3.reshape(3,1,1,1)
+    kint = jnp.stack(jnp.meshgrid(*[jnp.arange(m) for m in M], indexing='ij'))
+    kint = (kint - MM/2) % MM - MM/2  # folded integer k-indices, box-independent
+    def p3mlr_fn(coord_N3, q_N, box3): # coord in Angstrom, q in elementary charge, returns energy in eV
+        kgrid = 2*jnp.pi/box3[:,None,None,None] * kint
+        ksquare = (kgrid ** 2).sum(0)
+        z = kgrid * (box3/M3)[:,None,None,None] / 2
+        # Use safe operands so divisions by zero at k=0 don't poison the gradient.
+        z_nz = z != 0
+        z_safe = jnp.where(z_nz, z, 1.)
+        sinz = jnp.sin(z)
+        w3k = jnp.prod(jnp.where(z_nz, (jnp.sin(z_safe)/z_safe)**3, 1.), axis=0)
+        Sk = (jnp.prod(1 - sinz**2 + 2/15*sinz**4, axis=0))**2
+        k_nz = ksquare != 0
+        ksquare_safe = jnp.where(k_nz, ksquare, 1.)
+        kfactor = (14.399645*2*jnp.pi/jnp.prod(box3)) * jnp.exp(-ksquare/(4*beta**2)) * w3k**2/(Sk*ksquare_safe)
+        kfactor = jnp.where(k_nz, kfactor, 0.)
+
         grid = jnp.zeros(M)
-        M3 = jnp.array(M)
         coord_3N = ((coord_N3 % box3) / box3 * M3).T
         center_idx_3N = jnp.rint(coord_3N).astype(int) # in [0, M3]
         r_3N = coord_3N - center_idx_3N # lies in (-0.5, 0.5)
@@ -201,9 +215,7 @@ def get_p3mlr_fn(box3, beta, M=None, resolution=5): # PPPM long range with TSC a
         fr_27N = (fr_33N[:,None,None,0,:]*fr_33N[:,None,1,:]*fr_33N[:,2,:]).reshape(27,-1)
         all_idx = (center_idx_3N[:,None] + cube_idx[:,:,None]).reshape(3,-1) % M3[:,None]
         grid = grid.at[tuple(all_idx)].add((q_N*fr_27N).reshape(-1))
-        return grid
-    def p3mlr_fn(coord_N3, q_N): # coord in Angstrom, q in elementary charge, returns energy in eV
-        grid = assign_to_grid(coord_N3, q_N)
+
         skfactor = jnp.fft.fftn(grid)
         # the following step may cause a bit speed loss under multi-gpu, but I haven't figured out why
         E = (kfactor * (skfactor*skfactor.conj()).real).sum()

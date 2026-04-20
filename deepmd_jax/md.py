@@ -499,7 +499,8 @@ class Simulation:
                                          self._static_args,
                                          nbrs_nm)
                 E = E + p3mlr_fn(jnp.concatenate([coord, wc]),
-                                 jnp.concatenate([qatoms, qwc]))
+                                 jnp.concatenate([qatoms, qwc]),
+                                 jnp.diag(box))
             return E
 
         return energy_fn

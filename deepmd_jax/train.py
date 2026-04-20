@@ -696,7 +696,7 @@ def process_long_range_subset(subset, dplr_q_atoms, dplr_q_wc, dplr_beta, dplr_r
     def lr_energy(coord, box, Ngrid):
         wc = wc_model.wc_predict(wc_variables, coord, box, static_args)
         p3mlr_fn = get_p3mlr_fn(jnp.diag(box), dplr_beta, Ngrid)
-        return p3mlr_fn(jnp.concatenate([coord, wc]), jnp.concatenate([qatoms, qwc]))
+        return p3mlr_fn(jnp.concatenate([coord, wc]), jnp.concatenate([qatoms, qwc]), jnp.diag(box))
     
     @partial(jax.jit, static_argnums=(2,))
     def lr_energy_and_force(coord, box, Ngrid):
