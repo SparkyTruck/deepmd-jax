@@ -129,7 +129,7 @@ def typed_neighbor_list(box, type_idx, type_count, rcut, buffer_ratio=1.2):
     def canonicalize(coord, box=reference_box):
         # scale coord to reference_box and store in float32 fractional coordinates
         box = box.astype(jnp.float32)
-        scale = reference_box[0] / box[0]
+        scale = reference_box / box  # (3,) per-axis; works for iso and semi_iso
         coord = coord[type_idx.argsort(kind='stable')]
         coord = (coord.astype(jnp.float32) % box) * scale
         # shrink by 1e-7 from the boundary to avoid numerical issues
@@ -145,7 +145,7 @@ def typed_neighbor_list(box, type_idx, type_count, rcut, buffer_ratio=1.2):
         # Measure the exact size of max neighbors for each atom type
         test_nbr = jax_md.partition.neighbor_list(displacement_fn,
                                                   reference_box,
-                                                  rcut * reference_box[0] / box[0], # scale rcut to reference_box
+                                                  rcut * (reference_box / box).max(), # worst-case per-axis shrink
                                                   capacity_multiplier=1.,
                                                   custom_mask_function=idx_mask_fn
                                                 ).allocate(coord)
@@ -165,7 +165,7 @@ def typed_neighbor_list(box, type_idx, type_count, rcut, buffer_ratio=1.2):
         # Allocate the neighbor list with the inferred buffer ratio
         nbrs = jax_md.partition.neighbor_list(displacement_fn,
                                               box,
-                                              rcut * reference_box[0] / box[0], # scale rcut to reference_box
+                                              rcut * (reference_box / box).max(), # worst-case per-axis shrink
                                               capacity_multiplier=total_buffer_ratio * 1.1,
                                               custom_mask_function=idx_mask_fn
                                             ).allocate(coord)
@@ -258,6 +258,7 @@ class Simulation:
                  sy_steps_t=1,
                  sy_steps_p=1,
                  fixed_indices: Optional[List[int]] = None,
+                 fixed_axes: tuple = (),
                 ):
         '''
             Initialize a Simulation instance.
@@ -284,6 +285,7 @@ class Simulation:
             chain_steps: Nose-Hoover thermostat/barostat chain steps
             sy_steps: Nose-Hoover thermostat/barostat number of Suzuki-Yoshida steps (must be 1,3,5,7)
             fixed_indices: zero-based indices of atoms that should remain fixed (constrained position) in the simulation.
+            fixed_axes: box axes held fixed in NPT. Subset of {0,1,2}, given as int or tuple. () = isotropic; 2 or (2,) = semi_iso (xy couple, z fixed); (1,2) = uniaxial (only x moves). Only used for NPT.
             ############################
             Usage:
                 sim = Simulation(...)
@@ -343,6 +345,13 @@ class Simulation:
                 return shift(x, dx, **kwargs)
         self._shift_fn = _shift_fn_wrapper
 
+        # Defaults for fixed_axes; overridden in the NPT branch below.
+        self._fixed_axes = ()
+        self._moving_mask_np = np.array([1, 1, 1], dtype=bool)
+        _fa_empty = fixed_axes is None or (hasattr(fixed_axes, '__len__') and len(fixed_axes) == 0)
+        if not _fa_empty and "NPT" not in self._routine:
+            raise ValueError("fixed_axes is only meaningful for routine='NPT'")
+
         # Initialize according to routine;
         if self._routine == "NVE":
             self._routine_fn = jax_md.simulate.nve
@@ -362,6 +371,16 @@ class Simulation:
             self._routine_fn = npt_nose_hoover
             if pressure is None:
                 raise ValueError("Missing argument 'pressure' (in bar) for routine 'NPT'")
+            if isinstance(fixed_axes, int):
+                fixed_axes = (fixed_axes,)
+            self._fixed_axes = tuple(sorted({int(a) for a in fixed_axes}))
+            if any(a not in (0, 1, 2) for a in self._fixed_axes):
+                raise ValueError(f"fixed_axes must be a subset of (0,1,2); got {fixed_axes}")
+            if len(self._fixed_axes) >= 3:
+                raise ValueError("fixed_axes cannot cover all three axes; use 'NVT' instead")
+            self._moving_mask_np = np.array(
+                [1 if i not in self._fixed_axes else 0 for i in range(3)], dtype=bool
+            )
             self._routine_args = {
                 'pressure': pressure * PRESS_UNIT_CONVERSION,
                 'kT': self._temperature * TEMP_UNIT_CONVERSION,
@@ -373,6 +392,7 @@ class Simulation:
                                       'chain_length': chain_length_t,
                                       'chain_steps': chain_steps_t,
                                       'sy_steps': sy_steps_t},
+                'fixed_axes': self._fixed_axes,
             }
             self._pressure = pressure
         else:
@@ -565,7 +585,7 @@ class Simulation:
         elif self._routine == "NPT":
             self._reporters["Pressure"] = lambda state, nbrs_nm: self._pressure_fn(state, state.box, nbrs_nm)
             self._reporters["box_x"] = lambda state, _: state.box[0]
-            self._reporters["Invariant"] = lambda state, nbrs_nm: jax_md.simulate.npt_nose_hoover_invariant(
+            self._reporters["Invariant"] = lambda state, nbrs_nm: npt_nose_hoover_invariant(
                                             self._energy_fn,
                                             state,
                                             self._pressure * PRESS_UNIT_CONVERSION,
@@ -636,9 +656,11 @@ class Simulation:
             error_code = 0
             if self._static_args['use_neighbor_list']:
                 if "NPT" in self._routine:
-                    error_code += (((1 - state.box[0] / typed_nbrs.reference_box[0]) > \
+                    # Per-axis max shrinkage (fixed axes trivially contribute 0); per-axis min size.
+                    shrink = (1 - state.box / typed_nbrs.reference_box).max()
+                    error_code += ((shrink >
                                     0.8 * self._neighbor_skin / (self._model.params['rcut'] + self._neighbor_skin))
-                                    | (state.box[0] < 2 * (self._model.params['rcut'] + self._neighbor_skin) * 1.02))
+                                    | (state.box.min() < 2 * (self._model.params['rcut'] + self._neighbor_skin) * 1.02))
                 error_code += 2 * (typed_nbrs.did_buffer_overflow > 0)
             is_nan = jnp.isnan(state.position).any() | jnp.isnan(state.velocity).any()
             is_inf = jnp.isinf(state.position).any() | jnp.isinf(state.velocity).any()
@@ -700,18 +722,19 @@ class Simulation:
         '''
 
         def soft_update_nbrs(typed_nbrs, position, box, profile):
-            scale = typed_nbrs.reference_box[0] / box[0]
+            scale = typed_nbrs.reference_box / box  # (3,); fixed axes stay 1
             scaled_position = (position % box) * scale
             scaled_position = scaled_position[self._type_idx.argsort(kind='stable')]
             scaled_position = reorder_by_device(scaled_position, self._type_count)
             rcut, dr = self._model.params['rcut'], self._neighbor_skin
-            safe_scale = scale * 1.02 if "NPT" in self._routine else scale
+            # Worst-case shrinkage across axes governs the allowed drift.
+            safe_scale = scale.max() * 1.02 if "NPT" in self._routine else scale.max()
             allowed_movement = ((rcut + dr) - rcut * safe_scale) / 2
             max_movement = norm_ortho_box(
                                     scaled_position - typed_nbrs.reference_position,
                                     typed_nbrs.reference_box
                                 ).max()
-            update_required = max_movement > allowed_movement - typed_nbrs.reference_box[0] * 1e-6
+            update_required = max_movement > allowed_movement - typed_nbrs.reference_box.min() * 1e-6
             profile = profile * (1 - 1/100) + 1/100 * update_required
             typed_nbrs = jax.lax.cond(
                                 update_required,

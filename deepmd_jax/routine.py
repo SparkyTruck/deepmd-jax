@@ -89,6 +89,10 @@ class CachedNPTNoseHooverState:
 
     Storing dUdV lets inner_step skip the initial stress_fn call and perform a
     single combined value_and_grad per step (see jax-md issue #330).
+
+    moving_mask is a (3,) {0.,1.} array marking axes that scale under the
+    barostat; fixed axes have mass 1 in the rescale and don't contribute to
+    dU/dV. moving_mask=[1,1,1] recovers standard isotropic NPT.
     """
     position: jnp.ndarray
     momentum: jnp.ndarray
@@ -105,6 +109,7 @@ class CachedNPTNoseHooverState:
     thermostat: _jms.NoseHooverChain
 
     dUdV: jnp.ndarray
+    moving_mask: jnp.ndarray
 
     @property
     def velocity(self):
@@ -112,11 +117,9 @@ class CachedNPTNoseHooverState:
 
     @property
     def box(self):
-        dim = self.position.shape[1]
-        ref = self.reference_box
-        V_0 = quantity.volume(dim, ref)
-        V = V_0 * jnp.exp(dim * self.box_position)
-        return (V / V_0) ** (1 / dim) * ref
+        s = jnp.exp(self.box_position)
+        per_axis = jnp.where(self.moving_mask > 0, s, 1.)
+        return self.reference_box * per_axis
 
 
 def npt_nose_hoover(
@@ -127,16 +130,30 @@ def npt_nose_hoover(
     kT,
     barostat_kwargs=None,
     thermostat_kwargs=None,
+    fixed_axes=(),
 ):
     """NPT Nose-Hoover integrator that caches dU/dV across steps.
 
     Adapted from jax_md.simulate.npt_nose_hoover. Each step needs only one
     combined value_and_grad (force + dU/dV) instead of two; the dU/dV from the
     end of step n is reused as the dU/dV at the start of step n+1.
+
+    fixed_axes: tuple of axis indices (subset of {0,1,2}) held fixed. The
+    remaining ("moving") axes share a single scalar scale factor (first-family
+    anisotropic NPT: iso / semi_iso / uniaxial). fixed_axes=() is isotropic.
     """
     f32 = jnp.float32
     dt = f32(dt)
     dt_2 = f32(dt / 2)
+
+    fixed_axes = tuple(sorted({int(a) for a in fixed_axes}))
+    if any(a not in (0, 1, 2) for a in fixed_axes):
+        raise ValueError(f"fixed_axes must be a subset of (0,1,2); got {fixed_axes}")
+    if len(fixed_axes) >= 3:
+        raise ValueError("fixed_axes cannot cover all three axes; use NVT instead")
+    moving_axes = tuple(i for i in range(3) if i not in fixed_axes)
+    d_move = len(moving_axes)
+    chi = jnp.array([1.0 if i in moving_axes else 0.0 for i in range(3)])
 
     barostat_kwargs = _jms.default_nhc_kwargs(1000 * dt, barostat_kwargs)
     barostat = _jms.nose_hoover_chain(dt, **barostat_kwargs)
@@ -146,43 +163,51 @@ def npt_nose_hoover(
 
     def force_stress_fn(position, box, **kwargs):
         def U(position, eps):
-            return energy_fn(position, box=box, perturbation=(1 + eps), **kwargs)
+            # Perturbation scales only moving axes; fixed axes use 1.0.
+            perturbation = 1.0 + eps * chi
+            return energy_fn(position, box=box, perturbation=perturbation, **kwargs)
         E, grad = jax.value_and_grad(U, argnums=(0, 1))(position, 0.0)
         return E, -grad[0], grad[1]
 
     def box_force(alpha, vol, dUdV, momentum, mass, pressure):
-        _, dim = momentum.shape
         KE2 = util.high_precision_sum(momentum ** 2 / mass)
-        return alpha * KE2 - dUdV - pressure * vol * dim
+        return alpha * KE2 - dUdV - pressure * vol * d_move
 
     def sinhx_x(x):
         return (1 + x ** 2 / 6 + x ** 4 / 120 + x ** 6 / 5040
                 + x ** 8 / 362_880 + x ** 10 / 39_916_800)
 
     def exp_iL1(box, R, V, V_b, **kwargs):
-        x = V_b * dt
+        # chi zeros-out the scaling factor on fixed axes, reducing the update
+        # to the plain NVE form (R + dt*V) along those axes.
+        x = V_b * dt * chi
         x_2 = x / 2
         sinhV = sinhx_x(x_2)
         return shift_fn(R, R * (jnp.exp(x) - 1) + dt * V * jnp.exp(x_2) * sinhV,
                         box=box, **kwargs)
 
     def exp_iL2(alpha, P, F, V_b):
-        x = alpha * V_b * dt_2
+        x = alpha * V_b * dt_2 * chi
         x_2 = x / 2
         sinhP = sinhx_x(x_2)
         return P * jnp.exp(-x) + dt_2 * F * sinhP * jnp.exp(-x_2)
 
     def _box_info(state):
-        dim = state.position.shape[1]
         ref = state.reference_box
+        dim = state.position.shape[1]
         V_0 = quantity.volume(dim, ref)
-        V = V_0 * jnp.exp(dim * state.box_position)
-        return V, lambda V: (V / V_0) ** (1 / dim) * ref
+        s = jnp.exp(state.box_position)
+        V = V_0 * s ** d_move  # total volume, scaling only moving axes
+        def box_fn(V):
+            s_reco = (V / V_0) ** (1.0 / d_move)
+            per_axis = jnp.where(chi > 0, s_reco, 1.)
+            return ref * per_axis
+        return V, box_fn
 
     def update_box_mass(state, kT):
-        N, dim = state.position.shape
+        N, _ = state.position.shape
         dtype = state.position.dtype
-        box_mass = jnp.array(dim * (N + 1) * kT * state.barostat.tau ** 2, dtype)
+        box_mass = jnp.array(d_move * (N + 1) * kT * state.barostat.tau ** 2, dtype)
         return state.set(box_mass=box_mass)
 
     def init_fn(key, R, box, mass=f32(1.0), **kwargs):
@@ -193,7 +218,7 @@ def npt_nose_hoover(
         one = jnp.ones((), dtype=R.dtype)
         box_position = zero
         box_momentum = zero
-        box_mass = dim * (N + 1) * _kT * barostat_kwargs['tau'] ** 2 * one
+        box_mass = d_move * (N + 1) * _kT * barostat_kwargs['tau'] ** 2 * one
         KE_box = quantity.kinetic_energy(momentum=box_momentum, mass=box_mass)
 
         if jnp.isscalar(box) or box.ndim == 0:
@@ -215,6 +240,7 @@ def npt_nose_hoover(
             barostat=barostat.initialize(1, KE_box, _kT),
             thermostat=None,
             dUdV=dUdV,
+            moving_mask=chi,
         )
         state = _jms.canonicalize_mass(state)
         state = _jms.initialize_momenta(state, key, _kT)
@@ -230,8 +256,8 @@ def npt_nose_hoover(
         R_b, P_b, M_b = state.box_position, state.box_momentum, state.box_mass
         dUdV = state.dUdV
 
-        N, _ = R.shape
-        alpha = 1 + 1 / N
+        N, dim = R.shape
+        alpha = 1 + d_move / (dim * N)
 
         vol, _ = _box_info(state)
         # First barostat kick uses cached dU/dV from previous step (or init).
@@ -286,3 +312,37 @@ def npt_nose_hoover(
         return S
 
     return init_fn, apply_fn
+
+
+def npt_nose_hoover_invariant(energy_fn, state, pressure, kT, **kwargs):
+    """Conserved quantity for CachedNPTNoseHooverState (iso / semi_iso).
+
+    Uses d_move = state.moving_mask.sum() so V is the total volume under
+    moving-axis scaling, regardless of how many axes are fixed.
+    """
+    ref = state.reference_box
+    dim = state.position.shape[1]
+    V_0 = quantity.volume(dim, ref)
+    d_move = state.moving_mask.sum()
+    s = jnp.exp(state.box_position)
+    V = V_0 * s ** d_move
+    per_axis = jnp.where(state.moving_mask > 0, s, 1.)
+    box = ref * per_axis
+
+    PE = energy_fn(state.position, box=box, **kwargs)
+    KE = jax_md.simulate.kinetic_energy(state)
+    DOF = state.position.size
+    E = PE + KE
+
+    c = state.thermostat
+    E += c.momentum[0] ** 2 / (2 * c.mass[0]) + DOF * kT * c.position[0]
+    for r, p, m in zip(c.position[1:], c.momentum[1:], c.mass[1:]):
+        E += p ** 2 / (2 * m) + kT * r
+
+    c = state.barostat
+    for r, p, m in zip(c.position, c.momentum, c.mass):
+        E += p ** 2 / (2 * m) + kT * r
+
+    E += pressure * V
+    E += state.box_momentum ** 2 / (2 * state.box_mass)
+    return E
