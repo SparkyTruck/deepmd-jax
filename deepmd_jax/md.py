@@ -265,7 +265,10 @@ class Simulation:
             Initialize a Simulation instance.
             model_path: path to the deepmd model
             box: box size, scalar or (3,) or (3,3)
-            type_idx: list of atom types, length = n_atoms
+            type_idx: list of atom types, length = n_atoms. If the loaded model stores
+                model.params['chemical_types'] (i.e. was trained from extxyz or with chemical_types
+                supplied), type_idx is interpreted as atomic numbers (Z); otherwise as integer
+                type indices in the range [0, ntypes).
             mass: atomic mass for each type, length = number of atom types
             routine: simulation routine, currently limited to 'NVE', 'NVT', 'NPT', where NVT/NPT uses Nose-Hoover thermostat/barostat
             dt: time step size (fs)
@@ -299,9 +302,18 @@ class Simulation:
         self._dt = dt
         self._routine = routine
         self._temperature = temperature
-        self._type_idx = np.array(type_idx).astype(int)
-        self._mass = jnp.array(np.array(mass)[np.array(self._type_idx)]) # AMU
         self._model, self._variables = load_model(model_path)
+        type_idx_np = np.array(type_idx).astype(int)
+        ct = self._model.params.get('chemical_types')
+        if ct is not None:
+            unknown = set(type_idx_np.tolist()) - set(ct)
+            if unknown:
+                raise ValueError('Atomic numbers %s in type_idx are not in model.params["chemical_types"]=%s'
+                                 % (sorted(unknown), ct))
+            z_to_idx = {z: i for i, z in enumerate(ct)}
+            type_idx_np = np.array([z_to_idx[z] for z in type_idx_np], dtype=int)
+        self._type_idx = type_idx_np
+        self._mass = jnp.array(np.array(mass)[np.array(self._type_idx)]) # AMU
         type_count = np.bincount(self._type_idx)
         self._type_count = np.pad(type_count, (0, self._model.params['ntypes'] - len(type_count)))
         self._debug = debug
