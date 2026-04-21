@@ -15,6 +15,7 @@ from ase.calculators.calculator import Calculator, all_changes
 from .data import compute_lattice_candidate
 from .utils import split, concat, load_model, norm_ortho_box, get_p3mlr_fn, get_p3mlr_grid_size
 from .routine import *
+from .routine import _parse_couple_axes
 from typing import Callable
 from functools import partial
 
@@ -258,7 +259,7 @@ class Simulation:
                  sy_steps_t=1,
                  sy_steps_p=1,
                  fixed_indices: Optional[List[int]] = None,
-                 fixed_axes: tuple = (),
+                 couple_axes: tuple = ((0, 1, 2),),
                 ):
         '''
             Initialize a Simulation instance.
@@ -285,7 +286,7 @@ class Simulation:
             chain_steps: Nose-Hoover thermostat/barostat chain steps
             sy_steps: Nose-Hoover thermostat/barostat number of Suzuki-Yoshida steps (must be 1,3,5,7)
             fixed_indices: zero-based indices of atoms that should remain fixed (constrained position) in the simulation.
-            fixed_axes: box axes held fixed in NPT. Subset of {0,1,2}, given as int or tuple. () = isotropic; 2 or (2,) = semi_iso (xy couple, z fixed); (1,2) = uniaxial (only x moves). Only used for NPT.
+            couple_axes: NPT-only partition of a subset of {0,1,2} into coupled groups. Each inner tuple lists axes sharing one scale factor; axes not listed are held fixed. Examples: ((0,1,2),) iso (default); ((0,1),) semi-iso (xy couple, z fixed); ((0,),) uniaxial (only x moves); ((0,),(1,),(2,)) fully anisotropic ortho; ((0,1),(2,)) xy couple + z independent.
             ############################
             Usage:
                 sim = Simulation(...)
@@ -345,12 +346,14 @@ class Simulation:
                 return shift(x, dx, **kwargs)
         self._shift_fn = _shift_fn_wrapper
 
-        # Defaults for fixed_axes; overridden in the NPT branch below.
-        self._fixed_axes = ()
+        # Defaults; overridden in the NPT branch below.
+        self._couple_axes = ((0, 1, 2),)
         self._moving_mask_np = np.array([1, 1, 1], dtype=bool)
-        _fa_empty = fixed_axes is None or (hasattr(fixed_axes, '__len__') and len(fixed_axes) == 0)
-        if not _fa_empty and "NPT" not in self._routine:
-            raise ValueError("fixed_axes is only meaningful for routine='NPT'")
+        self._group_ids_np = np.array([0, 0, 0], dtype=np.int32)
+        _is_default_couple = (isinstance(couple_axes, tuple)
+                              and couple_axes == ((0, 1, 2),))
+        if not _is_default_couple and "NPT" not in self._routine:
+            raise ValueError("couple_axes is only meaningful for routine='NPT'")
 
         # Initialize according to routine;
         if self._routine == "NVE":
@@ -371,16 +374,9 @@ class Simulation:
             self._routine_fn = npt_nose_hoover
             if pressure is None:
                 raise ValueError("Missing argument 'pressure' (in bar) for routine 'NPT'")
-            if isinstance(fixed_axes, int):
-                fixed_axes = (fixed_axes,)
-            self._fixed_axes = tuple(sorted({int(a) for a in fixed_axes}))
-            if any(a not in (0, 1, 2) for a in self._fixed_axes):
-                raise ValueError(f"fixed_axes must be a subset of (0,1,2); got {fixed_axes}")
-            if len(self._fixed_axes) >= 3:
-                raise ValueError("fixed_axes cannot cover all three axes; use 'NVT' instead")
-            self._moving_mask_np = np.array(
-                [1 if i not in self._fixed_axes else 0 for i in range(3)], dtype=bool
-            )
+            groups, _, self._group_ids_np, _ = _parse_couple_axes(couple_axes)
+            self._couple_axes = groups
+            self._moving_mask_np = (self._group_ids_np >= 0)
             self._routine_args = {
                 'pressure': pressure * PRESS_UNIT_CONVERSION,
                 'kT': self._temperature * TEMP_UNIT_CONVERSION,
@@ -392,7 +388,7 @@ class Simulation:
                                       'chain_length': chain_length_t,
                                       'chain_steps': chain_steps_t,
                                       'sy_steps': sy_steps_t},
-                'fixed_axes': self._fixed_axes,
+                'couple_axes': self._couple_axes,
             }
             self._pressure = pressure
         else:
@@ -584,7 +580,14 @@ class Simulation:
                                         )
         elif self._routine == "NPT":
             self._reporters["Pressure"] = lambda state, nbrs_nm: self._pressure_fn(state, state.box, nbrs_nm)
-            self._reporters["box_x"] = lambda state, _: state.box[0]
+            # One column per moving axis (axis letter labels the actual box length).
+            # Fixed axes are omitted since they never change. Axes in the same
+            # coupled group will track exactly in the log but their absolute
+            # lengths can differ when the reference box is non-cubic.
+            axis_letters = ['x', 'y', 'z']
+            moving_axes = [a for g in self._couple_axes for a in g]
+            for a in sorted(moving_axes):
+                self._reporters[f'box_{axis_letters[a]}'] = (lambda state, _, a=a: state.box[a])
             self._reporters["Invariant"] = lambda state, nbrs_nm: npt_nose_hoover_invariant(
                                             self._energy_fn,
                                             state,
@@ -611,7 +614,9 @@ class Simulation:
             Print a report of the current state.
             All reports are accumulated in self.log.
         '''
-        char_space = ["8"] + ["12"] * len(self._reporters) + ["6"]
+        # Box-length columns only need ~6 chars ("12.487"); give them less width.
+        reporter_widths = [7 if k.startswith('box_') else 12 for k in self._reporters.keys()]
+        char_space = ["8"] + [str(w) for w in reporter_widths] + ["6"]
         if self._is_initial_state:
             headers = ["Step"] + list(self._reporters.keys()) + ["Time"]
             if self._debug and self._static_args['use_neighbor_list']:
