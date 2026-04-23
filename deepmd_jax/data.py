@@ -23,6 +23,9 @@ class DPDataset():
                                                 for path in paths], [])) for l in labels}
             self.natoms = len(self.type)
             self.nframes = len(self.data['coord'])
+            for l in labels:
+                assert self.data[l].shape[0] == self.nframes, \
+                    f"{l}.npy has {self.data[l].shape[0]} frames, expected {self.nframes}"
             self.pointer = self.nframes
             self.type_count = np.array([(self.type == i).sum() for i in range(max(self.type)+1)])
             self.ntypes = len(self.type_count)
@@ -38,6 +41,8 @@ class DPDataset():
                 if l in ['coord', 'force']:
                     self.data[l] = self.data[l].reshape(self.data[l].shape[0],-1,3)
                     self.data[l] = self.data[l][:,self.type.argsort(kind='stable')]
+                if l == 'energy':
+                    self.data[l] = self.data[l].reshape(-1)
                 if 'atomic' in l:
                     try:
                         self.data[l] = self.data[l].reshape(self.data[l].shape[0],self.nlabels,-1)
