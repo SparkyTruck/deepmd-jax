@@ -119,7 +119,8 @@ class DPModel(nn.Module):
                     return pref['e']*le + pref['f']*lf, (le, lf)
                 elif order == 'l1-mixed':
                     le = jnp.abs(batch_data['energy'] - e).mean() / f.shape[1]
-                    lf = (((batch_data['force'] - f)**2).mean(-1)**0.5).mean()
+                    sq = ((batch_data['force'] - f)**2).mean(-1)
+                    lf = jnp.where(sq > 0, jnp.sqrt(jnp.where(sq > 0, sq, 1.)), 0.).mean()
                     return (pref['e']**0.5)*le + (pref['f']**0.5)*lf, (le, lf)
             loss_and_grad = value_and_grad(loss_ef, has_aux=True)
             return loss_ef, loss_and_grad
@@ -130,7 +131,8 @@ class DPModel(nn.Module):
                 if order == 'l2':
                     return ((batch_data['atomic'] - pred)**2).mean()
                 elif order == 'l1-mixed':
-                    return (((batch_data['atomic'] - pred)**2).mean(-1)**0.5).mean()
+                    sq = ((batch_data['atomic'] - pred)**2).mean(-1)
+                    return jnp.where(sq > 0, jnp.sqrt(jnp.where(sq > 0, sq, 1.)), 0.).mean()
             loss_and_grad = value_and_grad(loss_atomic)
             return loss_atomic, loss_and_grad
 
