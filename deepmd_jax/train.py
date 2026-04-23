@@ -760,7 +760,7 @@ def evaluate(
             label_count = np.isin(type_idx, model.params['nsel']).sum()
             label_dim = 9 if model.params['type'] == 'atomic_t2' else 3
             np.save(atomic_path, np.zeros((coord.shape[0], label_count * label_dim)))
-        elif model.params['type'] == 'energy':
+        elif model.params['type'] in ('energy', 'dplr'):
             energy_path = os.path.join(set_dir, "energy.npy")
             force_path = os.path.join(set_dir, "force.npy")
             np.save(energy_path, np.zeros(coord.shape[0]))
@@ -784,7 +784,7 @@ def process_long_range_subset(subset, dplr_q_atoms, dplr_q_wc, dplr_beta, dplr_r
     def lr_energy(coord, box, Ngrid):
         wc = wc_model.wc_predict(wc_variables, coord, box, static_args)
         p3mlr_fn = get_p3mlr_fn(jnp.diag(box), dplr_beta, Ngrid)
-        return p3mlr_fn(jnp.concatenate([coord, wc]), jnp.concatenate([qatoms, qwc]))
+        return p3mlr_fn(jnp.concatenate([coord, wc]), jnp.concatenate([qatoms, qwc]), jnp.diag(box))
     
     @partial(jax.jit, static_argnums=(2,))
     def lr_energy_and_force(coord, box, Ngrid):

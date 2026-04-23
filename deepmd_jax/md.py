@@ -15,6 +15,7 @@ from ase.calculators.calculator import Calculator, all_changes
 from .data import compute_lattice_candidate
 from .utils import split, concat, load_model, norm_ortho_box, get_p3mlr_fn, get_p3mlr_grid_size
 from .routine import *
+from .routine import _parse_couple_axes
 from typing import Callable
 from functools import partial
 
@@ -129,7 +130,7 @@ def typed_neighbor_list(box, type_idx, type_count, rcut, buffer_ratio=1.2):
     def canonicalize(coord, box=reference_box):
         # scale coord to reference_box and store in float32 fractional coordinates
         box = box.astype(jnp.float32)
-        scale = reference_box[0] / box[0]
+        scale = reference_box / box  # (3,) per-axis; works for iso and semi_iso
         coord = coord[type_idx.argsort(kind='stable')]
         coord = (coord.astype(jnp.float32) % box) * scale
         # shrink by 1e-7 from the boundary to avoid numerical issues
@@ -145,7 +146,7 @@ def typed_neighbor_list(box, type_idx, type_count, rcut, buffer_ratio=1.2):
         # Measure the exact size of max neighbors for each atom type
         test_nbr = jax_md.partition.neighbor_list(displacement_fn,
                                                   reference_box,
-                                                  rcut * reference_box[0] / box[0], # scale rcut to reference_box
+                                                  rcut * (reference_box / box).max(), # worst-case per-axis shrink
                                                   capacity_multiplier=1.,
                                                   custom_mask_function=idx_mask_fn
                                                 ).allocate(coord)
@@ -165,7 +166,7 @@ def typed_neighbor_list(box, type_idx, type_count, rcut, buffer_ratio=1.2):
         # Allocate the neighbor list with the inferred buffer ratio
         nbrs = jax_md.partition.neighbor_list(displacement_fn,
                                               box,
-                                              rcut * reference_box[0] / box[0], # scale rcut to reference_box
+                                              rcut * (reference_box / box).max(), # worst-case per-axis shrink
                                               capacity_multiplier=total_buffer_ratio * 1.1,
                                               custom_mask_function=idx_mask_fn
                                             ).allocate(coord)
@@ -258,6 +259,7 @@ class Simulation:
                  sy_steps_t=1,
                  sy_steps_p=1,
                  fixed_indices: Optional[List[int]] = None,
+                 couple_axes: tuple = ((0, 1, 2),),
                 ):
         '''
             Initialize a Simulation instance.
@@ -287,6 +289,7 @@ class Simulation:
             chain_steps: Nose-Hoover thermostat/barostat chain steps
             sy_steps: Nose-Hoover thermostat/barostat number of Suzuki-Yoshida steps (must be 1,3,5,7)
             fixed_indices: zero-based indices of atoms that should remain fixed (constrained position) in the simulation.
+            couple_axes: NPT-only partition of a subset of {0,1,2} into coupled groups. Each inner tuple lists axes sharing one scale factor; axes not listed are held fixed. Examples: ((0,1,2),) iso (default); ((0,1),) semi-iso (xy couple, z fixed); ((0,),) uniaxial (only x moves); ((0,),(1,),(2,)) fully anisotropic ortho; ((0,1),(2,)) xy couple + z independent.
             ############################
             Usage:
                 sim = Simulation(...)
@@ -355,6 +358,15 @@ class Simulation:
                 return shift(x, dx, **kwargs)
         self._shift_fn = _shift_fn_wrapper
 
+        # Defaults; overridden in the NPT branch below.
+        self._couple_axes = ((0, 1, 2),)
+        self._moving_mask_np = np.array([1, 1, 1], dtype=bool)
+        self._group_ids_np = np.array([0, 0, 0], dtype=np.int32)
+        _is_default_couple = (isinstance(couple_axes, tuple)
+                              and couple_axes == ((0, 1, 2),))
+        if not _is_default_couple and "NPT" not in self._routine:
+            raise ValueError("couple_axes is only meaningful for routine='NPT'")
+
         # Initialize according to routine;
         if self._routine == "NVE":
             self._routine_fn = jax_md.simulate.nve
@@ -371,9 +383,12 @@ class Simulation:
         elif self._routine == "NPT":
             box33 = jnp.diag(self._initial_box) if self._initial_box.shape == (3,) else self._initial_box
             initial_position = initial_position @ jnp.linalg.inv(box33)
-            self._routine_fn = jax_md.simulate.npt_nose_hoover
+            self._routine_fn = npt_nose_hoover
             if pressure is None:
                 raise ValueError("Missing argument 'pressure' (in bar) for routine 'NPT'")
+            groups, _, self._group_ids_np, _ = _parse_couple_axes(couple_axes)
+            self._couple_axes = groups
+            self._moving_mask_np = (self._group_ids_np >= 0)
             self._routine_args = {
                 'pressure': pressure * PRESS_UNIT_CONVERSION,
                 'kT': self._temperature * TEMP_UNIT_CONVERSION,
@@ -385,6 +400,7 @@ class Simulation:
                                       'chain_length': chain_length_t,
                                       'chain_steps': chain_steps_t,
                                       'sy_steps': sy_steps_t},
+                'couple_axes': self._couple_axes,
             }
             self._pressure = pressure
         else:
@@ -511,7 +527,8 @@ class Simulation:
                                          self._static_args,
                                          nbrs_nm)
                 E = E + p3mlr_fn(jnp.concatenate([coord, wc]),
-                                 jnp.concatenate([qatoms, qwc]))
+                                 jnp.concatenate([qatoms, qwc]),
+                                 jnp.diag(box))
             return E
 
         return energy_fn
@@ -575,8 +592,15 @@ class Simulation:
                                         )
         elif self._routine == "NPT":
             self._reporters["Pressure"] = lambda state, nbrs_nm: self._pressure_fn(state, state.box, nbrs_nm)
-            self._reporters["box_x"] = lambda state, _: state.box[0]
-            self._reporters["Invariant"] = lambda state, nbrs_nm: jax_md.simulate.npt_nose_hoover_invariant(
+            # One column per moving axis (axis letter labels the actual box length).
+            # Fixed axes are omitted since they never change. Axes in the same
+            # coupled group will track exactly in the log but their absolute
+            # lengths can differ when the reference box is non-cubic.
+            axis_letters = ['x', 'y', 'z']
+            moving_axes = [a for g in self._couple_axes for a in g]
+            for a in sorted(moving_axes):
+                self._reporters[f'box_{axis_letters[a]}'] = (lambda state, _, a=a: state.box[a])
+            self._reporters["Invariant"] = lambda state, nbrs_nm: npt_nose_hoover_invariant(
                                             self._energy_fn,
                                             state,
                                             self._pressure * PRESS_UNIT_CONVERSION,
@@ -602,7 +626,9 @@ class Simulation:
             Print a report of the current state.
             All reports are accumulated in self.log.
         '''
-        char_space = ["8"] + ["12"] * len(self._reporters) + ["6"]
+        # Box-length columns only need ~6 chars ("12.487"); give them less width.
+        reporter_widths = [7 if k.startswith('box_') else 12 for k in self._reporters.keys()]
+        char_space = ["8"] + [str(w) for w in reporter_widths] + ["6"]
         if self._is_initial_state:
             headers = ["Step"] + list(self._reporters.keys()) + ["Time"]
             if self._debug and self._static_args['use_neighbor_list']:
@@ -647,9 +673,11 @@ class Simulation:
             error_code = 0
             if self._static_args['use_neighbor_list']:
                 if "NPT" in self._routine:
-                    error_code += (((1 - state.box[0] / typed_nbrs.reference_box[0]) > \
+                    # Per-axis max shrinkage (fixed axes trivially contribute 0); per-axis min size.
+                    shrink = (1 - state.box / typed_nbrs.reference_box).max()
+                    error_code += ((shrink >
                                     0.8 * self._neighbor_skin / (self._model.params['rcut'] + self._neighbor_skin))
-                                    | (state.box[0] < 2 * (self._model.params['rcut'] + self._neighbor_skin) * 1.02))
+                                    | (state.box.min() < 2 * (self._model.params['rcut'] + self._neighbor_skin) * 1.02))
                 error_code += 2 * (typed_nbrs.did_buffer_overflow > 0)
             is_nan = jnp.isnan(state.position).any() | jnp.isnan(state.velocity).any()
             is_inf = jnp.isinf(state.position).any() | jnp.isinf(state.velocity).any()
@@ -711,18 +739,19 @@ class Simulation:
         '''
 
         def soft_update_nbrs(typed_nbrs, position, box, profile):
-            scale = typed_nbrs.reference_box[0] / box[0]
+            scale = typed_nbrs.reference_box / box  # (3,); fixed axes stay 1
             scaled_position = (position % box) * scale
             scaled_position = scaled_position[self._type_idx.argsort(kind='stable')]
             scaled_position = reorder_by_device(scaled_position, self._type_count)
             rcut, dr = self._model.params['rcut'], self._neighbor_skin
-            safe_scale = scale * 1.02 if "NPT" in self._routine else scale
+            # Worst-case shrinkage across axes governs the allowed drift.
+            safe_scale = scale.max() * 1.02 if "NPT" in self._routine else scale.max()
             allowed_movement = ((rcut + dr) - rcut * safe_scale) / 2
             max_movement = norm_ortho_box(
                                     scaled_position - typed_nbrs.reference_position,
                                     typed_nbrs.reference_box
                                 ).max()
-            update_required = max_movement > allowed_movement - typed_nbrs.reference_box[0] * 1e-6
+            update_required = max_movement > allowed_movement - typed_nbrs.reference_box.min() * 1e-6
             profile = profile * (1 - 1/100) + 1/100 * update_required
             typed_nbrs = jax.lax.cond(
                                 update_required,
