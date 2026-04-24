@@ -13,7 +13,7 @@ from jax.sharding import PartitionSpec as PSpec
 from ase.calculators.calculator import Calculator, all_changes
 
 from .data import compute_lattice_candidate
-from .utils import split, concat, load_model, norm_ortho_box, get_p3mlr_fn, get_p3mlr_grid_size
+from .utils import split, concat, load_model, norm_ortho_box, get_p3mlr_fn, get_p3mlr_grid_size, normal_mode_transform_fn
 from .routine import *
 from .routine import _parse_couple_axes
 from typing import Callable
@@ -22,6 +22,7 @@ from functools import partial
 MASS_UNIT_CONVERSION = 1.036427e2 # from Dalton to eV * fs^2 / Å^2
 TEMP_UNIT_CONVERSION = 8.617333e-5 # from Kelvin to eV
 PRESS_UNIT_CONVERSION = 6.241509e-7 # from bar to eV / Å^3
+HBAR = 6.582119569e-16 * 1E15  # reduced Planck's constant, eV * fs
 
 def reorder_by_device(coord, type_count):
     '''
@@ -260,6 +261,7 @@ class Simulation:
                  sy_steps_p=1,
                  fixed_indices: Optional[List[int]] = None,
                  couple_axes: tuple = ((0, 1, 2),),
+                 n_bead=1,
                 ):
         '''
             Initialize a Simulation instance.
@@ -295,10 +297,17 @@ class Simulation:
         initial_position = jnp.array(initial_position) * jnp.ones(1) # Ensure default precision
         self.report_interval = int(report_interval)
         self.log = []
-        self._natoms = initial_position.shape[0]
+        ### MODIFY!!
+        self._n_bead = n_bead
+        if n_bead == 1:
+            self._natoms = initial_position.shape[0]
+            self._temperature = temperature
+        elif n_bead > 1:
+            self._natoms = initial_position.shape[1]    # For PIMD, initial_position.shape = (n_bead, n_atom, dimen)
+            self._nm_freqs, self._nm_trans = normal_mode_transform_fn(n_bead, temperature * TEMP_UNIT_CONVERSION, HBAR)
+            self._temperature = temperature * n_bead    # For PIMD, the effective temp = temp * #beads
         self._dt = dt
         self._routine = routine
-        self._temperature = temperature
         self._type_idx = np.array(type_idx).astype(int)
         self._mass = jnp.array(np.array(mass)[np.array(self._type_idx)]) # AMU
         self._model, self._variables = load_model(model_path)
@@ -368,6 +377,24 @@ class Simulation:
                 'chain_steps': chain_steps_t,
                 'sy_steps': sy_steps_t,
             }
+        ### MODIFY!!
+        elif self._routine == "NVT_langevin":
+            if n_bead == 1:
+                self._routine_fn = jax_md.simulate.nvt_langevin
+                self._routine_args = {
+                    'kT': self._temperature * TEMP_UNIT_CONVERSION,
+                }
+            else:
+                self._routine_fn = nvt_langevin_pimd
+                gamma = 2 * self._nm_freqs
+                gamma[0] = 1 / tau_t
+                self._routine_args = {
+                    'kT': self._temperature * TEMP_UNIT_CONVERSION,
+                    'gamma': jnp.array(np.repeat(gamma, self._natoms)).reshape(-1, 1),
+                    'natoms': self._natoms,
+                    'n_bead': self._n_bead,
+                    'nm_trans': jnp.array(self._nm_trans),
+                }
         elif self._routine == "NPT":
             box33 = jnp.diag(self._initial_box) if self._initial_box.shape == (3,) else self._initial_box
             initial_position = initial_position @ jnp.linalg.inv(box33)
@@ -503,20 +530,46 @@ class Simulation:
             box = jax.lax.with_sharding_constraint(box, PSpec())
 
             # Energy calculation
-            E = model.apply(variables,
-                            coord,
-                            box,
-                            self._static_args,
-                            nbrs_nm)[0]
-            if model.params['type'] == 'dplr':
-                wc = wc_model.wc_predict(wc_variables,
-                                         coord,
-                                         box,
-                                         self._static_args,
-                                         nbrs_nm)
-                E = E + p3mlr_fn(jnp.concatenate([coord, wc]),
-                                 jnp.concatenate([qatoms, qwc]),
-                                 jnp.diag(box))
+            if self._n_bead == 1:
+                E = model.apply(variables,
+                                coord,
+                                box,
+                                self._static_args,
+                                nbrs_nm)[0]
+                if model.params['type'] == 'dplr':
+                    wc = wc_model.wc_predict(wc_variables,
+                                            coord,
+                                            box,
+                                            self._static_args,
+                                            nbrs_nm)
+                    E = E + p3mlr_fn(jnp.concatenate([coord, wc]),
+                                    jnp.concatenate([qatoms, qwc]),
+                                    jnp.diag(box))
+            elif self._n_bead > 1:
+                ### MODIFY!!
+                coord_reshape = coord   # coord.reshape(self._n_bead, self._natoms//self._n_bead, 3)
+                E = jax.vmap(model.apply, in_axes=(None, 0, None, None, None)) \
+                                                (variables,
+                                                coord_reshape,
+                                                box,
+                                                self._static_args,
+                                                nbrs_nm)[0]         # (n_bead, )
+                E = jnp.sum(E)     
+                ### MODIFY!! Add spring energy
+                nm_coord_reshape = jnp.tensordot(self._nm_trans.T, coord_reshape, axes=(1, 0))   # (n_bead, n_atoms, dimen)
+                E = E + 0.5 * jnp.sum((self._mass * MASS_UNIT_CONVERSION)[None, :, None] * self._nm_freqs[:, None, None]**2 * nm_coord_reshape**2)
+
+                if model.params['type'] == 'dplr':
+                    wc = jax.vmap(wc_model.wc_predict, in_axes=(None, 0, None, None, None)) \
+                                                (wc_variables,
+                                                coord_reshape,
+                                                box,
+                                                self._static_args,
+                                                nbrs_nm)            # (n_bead, n_wc, dimen)
+                    E = E + jnp.sum( jax.vmap(p3mlr_fn, in_axes=(0, None)) \
+                                                    (jnp.concatenate([coord_reshape, wc], axis=1),
+                                                     jnp.concatenate([qatoms, qwc])) )
+
             return E
 
         return energy_fn
