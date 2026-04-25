@@ -13,210 +13,27 @@ from jax.sharding import PartitionSpec as PSpec
 from ase.calculators.calculator import Calculator, all_changes
 
 from .data import compute_lattice_candidate
-from .utils import split, concat, load_model, norm_ortho_box, get_p3mlr_fn, get_p3mlr_grid_size, normal_mode_transform_fn
+from .utils import (split, concat, load_model, norm_ortho_box,
+                    get_p3mlr_fn, get_p3mlr_grid_size,
+                    reorder_by_device, get_mask_by_device)
+from .simulation_utils import (TypedNeighborList, typed_neighbor_list,
+                               typed_neighbor_list_fn,
+                               get_type_mask_fns, get_idx_mask_fn,
+                               min_image_unwrap, print_run_profile,
+                               prepare_dumps, write_dump_frame,
+                               stack_typed_nbrs_per_bead)
+# Back-compat re-export; the ASE calculator now lives in ase_calc.py.
+from .ase_calc import DPJaxCalculator  # noqa: F401
 from .routine import *
 from .routine import _parse_couple_axes
+from . import pimd as _pimd
 from typing import Callable
 from functools import partial
 
 MASS_UNIT_CONVERSION = 1.036427e2 # from Dalton to eV * fs^2 / Å^2
 TEMP_UNIT_CONVERSION = 8.617333e-5 # from Kelvin to eV
 PRESS_UNIT_CONVERSION = 6.241509e-7 # from bar to eV / Å^3
-HBAR = 6.582119569e-16 * 1E15  # reduced Planck's constant, eV * fs
 
-def reorder_by_device(coord, type_count):
-    '''
-        For multiple devices, ghost atoms are padded to ensure equal partitioning.
-        Each type of atom is padded and partitioned separately and then concatenated.
-    '''
-    K = jax.device_count()
-    coord = jnp.concatenate(
-                [
-                    jnp.pad(c,
-                            ((0,-c.shape[0]%K),)+((0,0),)*(c.ndim-1)
-                        ).reshape(K,-1,*c.shape[1:])
-                    for c in split(coord,type_count)
-                ], axis=1).reshape(-1, *coord.shape[1:])
-    return jax.lax.with_sharding_constraint(coord, PSpec())
-
-def get_mask_by_device(type_count):
-    '''
-        For multiple-device partitioning, ghost atoms are padded.
-        Returns a binary mask indicating the valid atoms, sharded by device.
-    '''
-    K = jax.device_count()
-    mask = concat([
-                concat([jnp.ones(count, dtype=bool),
-                        jnp.zeros((-count%K,), dtype=bool)
-                        ]).reshape(K,-1)
-                for count in type_count
-                ],
-            axis=1).reshape(-1)
-    # ensure mask is sharded by device
-    return jax.lax.with_sharding_constraint(mask, PSpec('atom'))
-
-def get_type_mask_fns(type_count):
-    '''
-        Returned type_mask_fns filter nbrs.idx by atom type.
-        Padded ghost atoms are excluded.
-        This can be used to postprocess neighbor indices,
-        and can also be added as a custom_mask_function in jax_md.neighbor_list.
-    '''
-    type_mask_fns = []
-    K = jax.device_count()
-    full_mask = get_mask_by_device(type_count)
-    type_count_each = -(-np.array(type_count)//K)        # type_count for each device after padding
-    type_idx_each = np.cumsum([0] + list(type_count_each)) # type_idx for each device after padding
-    N_each = type_idx_each[-1] # number of atoms for each device after padding
-    for i in range(len(type_count)):
-        # filter neighbor atoms by type i; idx = nbrs.idx returned by jax_md
-        def mask_fn(idx, i=i): 
-            idx = jax.lax.with_sharding_constraint(idx, PSpec('atom'))
-            valid_center_atom = full_mask[:,None]
-            valid_type_neighbor_atom = idx%N_each >= type_idx_each[i]
-            valid_type_neighbor_atom *= idx%N_each < type_idx_each[i+1]
-            valid_neighbor_atom = (idx-type_idx_each[i]-(idx//N_each)*(N_each-type_count_each[i]) < type_count[i])
-            is_neighbor = (idx < N_each * K)
-            filter = valid_center_atom * valid_type_neighbor_atom * valid_neighbor_atom * is_neighbor
-            return jnp.where(filter, idx, N_each * K)
-        type_mask_fns.append(mask_fn)
-    return type_mask_fns
-
-def get_idx_mask_fn(type_count):
-    '''
-        Returned idx_mask_fn that filters out ghost atoms from nbrs.idx.
-    '''
-    full_mask = get_mask_by_device(type_count)
-    idx_mask_out = np.arange(len(full_mask))[~np.array(full_mask)]
-    def idx_mask_fn(idx):
-        idx = jax.lax.with_sharding_constraint(idx, PSpec('atom'))
-        filter = full_mask[:,None] * jnp.isin(idx, idx_mask_out, invert=True)
-        return jnp.where(filter, idx, len(full_mask))
-    return idx_mask_fn
-
-@jax_md.dataclasses.dataclass
-class TypedNeighborList():
-    '''
-        Wraps jax_md.partition.NeighborList with typed lists.
-    '''
-    nbrs: jax_md.partition.NeighborList
-    knbr: list[int] = jax_md.dataclasses.static_field()
-    nbrs_nm: list[list[jnp.ndarray]]
-    reference_box: jax.Array
-    did_buffer_overflow: bool = False
-    @property
-    def idx(self) -> jax.Array:
-        return self.nbrs.idx
-    @property
-    def reference_position(self) -> jax.Array:
-        return self.nbrs.reference_position
-
-@jax_md.dataclasses.dataclass
-class typed_neighbor_list_fn():
-    '''A struct containing functions to allocate and update neighbor lists.'''
-    allocate: Callable = jax_md.dataclasses.static_field()
-    update: Callable = jax_md.dataclasses.static_field()
-
-def typed_neighbor_list(box, type_idx, type_count, rcut, buffer_ratio=1.2):
-    '''
-        Returns a typed neighbor list function that can be used to allocate and update neighbor lists.
-        allocate_fn() and update_fn() accept real space coordinates but processes internally in fractional coordinates.
-    '''
-    type_idx = np.array(type_idx, dtype=int)
-    type_count = tuple(type_count)
-    reference_box = box.astype(jnp.float32) # box at creation of typed_neighbor_list_fn; pass only this box to jax_md.neighbor_list
-    type_mask_fns = get_type_mask_fns(type_count)
-    idx_mask_fn = get_idx_mask_fn(type_count)
-    
-    def canonicalize(coord, box=reference_box):
-        # scale coord to reference_box and store in float32 fractional coordinates
-        box = box.astype(jnp.float32)
-        scale = reference_box / box  # (3,) per-axis; works for iso and semi_iso
-        coord = coord[type_idx.argsort(kind='stable')]
-        coord = (coord.astype(jnp.float32) % box) * scale
-        # shrink by 1e-7 from the boundary to avoid numerical issues
-        coord = coord * (1-5e-7)
-        # reorder and partition to multiple devices
-        coord = reorder_by_device(coord, type_count)
-        return coord
-    
-    # allocate function: non-jit-compatible
-    def allocate_fn(coord, box=reference_box):
-        coord = canonicalize(coord, box)
-        displacement_fn = jax_md.space.periodic(reference_box)[0]
-        # Measure the exact size of max neighbors for each atom type
-        test_nbr = jax_md.partition.neighbor_list(displacement_fn,
-                                                  reference_box,
-                                                  rcut * (reference_box / box).max(), # worst-case per-axis shrink
-                                                  capacity_multiplier=1.,
-                                                  custom_mask_function=idx_mask_fn
-                                                ).allocate(coord)
-        knbr = np.array([
-                (type_mask(test_nbr.idx) < len(coord)).sum(1).max()
-                for type_mask in type_mask_fns
-            ])
-        # Bloat knbr by buffer_ratio; also ensure if buffer_ratio += 0.05, knbr at least +1
-        knbr = np.where(knbr == 0,
-                        1,
-                        1 + (knbr * buffer_ratio + 
-                            np.maximum(20 - knbr,0) * max(buffer_ratio-1.2,0)))
-        knbr = list(knbr.astype(int))
-        print(f'# Neighborlist allocated with size {np.array(knbr) - 1}, rcut_plus_skin = {rcut}, buffer_ratio = {buffer_ratio}')
-        # infer a total buffer from the max neighbors of each type
-        total_buffer_ratio = (sum(knbr)+1.01) / test_nbr.idx.shape[1]
-        # Allocate the neighbor list with the inferred buffer ratio
-        nbrs = jax_md.partition.neighbor_list(displacement_fn,
-                                              box,
-                                              rcut * (reference_box / box).max(), # worst-case per-axis shrink
-                                              capacity_multiplier=total_buffer_ratio * 1.1,
-                                              custom_mask_function=idx_mask_fn
-                                            ).allocate(coord)
-        nbrs_nm, overflow = get_nm(nbrs, knbr)
-        return TypedNeighborList(nbrs=nbrs,
-                                 knbr=knbr,
-                                 nbrs_nm=nbrs_nm,
-                                 did_buffer_overflow=overflow,
-                                 reference_box=reference_box)
-    
-    # update function: jit-compatible
-    def update_fn(coord, typed_nbrs, box=reference_box):
-        coord = canonicalize(coord, box)
-        typed_nbrs = typed_nbrs.set(nbrs=typed_nbrs.nbrs.update(coord))
-        nbrs_nm, overflow = get_nm(typed_nbrs.nbrs, typed_nbrs.knbr)
-        return typed_nbrs.set(nbrs_nm=nbrs_nm,
-                              did_buffer_overflow=overflow|typed_nbrs.did_buffer_overflow)
-    
-    def get_nm(nbrs, knbr):
-        '''
-            Get neighbor idx as a nested list of device-sharded arrays.
-            nbrs_nm[i][j] for type i center atoms with neighbor type j.
-            Entries stand for atom indices after device partitioning.
-        '''
-
-        # ensure idx is sharded by device
-        K = jax.device_count()
-        nbr_idx = jax.lax.with_sharding_constraint(nbrs.idx, PSpec('atom'))
-        # take knbr[i] smallest indices for type i
-        nbrs_idx = [-jax.lax.top_k(-fn(nbr_idx), k)[0]
-                    for fn,k in zip(type_mask_fns, knbr)]
-        type_count_each = -(-np.array(type_count)//K)        # type_count for each device after padding
-        type_idx_each = np.cumsum([0] + list(type_count_each)) # type_idx for each device after padding
-        # convert idx to each type pair; this is a bit tricky
-        nbrs_nm = [mlist for mlist in 
-                   zip(*[split(jnp.where(nbrs < type_idx_each[-1]*K,
-                                         nbrs - type_idx_each[i] - (nbrs//type_idx_each[-1]) * (type_idx_each[-1] - type_count_each[i]),
-                                         type_idx_each[-1]*K
-                                    ), type_count_each, K=K)
-                        for i, nbrs in enumerate(nbrs_idx)
-                        ])]
-        overflow = nbrs.did_buffer_overflow | jnp.array([
-                                    (idx.max(axis=1)<type_idx_each[-1]*K).any()
-                                    for idx in nbrs_idx
-                                    ]).any()
-        nbrs_nm = [[n[:,:-1] for n in nbrs_m] for nbrs_m in nbrs_nm]
-        return nbrs_nm, overflow
-    
-    return typed_neighbor_list_fn(allocate=allocate_fn, update=update_fn)
 
 
 class Simulation:
@@ -262,6 +79,7 @@ class Simulation:
                  fixed_indices: Optional[List[int]] = None,
                  couple_axes: tuple = ((0, 1, 2),),
                  n_bead=1,
+                 type_symbols: Optional[List[str]] = None,
                 ):
         '''
             Initialize a Simulation instance.
@@ -269,7 +87,7 @@ class Simulation:
             box: box size, scalar or (3,) or (3,3)
             type_idx: list of atom types, length = n_atoms
             mass: atomic mass for each type, length = number of atom types
-            routine: simulation routine, currently limited to 'NVE', 'NVT', 'NPT', where NVT/NPT uses Nose-Hoover thermostat/barostat
+            routine: 'NVE', 'NVT', 'NVT_langevin', or 'NPT'. 'NVT'/'NPT' use Nose-Hoover; 'NVT_langevin' wraps jax_md's BAOAB Langevin thermostat (friction = 1/tau_t). When n_bead > 1 and routine='NVT', the integrator switches to path-integral MD (ring-polymer BAOAB with PILE-L thermostat).
             dt: time step size (fs)
             initial_position: shape = (n_atoms, 3)
             initial_velocity: shape = (n_atoms, 3); if None, use temperature to generate; if temperature is also None, use 0.
@@ -287,8 +105,10 @@ class Simulation:
             chain_length: Nose-Hoover thermostat/barostat chain length
             chain_steps: Nose-Hoover thermostat/barostat chain steps
             sy_steps: Nose-Hoover thermostat/barostat number of Suzuki-Yoshida steps (must be 1,3,5,7)
+            type_symbols: chemical symbols per atom type (e.g. ['O','H']); required only to use dump_* kwargs on run() since XYZ output needs element labels.
             fixed_indices: zero-based indices of atoms that should remain fixed (constrained position) in the simulation.
             couple_axes: NPT-only partition of a subset of {0,1,2} into coupled groups. Each inner tuple lists axes sharing one scale factor; axes not listed are held fixed. Examples: ((0,1,2),) iso (default); ((0,1),) semi-iso (xy couple, z fixed); ((0,),) uniaxial (only x moves); ((0,),(1,),(2,)) fully anisotropic ortho; ((0,1),(2,)) xy couple + z independent.
+            n_bead: number of ring-polymer beads. 1 (default) = classical MD. n_bead > 1 switches routine='NVT' to path-integral MD using PILE-L thermostat (internal modes critically damped, centroid friction = 1/tau_t). initial_position may be (N,3) (replicated across beads) or (P,N,3).
             ############################
             Usage:
                 sim = Simulation(...)
@@ -297,24 +117,55 @@ class Simulation:
         initial_position = jnp.array(initial_position) * jnp.ones(1) # Ensure default precision
         self.report_interval = int(report_interval)
         self.log = []
-        ### MODIFY!!
-        self._n_bead = n_bead
-        if n_bead == 1:
+        self._n_bead = int(n_bead)
+        self._is_pimd = self._n_bead > 1
+        if self._is_pimd:
+            if routine != 'NVT':
+                raise NotImplementedError(
+                    "Path-integral MD (n_bead > 1) currently only supports routine='NVT'.")
+            if fixed_indices is not None:
+                raise NotImplementedError("fixed_indices is not supported with n_bead > 1.")
+            if len(model_deviation_paths) > 0:
+                raise NotImplementedError("model_deviation_paths is not supported with n_bead > 1.")
+            if remove_com_motion:
+                raise NotImplementedError("remove_com_motion is not supported with n_bead > 1.")
+            # Accept (N,3) -> replicate to (P,N,3); or (P,N,3) used verbatim.
+            if initial_position.ndim == 2:
+                initial_position = jnp.broadcast_to(
+                    initial_position, (self._n_bead,) + initial_position.shape
+                ).astype(initial_position.dtype)
+            elif initial_position.ndim == 3:
+                if initial_position.shape[0] != self._n_bead:
+                    raise ValueError(
+                        f"initial_position leading axis {initial_position.shape[0]} "
+                        f"does not match n_bead={self._n_bead}.")
+            else:
+                raise ValueError(
+                    "initial_position must have shape (N,3) or (P,N,3).")
+            self._natoms = initial_position.shape[1]
+            self._temperature = temperature  # physical T; kT_eff = P*kT is built below
+            self._nm_freqs, self._nm_trans = _pimd.normal_mode_transform(
+                self._n_bead, temperature * TEMP_UNIT_CONVERSION)
+        else:
             self._natoms = initial_position.shape[0]
             self._temperature = temperature
-        elif n_bead > 1:
-            self._natoms = initial_position.shape[1]    # For PIMD, initial_position.shape = (n_bead, n_atom, dimen)
-            self._nm_freqs, self._nm_trans = normal_mode_transform_fn(n_bead, temperature * TEMP_UNIT_CONVERSION, HBAR)
-            self._temperature = temperature * n_bead    # For PIMD, the effective temp = temp * #beads
         self._dt = dt
         self._routine = routine
         self._type_idx = np.array(type_idx).astype(int)
         self._mass = jnp.array(np.array(mass)[np.array(self._type_idx)]) # AMU
+        if type_symbols is not None:
+            n_types_needed = int(self._type_idx.max()) + 1
+            if len(type_symbols) < n_types_needed:
+                raise ValueError(
+                    f"type_symbols has length {len(type_symbols)} but type_idx "
+                    f"references types up to {n_types_needed - 1}.")
+        self._type_symbols = list(type_symbols) if type_symbols is not None else None
         self._model, self._variables = load_model(model_path)
         type_count = np.bincount(self._type_idx)
         self._type_count = np.pad(type_count, (0, self._model.params['ntypes'] - len(type_count)))
         self._debug = debug
-        self._step_chunk_size = max(10, min(100, 100000 // self._natoms))
+        # Chunk memory budget ~ chunk_size * n_bead * natoms.
+        self._step_chunk_size = max(10, min(100, 100000 // (self._natoms * self._n_bead)))
         self._model_deviation_paths = model_deviation_paths
         self._use_model_deviation = len(model_deviation_paths) > 0
         self._remove_com_motion = remove_com_motion
@@ -368,7 +219,7 @@ class Simulation:
         if self._routine == "NVE":
             self._routine_fn = jax_md.simulate.nve
             self._routine_args = {}
-        elif self._routine == "NVT":
+        elif self._routine == "NVT" and not self._is_pimd:
             self._routine_fn = jax_md.simulate.nvt_nose_hoover
             self._routine_args = {
                 'kT': self._temperature * TEMP_UNIT_CONVERSION,
@@ -377,24 +228,23 @@ class Simulation:
                 'chain_steps': chain_steps_t,
                 'sy_steps': sy_steps_t,
             }
-        ### MODIFY!!
+        elif self._routine == "NVT" and self._is_pimd:
+            # PILE-L: critically damped internal modes, centroid friction = 1/tau_t.
+            gamma = 2.0 * self._nm_freqs
+            gamma[0] = 1.0 / tau_t
+            self._routine_fn = _pimd.nvt_langevin_pimd
+            self._routine_args = {
+                'kT_eff': self._temperature * self._n_bead * TEMP_UNIT_CONVERSION,
+                'gamma_P': jnp.asarray(gamma),
+                'nm_trans': jnp.asarray(self._nm_trans),
+            }
         elif self._routine == "NVT_langevin":
-            if n_bead == 1:
-                self._routine_fn = jax_md.simulate.nvt_langevin
-                self._routine_args = {
-                    'kT': self._temperature * TEMP_UNIT_CONVERSION,
-                }
-            else:
-                self._routine_fn = nvt_langevin_pimd
-                gamma = 2 * self._nm_freqs
-                gamma[0] = 1 / tau_t
-                self._routine_args = {
-                    'kT': self._temperature * TEMP_UNIT_CONVERSION,
-                    'gamma': jnp.array(np.repeat(gamma, self._natoms)).reshape(-1, 1),
-                    'natoms': self._natoms,
-                    'n_bead': self._n_bead,
-                    'nm_trans': jnp.array(self._nm_trans),
-                }
+            # Thin wrapper around jax_md's reference Langevin NVT integrator.
+            self._routine_fn = jax_md.simulate.nvt_langevin
+            self._routine_args = {
+                'kT': self._temperature * TEMP_UNIT_CONVERSION,
+                'gamma': 1.0 / tau_t,
+            }
         elif self._routine == "NPT":
             box33 = jnp.diag(self._initial_box) if self._initial_box.shape == (3,) else self._initial_box
             initial_position = initial_position @ jnp.linalg.inv(box33)
@@ -419,7 +269,8 @@ class Simulation:
             }
             self._pressure = pressure
         else:
-            raise NotImplementedError("routine currently limited to 'NVE', 'NVT', 'NPT'")
+            raise NotImplementedError(
+                "routine currently limited to 'NVE', 'NVT', 'NVT_langevin', 'NPT'")
         print(f"# Initialized {self._routine} simulation with {self._natoms} atoms")
 
         # Initialize neighbor list if needed
@@ -440,13 +291,22 @@ class Simulation:
             self.setVelocity(initial_velocity)
 
     def _gen_fn(self):
-        ''' 
+        '''
             Generate the energy function and relevant functions.
             Need to regenerate when static_args changes.
             Beware of the order of functions here, as some functions depend on previous generated functions.
             Neighbor list functions are generated in _construct_nbr_and_nbr_fn separately.
         '''
-        self._energy_fn = self._get_energy_fn()
+        # ML potential only (reported as PE). The ring-polymer spring term,
+        # if present, is added on top below to produce the integrator energy.
+        self._ml_energy_fn = self._get_energy_fn()
+        spring_fn = self._get_spring_energy_fn()  # None unless PIMD
+        if spring_fn is None:
+            self._energy_fn = self._ml_energy_fn
+        else:
+            def _total_energy_with_spring(coord, **kwargs):
+                return self._ml_energy_fn(coord, **kwargs) + spring_fn(coord, **kwargs)
+            self._energy_fn = _total_energy_with_spring
         if self._mobile is not None:
             _inner_energy_fn = self._energy_fn
             def _constrained_energy_fn(coord, **kwargs):
@@ -506,10 +366,24 @@ class Simulation:
             qwc = jnp.array(np.repeat(model.params['dplr_q_wc'],
                                       [self._type_count[i] for i in wc_model.params['nsel']]))
 
+        def _single_conf_energy(coord, box, nbrs_nm):
+            '''Evaluate the ML (and optional DPLR) potential on one configuration.'''
+            E = model.apply(variables, coord, box, self._static_args, nbrs_nm)[0]
+            if model.params['type'] == 'dplr':
+                wc = wc_model.wc_predict(
+                    wc_variables, coord, box, self._static_args, nbrs_nm)
+                E = E + p3mlr_fn(
+                    jnp.concatenate([coord, wc]),
+                    jnp.concatenate([qatoms, qwc]),
+                    jnp.diag(box),
+                )
+            return E
+
         def energy_fn(coord, nbrs_nm, perturbation=1., **kwargs):
             '''
-                Energy function that can be used in jax_md.simulate routines.
-                You can customize the energy function here, i.e. if you want to add perturbations.
+                ML (and optional DPLR) potential energy.
+                coord is (N, 3) normally, or (P, N, 3) under PIMD in which case
+                the result is the bead-averaged potential <V>_beads.
             '''
             # if box in kwargs, use it else self._current_box, and convert to (3,3)
             box = kwargs['box'] if 'box' in kwargs else self._current_box
@@ -520,59 +394,51 @@ class Simulation:
             # NPT is computed in fractional coordinates; but we need real space forces returned by grad(energy_fn)
             if 'NPT' in self._routine:
                 coord = jax.lax.stop_gradient(coord @ box) + coord - jax.lax.stop_gradient(coord)
-            # Atoms are reordered and grouped by type in neural network inputs
-            coord = coord[self._type_idx.argsort(kind='stable')]
+            # Atoms are reordered and grouped by type in neural network inputs.
+            # Applied along the atom axis, which is the last-but-one axis for
+            # both (N,3) and (P,N,3).
+            coord = coord[..., self._type_idx.argsort(kind='stable'), :]
             # perturbation = 1, required by jax-md pressure calculation
             coord = coord * perturbation
             box = box * perturbation
-            # Ensure coord and box is replicated on all devices
             coord = jax.lax.with_sharding_constraint(coord, PSpec())
             box = jax.lax.with_sharding_constraint(box, PSpec())
 
-            # Energy calculation
-            if self._n_bead == 1:
-                E = model.apply(variables,
-                                coord,
-                                box,
-                                self._static_args,
-                                nbrs_nm)[0]
-                if model.params['type'] == 'dplr':
-                    wc = wc_model.wc_predict(wc_variables,
-                                            coord,
-                                            box,
-                                            self._static_args,
-                                            nbrs_nm)
-                    E = E + p3mlr_fn(jnp.concatenate([coord, wc]),
-                                    jnp.concatenate([qatoms, qwc]),
-                                    jnp.diag(box))
-            elif self._n_bead > 1:
-                ### MODIFY!!
-                coord_reshape = coord   # coord.reshape(self._n_bead, self._natoms//self._n_bead, 3)
-                E = jax.vmap(model.apply, in_axes=(None, 0, None, None, None)) \
-                                                (variables,
-                                                coord_reshape,
-                                                box,
-                                                self._static_args,
-                                                nbrs_nm)[0]         # (n_bead, )
-                E = jnp.sum(E)     
-                ### MODIFY!! Add spring energy
-                nm_coord_reshape = jnp.tensordot(self._nm_trans.T, coord_reshape, axes=(1, 0))   # (n_bead, n_atoms, dimen)
-                E = E + 0.5 * jnp.sum((self._mass * MASS_UNIT_CONVERSION)[None, :, None] * self._nm_freqs[:, None, None]**2 * nm_coord_reshape**2)
-
-                if model.params['type'] == 'dplr':
-                    wc = jax.vmap(wc_model.wc_predict, in_axes=(None, 0, None, None, None)) \
-                                                (wc_variables,
-                                                coord_reshape,
-                                                box,
-                                                self._static_args,
-                                                nbrs_nm)            # (n_bead, n_wc, dimen)
-                    E = E + jnp.sum( jax.vmap(p3mlr_fn, in_axes=(0, None)) \
-                                                    (jnp.concatenate([coord_reshape, wc], axis=1),
-                                                     jnp.concatenate([qatoms, qwc])) )
-
-            return E
+            if not self._is_pimd:
+                return _single_conf_energy(coord, box, nbrs_nm)
+            # Bead axis vmapped; neighbor lists (when used) are per-bead, box shared.
+            nbrs_axes = None if nbrs_nm is None else 0
+            E_per_bead = jax.vmap(
+                _single_conf_energy, in_axes=(0, None, nbrs_axes)
+            )(coord, box, nbrs_nm)                                   # (P,)
+            return jnp.sum(E_per_bead) / self._n_bead
 
         return energy_fn
+
+    def _get_spring_energy_fn(self):
+        '''
+            Ring-polymer spring energy as a function of position (P, N, 3),
+            or None outside PIMD. Beads are minimum-image-shifted onto a common
+            periodic image before the normal-mode transform.
+        '''
+        if not self._is_pimd:
+            return None
+        nm_trans = jnp.asarray(self._nm_trans)           # (P, P)
+        nm_freqs = jnp.asarray(self._nm_freqs)           # (P,)
+        mass_eV = self._mass * MASS_UNIT_CONVERSION      # (N,)
+
+        def spring_energy(coord, **kwargs):
+            box = kwargs.get('box', self._current_box)
+            coord = _pimd.unwrap_across_beads(coord, box)
+            # Normal-mode coordinates q_alpha = sum_k (C.T)_alpha,k R_k.
+            # V_spring = 0.5 sum_{alpha,i} m_i omega_alpha^2 |q_alpha,i|^2.
+            q_nm = jnp.tensordot(nm_trans.T, coord, axes=(1, 0))      # (P, N, 3)
+            return 0.5 * jnp.sum(
+                mass_eV[None, :, None]
+                * (nm_freqs[:, None, None] ** 2)
+                * (q_nm ** 2)
+            )
+        return spring_energy
 
     def _check_if_use_neighbor_list(self):
         '''
@@ -604,27 +470,29 @@ class Simulation:
             You can customize report functions with the same signature.
         '''
         _temp_dof_scale = self._natoms / int(np.sum(self._mobile)) if self._mobile is not None else 1
+        # Under PIMD, momenta sample at kT_eff = n_bead * kT; divide out for physical T.
+        _pimd_temp_scale = (1.0 / self._n_bead) if self._is_pimd else 1.0
         self._reporters = {
             "Temperature": lambda state, _: jax_md.quantity.temperature(
                                                             velocity=state.velocity,
                                                             mass=state.mass,
-                                                        ) / TEMP_UNIT_CONVERSION * _temp_dof_scale,
+                                                        ) / TEMP_UNIT_CONVERSION * _temp_dof_scale * _pimd_temp_scale,
             "KE": lambda state, _: jax_md.quantity.kinetic_energy(
                                                     velocity=state.velocity,
                                                     mass=state.mass,
                                                 ),
-            "PE": lambda state, nbrs_nm: self._energy_fn(
+            "PE": lambda state, nbrs_nm: self._ml_energy_fn(
                                     state.position,
                                     box=state.box if "NPT" in self._routine else self._initial_box,
                                     nbrs_nm=nbrs_nm,
-                                ),                 
+                                ),
             }
 
         if self._routine == "NVE":
             self._reporters["Invariant"] = lambda state, nbrs_nm: \
                                             self._reporters["KE"](state, nbrs_nm) + \
                                             self._reporters["PE"](state, nbrs_nm)
-        elif self._routine == "NVT":
+        elif self._routine == "NVT" and not self._is_pimd:
             self._reporters["Invariant"] = lambda state, nbrs_nm: nvt_nose_hoover_invariant(
                                             self._energy_fn,
                                             state,
@@ -689,15 +557,22 @@ class Simulation:
 
     def _construct_nbr_and_nbr_fn(self, position=None):
         '''
-            Initial construction, or reconstruction when dr_buffer_neighbor or neighbor_buffer_ratio changes.
+            Initial construction, or reconstruction when dr_buffer_neighbor or
+            neighbor_buffer_ratio changes. Under PIMD, replicas are stacked
+            along a leading P axis (see stack_typed_nbrs_per_bead).
         '''
         self._typed_nbr_fn = typed_neighbor_list(self._current_box,
                                                  self._type_idx,
                                                  self._type_count,
                                                  self._model.params['rcut'] + self._neighbor_skin,
                                                  self._neighbor_buffer_ratio)
-        self._typed_nbrs = self._typed_nbr_fn.allocate(self._getRealPosition(position),
-                                                       box=self._current_box)
+        real_pos = self._getRealPosition(position)
+        if self._is_pimd:
+            self._typed_nbrs = stack_typed_nbrs_per_bead(
+                self._typed_nbr_fn, real_pos, self._current_box, self._n_bead)
+        else:
+            self._typed_nbrs = self._typed_nbr_fn.allocate(
+                real_pos, box=self._current_box)
 
     def _get_check_hard_overflow_fn(self):
 
@@ -710,6 +585,7 @@ class Simulation:
                     4: Neighbor list buffer overflow the previous step/chunk
                     8: Lattice overflow: Increase lattice candidate/neighbor count
                     16: Nan or Inf encountered in coordinates or velocities
+                Under PIMD the overflow flag reduces across beads via .any().
             '''
             error_code = 0
             if self._static_args['use_neighbor_list']:
@@ -719,7 +595,7 @@ class Simulation:
                     error_code += ((shrink >
                                     0.8 * self._neighbor_skin / (self._model.params['rcut'] + self._neighbor_skin))
                                     | (state.box.min() < 2 * (self._model.params['rcut'] + self._neighbor_skin) * 1.02))
-                error_code += 2 * (typed_nbrs.did_buffer_overflow > 0)
+                error_code += 2 * (jnp.asarray(typed_nbrs.did_buffer_overflow).any() > 0)
             is_nan = jnp.isnan(state.position).any() | jnp.isnan(state.velocity).any()
             is_inf = jnp.isinf(state.position).any() | jnp.isinf(state.velocity).any()
             error_code += 16 * (is_nan | is_inf)
@@ -744,8 +620,12 @@ class Simulation:
                 self._neighbor_buffer_ratio += 0.05
                 self._construct_nbr_and_nbr_fn()
             else: # Neighbor list buffer overflow once, simply reallocate
-                self._typed_nbrs = self._typed_nbr_fn.allocate(self._getRealPosition(),
-                                                               box=self._current_box)
+                if self._is_pimd:
+                    # Keep the stacked layout consistent; this reallocates every bead.
+                    self._construct_nbr_and_nbr_fn()
+                else:
+                    self._typed_nbrs = self._typed_nbr_fn.allocate(
+                        self._getRealPosition(), box=self._current_box)
             FLAG_4 = True
         elif self._error_code & 8: # Not fully implemented yet!!!
             self._static_args = self._get_static_args(self._state.position, use_neighbor_list=False)
@@ -775,57 +655,70 @@ class Simulation:
 
     def _get_soft_update_nbrs_fn(self):
         '''
-            A lazy jit-compatible update of neighbor list.
-            Intuition: only update if atoms have moved more than dr_buffer_neighbor/2.
+            Lazy jit-compatible neighbor list update: refresh only when atoms
+            have moved more than dr_buffer_neighbor/2. Under PIMD the drift
+            test reduces across beads and the stacked pytree is updated jointly.
         '''
+        rcut_static = self._model.params['rcut']
 
-        def soft_update_nbrs(typed_nbrs, position, box, profile):
-            scale = typed_nbrs.reference_box / box  # (3,); fixed axes stay 1
-            scaled_position = (position % box) * scale
+        def _drift_per_bead(typed_nbrs_single, position_N3, box):
+            scale = typed_nbrs_single.reference_box / box
+            scaled_position = (position_N3 % box) * scale
             scaled_position = scaled_position[self._type_idx.argsort(kind='stable')]
             scaled_position = reorder_by_device(scaled_position, self._type_count)
-            rcut, dr = self._model.params['rcut'], self._neighbor_skin
-            # Worst-case shrinkage across axes governs the allowed drift.
-            safe_scale = scale.max() * 1.02 if "NPT" in self._routine else scale.max()
-            allowed_movement = ((rcut + dr) - rcut * safe_scale) / 2
-            max_movement = norm_ortho_box(
-                                    scaled_position - typed_nbrs.reference_position,
-                                    typed_nbrs.reference_box
-                                ).max()
-            update_required = max_movement > allowed_movement - typed_nbrs.reference_box.min() * 1e-6
+            return norm_ortho_box(
+                scaled_position - typed_nbrs_single.reference_position,
+                typed_nbrs_single.reference_box,
+            ).max()
+
+        # Vmap the per-bead drift / update only when in PIMD; otherwise these
+        # are the no-op identities.
+        if self._is_pimd:
+            drift_fn = lambda nbrs, pos, box: jax.vmap(
+                _drift_per_bead, in_axes=(0, 0, None))(nbrs, pos, box).max()
+            ref_box_of = lambda nbrs: nbrs.reference_box[0]
+            update_fn = lambda nbrs, pos, box: jax.vmap(
+                lambda n, p: self._typed_nbr_fn.update(p, n, box=box),
+                in_axes=(0, 0))(nbrs, pos)
+        else:
+            drift_fn = _drift_per_bead
+            ref_box_of = lambda nbrs: nbrs.reference_box
+            update_fn = lambda nbrs, pos, box: self._typed_nbr_fn.update(
+                pos, nbrs, box=box)
+
+        def soft_update_nbrs(typed_nbrs, position, box, profile):
+            ref_box = ref_box_of(typed_nbrs)
+            scale_max = (ref_box / box).max()
+            safe_scale = scale_max * 1.02 if "NPT" in self._routine else scale_max
+            allowed_movement = ((rcut_static + self._neighbor_skin)
+                                - rcut_static * safe_scale) / 2
+            max_movement = drift_fn(typed_nbrs, position, box)
+            update_required = max_movement > allowed_movement - ref_box.min() * 1e-6
             profile = profile * (1 - 1/100) + 1/100 * update_required
             typed_nbrs = jax.lax.cond(
-                                update_required,
-                                lambda: self._typed_nbr_fn.update(
-                                    position,
-                                    typed_nbrs,
-                                    box=box),
-                                lambda: typed_nbrs
-                            )
+                update_required,
+                lambda: update_fn(typed_nbrs, position, box),
+                lambda: typed_nbrs,
+            )
             return typed_nbrs, profile
 
         return soft_update_nbrs
 
     def _unwrap_positions(self, previous_position, current_position, box):
-        '''
-            Unwrap positions to avoid discontinuities in trajectory.
-        '''
-        if "NPT" in self._routine:
-            current_position = previous_position + (current_position - previous_position + 0.5) % 1 - 0.5
-        else:
-            if box.size == 3:
-                current_position = previous_position + (current_position - previous_position + box/2) % box - box/2
-            else:
-                fractional_prev = previous_position @ jnp.linalg.inv(box)
-                fractional_curr = current_position @ jnp.linalg.inv(box)
-                fractional_curr = fractional_prev + (fractional_curr - fractional_prev + 0.5) % 1 - 0.5
-                current_position = fractional_curr @ box
-        return current_position
+        return min_image_unwrap(previous_position, current_position, box,
+                                fractional="NPT" in self._routine)
 
     def remove_com_motion(self):
         '''
-            Remove center-of-mass velocity from the current state.
+            Remove the center-of-mass velocity from the current state.
         '''
+        if self._is_pimd:
+            # mass is (N,1); velocity is (P,N,3). Sum over (beads, atoms) -> (3,).
+            total_mom = (self._state.velocity * self._state.mass).sum(axis=(0, 1))
+            total_mass = self._state.mass.sum() * self._n_bead
+            velocity = self._state.velocity - total_mom / total_mass
+            self.setVelocity(velocity)
+            return
         mask = self._mobile[:, None] if self._mobile is not None else jnp.ones_like(self._state.mass, dtype=bool)
         mobile_mass = self._state.mass * mask
         velocity = self._state.velocity - (self._state.velocity * mobile_mass).sum(0) / mobile_mass.sum()
@@ -866,10 +759,20 @@ class Simulation:
                 mobile_mass = state.mass * (self._mobile[:, None] if self._mobile is not None else jnp.ones_like(state.mass, dtype=bool))
                 velocity = state.velocity - (state.velocity * mobile_mass).sum(0) / mobile_mass.sum()
                 state = state.set(momentum=state.mass * velocity)
+            pos_stored = (state.position * state.box if "NPT" in self._routine
+                          else state.position)
+            box_for_centroid = (state.box if "NPT" in self._routine
+                                else self._initial_box)
+            # Under PIMD, emit the centroid with a minimum-image reduction.
+            if self._is_pimd:
+                centroid_frame = _pimd.centroid(pos_stored, box_for_centroid)
+            else:
+                centroid_frame = pos_stored
             return ((state, typed_nbrs, error_code, profile),
-                    (state.position * state.box if "NPT" in self._routine else state.position,
-                     state.velocity, 
+                    (pos_stored,
+                     state.velocity,
                      state.box if "NPT" in self._routine else self._initial_box,
+                     centroid_frame,
                     ))
 
         @partial(jax.jit, static_argnums=(1,))
@@ -881,46 +784,74 @@ class Simulation:
 
         return multiple_inner_step
 
-    def _initialize_run(self, steps):
+    def _initialize_run(self, steps, has_dumps=False):
         '''
-            Reset trajectory for each new run; 
-            if the simulation has not been run before, include the initial state.
-            Initialize run variables.
+            Reset trajectory for each new run; if the simulation has not been
+            run before, include the initial state. When has_dumps=True, skip
+            the in-memory trajectory buffers entirely and stream to disk.
         '''
         print(f'# Running {steps} steps...')
         traj_length = steps + int(self._is_initial_state)
         self._offset = self.step - int(self._is_initial_state)
         traj_dtype = np.float64 if jax.config.read('jax_enable_x64') else np.float32
-        # preallocate space for trajectory
-        try:
-            safe_buffer = np.zeros((traj_length, 5*self._natoms, 3), dtype=traj_dtype)
-            del safe_buffer
-            gc.collect()
-            self._position_trajectory = np.zeros((traj_length, self._natoms, 3), dtype=traj_dtype)
-            self._velocity_trajectory = np.zeros((traj_length, self._natoms, 3), dtype=traj_dtype)
-            self._box_trajectory = np.zeros((traj_length,) + self._current_box.shape, dtype=traj_dtype)
-        except MemoryError:
-            raise MemoryError("Trajectory too large to fit in CPU RAM. Please split into multiple shorter runs and save/postprocess the segment after each run.")
-        try:
-            safe_buffer = np.zeros((traj_length, 10*self._natoms, 3), dtype=traj_dtype)
-        except MemoryError:
-            print("# Warning: A long trajectory may exhaust CPU RAM. It is safer to split into multiple shorter runs and save/postprocess the segment after each run.")
-        if self._is_initial_state:
-            self._position_trajectory[0] = self.getPosition()
-            self._velocity_trajectory[0] = self.getVelocity()
-            self._box_trajectory[0] = self.getBox()
+        self._has_dumps = has_dumps
+        if not has_dumps:
+            # preallocate space for trajectory
+            frame_shape = ((self._n_bead, self._natoms, 3) if self._is_pimd
+                           else (self._natoms, 3))
+            centroid_shape = (self._natoms, 3)
+            natoms_eff = self._n_bead * self._natoms
+            try:
+                safe_buffer = np.zeros((traj_length, 5*natoms_eff, 3), dtype=traj_dtype)
+                del safe_buffer
+                gc.collect()
+                self._position_trajectory = np.zeros((traj_length,) + frame_shape, dtype=traj_dtype)
+                self._velocity_trajectory = np.zeros((traj_length,) + frame_shape, dtype=traj_dtype)
+                self._box_trajectory = np.zeros((traj_length,) + self._current_box.shape, dtype=traj_dtype)
+                if self._is_pimd:
+                    self._centroid_trajectory = np.zeros((traj_length,) + centroid_shape, dtype=traj_dtype)
+            except MemoryError:
+                raise MemoryError("Trajectory too large to fit in CPU RAM. Please pass dump_position=... (and friends) to stream to disk, or split into multiple shorter runs.")
+            try:
+                safe_buffer = np.zeros((traj_length, 10*natoms_eff, 3), dtype=traj_dtype)
+            except MemoryError:
+                print("# Warning: A long trajectory may exhaust CPU RAM. Consider dump_position=... to stream to disk.")
+            if self._is_initial_state:
+                self._position_trajectory[0] = self.getPosition()
+                self._velocity_trajectory[0] = self.getVelocity()
+                self._box_trajectory[0] = self.getBox()
+                if self._is_pimd:
+                    self._centroid_trajectory[0] = self.getCentroidPosition()
         self._tic_of_this_run = time()
         self._tic_between_report = time()
         self._error_code = 0
         self._print_report()
+        self._is_initial_state_at_run_start = self._is_initial_state
         self._is_initial_state = False
 
-    def run(self, steps):
+    def run(self, steps,
+            dump_position: Optional[str] = None,
+            dump_velocity: Optional[str] = None,
+            dump_centroid: Optional[str] = None,
+            dump_interval: Optional[int] = None):
         '''
-            Run the simulation for a number of steps.
+            Run for ``steps`` steps. Returns a trajectory dict, or ``None`` if
+            any ``dump_*`` kwarg is given (frames stream to XYZ instead).
         '''
+        dumps, write_interval = prepare_dumps(
+            {'position': dump_position, 'velocity': dump_velocity,
+             'centroid': dump_centroid},
+            self._type_idx, self._type_symbols, self._n_bead,
+            default_interval=self.report_interval, dump_interval=dump_interval)
+        has_dumps = len(dumps) > 0
 
-        self._initialize_run(steps)
+        self._initialize_run(steps, has_dumps=has_dumps)
+        if has_dumps and self._is_initial_state_at_run_start and (self.step % write_interval == 0):
+            write_dump_frame(dumps,
+                             self.getPosition(), self.getVelocity(),
+                             self.getCentroidPosition() if self._is_pimd else None,
+                             self._current_box)
+
         remaining_steps = steps
         while remaining_steps > 0:
 
@@ -952,11 +883,25 @@ class Simulation:
             self._neighbor_update_profile = profile
             if "NPT" in self._routine:
                 self._current_box = self._state.box
-            pos_traj, vel_traj, box_traj = traj
-            idx_l, idx_r = self.step - self._offset, self.step - self._offset + next_chunk
-            self._position_trajectory[idx_l:idx_r] = pos_traj
-            self._velocity_trajectory[idx_l:idx_r] = vel_traj
-            self._box_trajectory[idx_l:idx_r] = box_traj
+            pos_traj, vel_traj, box_traj, centroid_traj = traj
+            if has_dumps:
+                base = int(self.step)
+                for i in range(next_chunk):
+                    if (base + i + 1) % write_interval == 0:
+                        write_dump_frame(
+                            dumps,
+                            np.asarray(pos_traj[i]),
+                            np.asarray(vel_traj[i]),
+                            np.asarray(centroid_traj[i]) if self._is_pimd else None,
+                            np.asarray(box_traj[i]),
+                        )
+            else:
+                idx_l, idx_r = self.step - self._offset, self.step - self._offset + next_chunk
+                self._position_trajectory[idx_l:idx_r] = pos_traj
+                self._velocity_trajectory[idx_l:idx_r] = vel_traj
+                self._box_trajectory[idx_l:idx_r] = box_traj
+                if self._is_pimd:
+                    self._centroid_trajectory[idx_l:idx_r] = centroid_traj
             self.step += next_chunk
             remaining_steps -= next_chunk
 
@@ -966,22 +911,19 @@ class Simulation:
 
         self._print_run_profile(steps, time() - self._tic_of_this_run)
         self._keep_nbr_or_lattice_up_to_date()
+        if has_dumps:
+            return None
         trajectory = {
             'position': self._position_trajectory,
             'velocity': self._velocity_trajectory,
             'box': self._box_trajectory,
         }
+        if self._is_pimd:
+            trajectory['centroid'] = self._centroid_trajectory
         return trajectory
 
     def _print_run_profile(self, steps, elapsed_time):
-        '''
-            Print the profile of the run. Called at the end of each run(steps).
-        '''
-        steps_per_microsecond_per_atom = 1e-6 * steps * self._state.position.shape[0]/ (elapsed_time + 1e-6)
-        nanosecond_per_day = 1e-6 * steps * self._dt * (86400 / elapsed_time)
-        print('# Finished %d steps in %dh %dm %ds.' %
-                    (steps, elapsed_time // 3600, (elapsed_time % 3600) // 60, elapsed_time % 60))
-        print('# Performance: %.3f ns/day, %.3f step/μs/atom' % (nanosecond_per_day, steps_per_microsecond_per_atom))
+        print_run_profile(steps, elapsed_time, self._state.position.shape[0], self._dt)
 
     def _getRealPosition(self, position=None, box=None):
         '''
@@ -999,16 +941,29 @@ class Simulation:
 
     def getPosition(self):
         '''
-            Returns the current position (Å) of the atoms.
+            Returns the current position (Å). Shape (N, 3); (P, N, 3) under PIMD.
         '''
         return np.array(self._getRealPosition())
 
+    def getCentroidPosition(self):
+        '''
+            Ring-polymer centroid position (Å), shape (N, 3); identical to
+            getPosition() in classical MD. Beads are minimum-image-shifted
+            onto a common periodic image before averaging.
+        '''
+        pos = self._getRealPosition()
+        if self._is_pimd:
+            return np.array(_pimd.centroid(pos, self._current_box))
+        return np.array(pos)
+
     def setPosition(self, position, box=None):
         '''
-            Set the position (Å) of the atoms. Must be the same shape as the initial position representing the same atom types.
-            For NVE/NVT, box change is not allowed after initialization.
-            For NPT, box can be changed by providing the 'box' argument (Å).
+            Set the position (Å). Shape (N, 3); optionally (P, N, 3) for PIMD.
+            Box change is only allowed under NPT, via the 'box' argument.
         '''
+        position = jnp.asarray(position)
+        if self._is_pimd and position.ndim == 2:
+            position = jnp.broadcast_to(position, self._state.position.shape)
         if position.shape != self._state.position.shape:
             raise ValueError("Position must have the same shape as the initial position, or you have to create a new Simulation instance.")
         if box is not None:
@@ -1047,8 +1002,11 @@ class Simulation:
 
     def setVelocity(self, velocity):
         '''
-            Set the velocity (Å/fs) of the atoms. Must be the same shape as the initial position representing the same system.
+            Set the velocity (Å/fs). Shape (N, 3); optionally (P, N, 3) for PIMD.
         '''
+        velocity = jnp.asarray(velocity)
+        if self._is_pimd and velocity.ndim == 2:
+            velocity = jnp.broadcast_to(velocity, self._state.velocity.shape)
         if self._mobile is not None:
             velocity = velocity * self._mobile[:, None]
         self._state = self._state.set(momentum=self._state.mass * velocity)
@@ -1060,8 +1018,12 @@ class Simulation:
         if seed is None:
             seed = np.random.randint(1, 1e6)
         key = jax.random.PRNGKey(seed)
-        velocity = jax.random.normal(key, shape=self._state.velocity.shape, dtype=self._state.velocity.dtype)
-        velocity *= jnp.sqrt(TEMP_UNIT_CONVERSION * temperature / self._state.mass)
+        kT_eff = (temperature * TEMP_UNIT_CONVERSION
+                  * (self._n_bead if self._is_pimd else 1))
+        velocity = jax.random.normal(key,
+                                     shape=self._state.velocity.shape,
+                                     dtype=self._state.velocity.dtype)
+        velocity *= jnp.sqrt(kT_eff / self._state.mass)
         self.setVelocity(velocity)
         if remove_com_motion:
             self.remove_com_motion()
@@ -1100,6 +1062,10 @@ class Simulation:
 
 
 class TrajDump:
+    '''
+        .. deprecated::
+            Use ``Simulation.run(..., dump_position='traj.xyz', dump_interval=10)``
+    '''
     def __init__(
         self,
         atoms: Atoms,
@@ -1108,6 +1074,13 @@ class TrajDump:
         vel: bool = False,
         **kwargs,
     ) -> None:
+        import warnings
+        warnings.warn(
+            "TrajDump is deprecated. Use Simulation.run(..., dump_position=..., "
+            "dump_velocity=..., dump_centroid=..., dump_interval=...) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.fname = fname
         self.interval = interval
         self.vel = vel
@@ -1165,6 +1138,15 @@ class TrajDumpSimulation(Simulation):
         log_file: Optional[str] = "deepmd_jax.stdout",
         **kwargs,
     ):
+        import warnings
+        warnings.warn(
+            "TrajDumpSimulation is deprecated. Use Simulation(..., "
+            "type_symbols=[...]) together with Simulation.run(..., "
+            "dump_position=..., dump_velocity=..., dump_centroid=..., "
+            "dump_interval=...) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         super().__init__(
             model_path,
             box,
@@ -1241,7 +1223,7 @@ class TrajDumpSimulation(Simulation):
             self._neighbor_update_profile = profile
             if "NPT" in self._routine:
                 self._current_box = self._state.box
-            pos_traj, vel_traj, box_traj = traj
+            pos_traj, vel_traj, box_traj, _centroid_traj = traj
             self.step += next_chunk
             remaining_steps -= next_chunk
 
@@ -1259,123 +1241,3 @@ class TrajDumpSimulation(Simulation):
 
 
 
-class DPJaxCalculator(Calculator):
-    implemented_properties = ["energy", "forces", "stress"]
-
-    def __init__(self, 
-            model_path,
-            type_idx = None, 
-            dtype=jnp.float32,
-            **kwargs):
-
-        self.atoms = None
-        self.use_cache = False
-        self._dtype = dtype
-
-        self._model, self._variables = load_model(model_path)
-        self._static_args = None
-
-        self._type_idx = np.array(type_idx).astype(int)
-        type_count = np.bincount(self._type_idx)
-        self._type_count = np.pad(type_count, (0, self._model.params['ntypes'] - len(type_count)))
-
-        self._energy_and_forces_fn = self._get_energy_and_forces_fn()
-        print("# Initializing the DPJaxCalculator")
-
-    def _get_energy_and_forces_fn(self, model_and_variables=None):
-        if model_and_variables is None:
-            model_and_variables = (self._model, self._variables)
-        model, variables = model_and_variables
-
-        def energy_fn(coord, box, static_args, nbrs_nm=None, perturbation=None, **kwargs):
-            '''
-                You can customize the energy function here, i.e. if you want to add perturbations.
-            '''
-            # Atoms are reordered and grouped by type in neural network inputs
-            coord = coord[self._type_idx.argsort(kind='stable')]
-            # perturbation = 1, required by jax-md stress calculation
-            if perturbation is not None:
-                coord = coord @ perturbation
-                box = box @ perturbation
-            # Ensure coord and box is replicated on all devices
-            if len(jax.devices()) > 1:
-                coord = jax.lax.with_sharding_constraint(coord, PSpec())
-                box = jax.lax.with_sharding_constraint(box, PSpec())
-
-            # Energy calculation
-            E = model.apply(variables,
-                            coord,
-                            box,
-                            static_args,
-                            nbrs_nm)[0]
-            if model.params['type'] == 'dplr':
-                raise NotImplementedError("DPLR model not implemented in the ASE calculator yet.")
-            return E
-
-        def stress_fn(coord, box, static_args, **kwargs):
-            return jax_md.quantity.stress(
-                        energy_fn,
-                        coord,
-                        box,
-                        static_args=static_args,
-                        velocity=None,
-                        nbrs_nm=None,
-                    ) 
-
-        def e_and_f_and_s(coords, box, static_args, **kwargs):
-            e, grad = jax.value_and_grad(energy_fn)(coords, box, static_args, **kwargs)
-            stress = stress_fn(coords, box, static_args, **kwargs)
-            stress_voigt = jnp.array([
-                stress[0, 0],
-                stress[1, 1],
-                stress[2, 2],
-                stress[1, 2],  
-                stress[0, 2], 
-                stress[0, 1], 
-                ], dtype=self._dtype)
-            # Note the minus sign in the stress below, to match ASE's convention
-            # Also, the off-diagonal components have not been tested
-            return e, -grad, -stress_voigt
-
-        return jax.jit(e_and_f_and_s, static_argnames=('static_args',))
-
-
-    def _get_static_args(self, position):
-        '''
-            Returns a FrozenDict of the complete set of static arguments for jit compilation.
-        '''
-        box = self._current_box
-        # it is important to disable_ortho to compute the stress tensor correctly, even for orthogonal boxes
-        lattice_args = compute_lattice_candidate(box[None], self._model.params['rcut'], print_info=False, disable_ortho=True)
-        static_args = nn.FrozenDict({'type_count':tuple(self._type_count), 'lattice':lattice_args, 'use_neighbor_list':False})
-        return static_args
-
-    def calculate(self, atoms=None, properties=None, system_changes=all_changes):
-
-        if atoms is not None:
-            self.atoms = atoms.copy()
-
-        cell = np.asarray(self.atoms.get_cell(complete=True))  # Use complete=True for (3,3)
-        box = jnp.array(cell, dtype=self._dtype)
-        self._current_box = box
-
-        # Get positions and cell from ASE
-        pos = self.atoms.get_positions()  # (N,3), in Å
-        self._natoms = pos.shape[0]
-        coords = jnp.array(pos, dtype=self._dtype)
-
-        static_args = self._get_static_args(coords)
-        if self._static_args != static_args:
-            print('# Lattice vectors for neighbor images: Max %d out of %d candidates.' % (static_args['lattice']['lattice_max'], len(static_args['lattice']['lattice_cand'])))
-        self._static_args = static_args
-        
-        E, F, S = self._energy_and_forces_fn(
-            coords,
-            box,
-            static_args,
-            )
-
-        # Convert JAX arrays to numpy
-        self.results["energy"] = float(E)
-        self.results["forces"] = np.asarray(F)
-        self.results["stress"] = np.asarray(S)
