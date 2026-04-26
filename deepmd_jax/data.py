@@ -18,16 +18,16 @@ class DPDataset():
             self.valid_types = np.arange(self.ntypes)[self.type_count > 0]
         else:
             self.is_leaf = True
-            self.type = np.genfromtxt(paths[0] + '/type.raw').astype(int)
+            self.type_idx = np.genfromtxt(paths[0] + '/type.raw').astype(int)
             self.data = {l: np.concatenate(sum([[np.load(set+l+'.npy') for set in sorted(glob(path+'/set.*/'))]
                                                 for path in paths], [])) for l in labels}
-            self.natoms = len(self.type)
+            self.natoms = len(self.type_idx)
             self.nframes = len(self.data['coord'])
             for l in labels:
                 assert self.data[l].shape[0] == self.nframes, \
                     f"{l}.npy has {self.data[l].shape[0]} frames, expected {self.nframes}"
             self.pointer = self.nframes
-            self.type_count = np.array([(self.type == i).sum() for i in range(max(self.type)+1)])
+            self.type_count = np.array([(self.type_idx == i).sum() for i in range(max(self.type_idx)+1)])
             self.ntypes = len(self.type_count)
             self.valid_types = np.arange(self.ntypes)
             self.nsel = params.get('atomic_sel', None)
@@ -40,7 +40,6 @@ class DPDataset():
             for l in labels:
                 if l in ['coord', 'force']:
                     self.data[l] = self.data[l].reshape(self.data[l].shape[0],-1,3)
-                    self.data[l] = self.data[l][:,self.type.argsort(kind='stable')]
                 if l == 'energy':
                     self.data[l] = self.data[l].reshape(-1)
                 if 'atomic' in l:
@@ -49,8 +48,6 @@ class DPDataset():
                         assert self.data[l].shape[2] in (3, 9)
                     except:
                         raise ValueError('Atomic label must have 3 (vector) or 9 (3x3 tensor) components per atom.')
-                    sel_type = self.type[np.in1d(self.type, self.nsel)]
-                    self.data[l] = self.data[l][:,sel_type.argsort(kind='stable')]
             self.data['box'] = self.data['box'].reshape(-1,3,3)
             self.data['coord'] = np.array(vmap(shift)(self.data['coord'], self.data['box']))
             print('# Dataset loaded: %d frames/%d atoms. Path:'%(self.nframes,self.natoms),
@@ -72,6 +69,8 @@ class DPDataset():
         if self.is_leaf:
             batch = self.get_batch(bs)[0]
             coord, box = batch['coord'], batch['box']
+            # get_relative_coord still works in type-sorted layout; sort locally.
+            coord = coord[:, np.argsort(self.type_idx, kind='stable')]
             r_Bnm = vmap(get_relative_coord,(0,0,None,None))(coord, box, self.type_count, self.lattice_args)[1]
             sr_BnM = [sr(jnp.concatenate(r,axis=-1), rcut) for r in r_Bnm]
             sr_sum = np.array([sr.sum() for sr in sr_BnM])
@@ -107,7 +106,7 @@ class DPDataset():
             batch = {'atomic' if 'atomic' in l else l:
                      self.data[l][self.pointer:min(self.pointer+batch_size,self.nframes)] for l in self.data}
             self.pointer += batch_size
-            return batch, tuple(self.type_count), self.lattice_args
+            return batch, tuple(self.type_idx), self.lattice_args
 
     def compute_lattice_candidate(self, rcut): # computes candidate lattice vectors within rcut for neighbor images
         if not self.is_leaf:
@@ -137,7 +136,7 @@ class DPDataset():
         
     def get_flattened_data(self):
         if self.is_leaf:
-            return [{'data':self.data, 'type_count':self.type_count, 'lattice_args':self.lattice_args}]
+            return [{'data':self.data, 'type_idx':self.type_idx, 'lattice_args':self.lattice_args}]
         else:
             return sum([subset.get_flattened_data() for subset in self.subsets], [])
 

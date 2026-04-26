@@ -322,8 +322,8 @@ def train(
     print('# Model params:', {k:v for k,v in model.params.items() if k != 'dplr_wannier_model_and_variables'})
 
     # initialize model variables
-    batch, type_count, lattice_args = train_data.get_batch(1)
-    static_args = nn.FrozenDict({'type_count': type_count, 'lattice': lattice_args})
+    batch, type_idx, lattice_args = train_data.get_batch(1)
+    static_args = nn.FrozenDict({'type_idx': type_idx, 'lattice': lattice_args})
     if seed is None:
         seed = np.random.randint(65536)
     variables = model.init(
@@ -485,13 +485,13 @@ def train(
             val_batch = get_batch_val()
             loss_val = []
             for one_batch in val_batch:
-                v_batch, type_count, lattice_args = one_batch
-                static_args = nn.FrozenDict({'type_count': tuple(type_count),
+                v_batch, type_idx, lattice_args = one_batch
+                static_args = nn.FrozenDict({'type_idx': tuple(type_idx),
                                              'lattice': lattice_args})
                 loss_val.append(val_step(v_batch, variables, static_args))
 
-        batch, type_count, lattice_args = get_batch_train()
-        static_args = nn.FrozenDict({'type_count': tuple(type_count),
+        batch, type_idx, lattice_args = get_batch_train()
+        static_args = nn.FrozenDict({'type_idx': tuple(type_idx),
                                      'lattice': lattice_args})
         variables, opt_state, state = train_step(batch,
                                                  variables,
@@ -503,8 +503,8 @@ def train(
         if hybrid and iteration % obs_step_every == 0:
             # observable train step
             for i in range(len(obs_train_data_path)):
-                batch, type_count, lattice_args = get_batch_train_obs(obs_position=i)
-                static_args = nn.FrozenDict({'type_count': tuple(type_count),
+                batch, type_idx, lattice_args = get_batch_train_obs(obs_position=i)
+                static_args = nn.FrozenDict({'type_idx': tuple(type_idx),
                                             'lattice': lattice_args})
                 variables, opt_state, state_obs = train_step_obs(batch,
                                                         variables,
@@ -581,9 +581,9 @@ def test(
                                    static_argnames=('static_args',))
     while remaining > 0:
         bs = min(batch_size, remaining)
-        batch, type_count, lattice_args = test_data.get_batch(bs)
+        batch, type_idx, lattice_args = test_data.get_batch(bs)
         remaining -= bs
-        static_args = nn.FrozenDict({'type_count': type_count, 'lattice': lattice_args})
+        static_args = nn.FrozenDict({'type_idx': type_idx, 'lattice': lattice_args})
         pred = evaluate_fn(variables, batch['coord'], batch['box'], static_args)
         if model.params['type'] == 'energy' or model.params['type'] == 'dplr':
             predictions['energy'].append(pred[0])
@@ -601,10 +601,7 @@ def test(
         ground_truth[key] = np.concatenate(ground_truth[key], axis=0)
         rmse[key] = (((predictions[key] - ground_truth[key]) ** 2).mean() ** 0.5).item()
         mae[key] = np.abs(predictions[key] - ground_truth[key]).mean().item()
-    # reorder force back; will delete in future when reordering is moved into dpmodel.py
     if model.params['type'] == 'energy' or model.params['type'] == 'dplr':
-        ground_truth['force'] = ground_truth['force'][:, test_data.type.argsort(kind='stable').argsort(kind='stable')]
-        predictions['force'] = predictions['force'][:, test_data.type.argsort(kind='stable').argsort(kind='stable')]
         natoms = predictions['force'].shape[1]
         rmse['energy'] /= natoms
         mae['energy'] /= natoms
@@ -685,13 +682,17 @@ def process_long_range_subset(subset, dplr_q_atoms, dplr_q_wc, dplr_beta, dplr_r
     '''
         subtracting long range energy and force, keeping short range part only, for dplr models.
     '''
-    data, type_count, lattice_args = subset.values()
+    data, type_idx, lattice_args = subset.values()
     if not lattice_args['ortho']:
         raise ValueError('For "dplr" currently only orthorhombic boxes are supported.')
-    sel_type_count = tuple(np.array(type_count)[wc_model.params['nsel']])
-    qatoms = np.repeat(dplr_q_atoms, type_count)
-    qwc = np.repeat(dplr_q_wc, sel_type_count)
-    static_args = nn.FrozenDict({'type_count': type_count, 'lattice': lattice_args})
+    type_idx = np.asarray(type_idx)
+    nsel = list(wc_model.params['nsel'])
+    pos_in_nsel = np.full(wc_model.params['ntypes'], -1, dtype=int)
+    pos_in_nsel[np.asarray(nsel)] = np.arange(len(nsel))
+    nsel_mask = np.isin(type_idx, nsel)
+    qatoms = np.asarray(dplr_q_atoms)[type_idx]
+    qwc = np.asarray(dplr_q_wc)[pos_in_nsel[type_idx[nsel_mask]]]
+    static_args = nn.FrozenDict({'type_idx': tuple(type_idx), 'lattice': lattice_args})
 
     def lr_energy(coord, box, Ngrid):
         wc = wc_model.wc_predict(wc_variables, coord, box, static_args)

@@ -383,10 +383,14 @@ class Simulation:
                             model.params['dplr_beta'],
                             resolution=model.params['dplr_resolution'],
                         )
-            qatoms = jnp.array(np.repeat(model.params['dplr_q_atoms'],
-                                         self._type_count))
-            qwc = jnp.array(np.repeat(model.params['dplr_q_wc'],
-                                      [self._type_count[i] for i in wc_model.params['nsel']]))
+            # qatoms: per-atom charge in raw-coord order; qwc: per-wc charge in
+            # raw nsel-atom order (matching wc_predict's output ordering).
+            qatoms = jnp.array(np.asarray(model.params['dplr_q_atoms'])[self._type_idx])
+            nsel = list(wc_model.params['nsel'])
+            pos_in_nsel = np.full(self._model.params['ntypes'], -1, dtype=int)
+            pos_in_nsel[np.asarray(nsel)] = np.arange(len(nsel))
+            nsel_mask = np.isin(self._type_idx, nsel)
+            qwc = jnp.array(np.asarray(model.params['dplr_q_wc'])[pos_in_nsel[self._type_idx[nsel_mask]]])
 
         def _single_conf_energy(coord, box, nbrs_nm):
             '''Evaluate the ML (and optional DPLR) potential on one configuration.'''
@@ -413,10 +417,6 @@ class Simulation:
                 box = box * jnp.eye(3)
             elif box.shape == (3,):
                 box = jnp.diag(box)
-            # Atoms are reordered and grouped by type in neural network inputs.
-            # Applied along the atom axis, which is the last-but-one axis for
-            # both (N,3) and (P,N,3).
-            coord = coord[..., self._type_idx.argsort(kind='stable'), :]
             # perturbation = 1, required by jax-md pressure calculation
             coord = coord * perturbation
             box = box * perturbation
@@ -474,13 +474,13 @@ class Simulation:
         '''
         use_neighbor_list *= self._check_if_use_neighbor_list()
         if use_neighbor_list:
-            static_args = nn.FrozenDict({'type_count':self._type_count, 'use_neighbor_list':True})
+            static_args = nn.FrozenDict({'type_idx':tuple(self._type_idx), 'use_neighbor_list':True})
             return static_args
         else:
             # For npt, include extra buffer for lattice selection !! not implemented yet
             box = jnp.diag(self._current_box) if self._current_box.shape == (3,) else self._current_box
             lattice_args = compute_lattice_candidate(box[None], self._model.params['rcut'])
-            static_args = nn.FrozenDict({'type_count':self._type_count, 'lattice':lattice_args, 'use_neighbor_list':False})
+            static_args = nn.FrozenDict({'type_idx':tuple(self._type_idx), 'lattice':lattice_args, 'use_neighbor_list':False})
             return static_args
 
     def _generate_report_fn(self):
@@ -680,8 +680,7 @@ class Simulation:
         def _drift_per_bead(typed_nbrs_single, position_N3, box):
             scale = typed_nbrs_single.reference_box / box
             scaled_position = (position_N3 % box) * scale
-            scaled_position = scaled_position[self._type_idx.argsort(kind='stable')]
-            scaled_position = reorder_by_device(scaled_position, self._type_count)
+            scaled_position = reorder_by_device(scaled_position, self._type_idx)
             return norm_ortho_box(
                 scaled_position - typed_nbrs_single.reference_position,
                 typed_nbrs_single.reference_box,

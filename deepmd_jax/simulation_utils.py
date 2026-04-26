@@ -219,12 +219,11 @@ def typed_neighbor_list(box, type_idx, type_count, rcut, buffer_ratio=1.2):
         # scale coord to reference_box and store in float32 fractional coordinates
         box = box.astype(jnp.float32)
         scale = reference_box / box  # (3,) per-axis; works for iso and semi_iso
-        coord = coord[type_idx.argsort(kind='stable')]
         coord = (coord.astype(jnp.float32) % box) * scale
         # shrink by 1e-7 from the boundary to avoid numerical issues
         coord = coord * (1-5e-7)
-        # reorder and partition to multiple devices
-        coord = reorder_by_device(coord, type_count)
+        # sort by type, pad each type, and partition to multiple devices
+        coord = reorder_by_device(coord, type_idx)
         return coord
 
     # allocate function: non-jit-compatible

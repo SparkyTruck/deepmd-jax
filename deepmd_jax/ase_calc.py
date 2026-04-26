@@ -47,8 +47,6 @@ class DPJaxCalculator(Calculator):
             '''
                 You can customize the energy function here, i.e. if you want to add perturbations.
             '''
-            # Atoms are reordered and grouped by type in neural network inputs
-            coord = coord[self._type_idx.argsort(kind='stable')]
             # perturbation = 1, required by jax-md stress calculation
             if perturbation is not None:
                 coord = coord @ perturbation
@@ -103,7 +101,7 @@ class DPJaxCalculator(Calculator):
         box = self._current_box
         # it is important to disable_ortho to compute the stress tensor correctly, even for orthogonal boxes
         lattice_args = compute_lattice_candidate(box[None], self._model.params['rcut'], print_info=False, disable_ortho=True)
-        static_args = nn.FrozenDict({'type_count':tuple(self._type_count), 'lattice':lattice_args, 'use_neighbor_list':False})
+        static_args = nn.FrozenDict({'type_idx':tuple(self._type_idx), 'lattice':lattice_args, 'use_neighbor_list':False})
         return static_args
 
     def calculate(self, atoms=None, properties=None, system_changes=all_changes):

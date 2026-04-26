@@ -8,18 +8,22 @@ from jax.sharding import PartitionSpec as PSpec
 class DPModel(nn.Module):
     params: dict
     def get_input(self, coord, static_args, nbrs_nm):
-        type_count = np.pad(np.array(static_args['type_count']), (0,self.params['ntypes']-len(static_args['type_count'])))[self.params['valid_types']]
+        type_idx = np.asarray(static_args['type_idx'])
+        valid_types = self.params['valid_types']
+        assert_type_idx_in_valid_types(type_idx, valid_types)
+        type_count_full = np.bincount(type_idx, minlength=self.params['ntypes'])
+        type_count = type_count_full[valid_types]
         compress = self.params.get('is_compressed', False)
         if self.params['atomic']:
-            nsel = [list(self.params['valid_types']).index(i) for i in self.params['nsel']]
+            nsel = [list(valid_types).index(i) for i in self.params['nsel']]
         else:
             nsel = list(range(len(type_count)))
+        K = jax.device_count() if nbrs_nm is not None else 1
+        coord = reorder_by_device(coord, type_idx, K=K)
         if nbrs_nm is not None:
-            nbrs_nm = [[nbrs_nm[i][j] for j in self.params['valid_types']] for i in self.params['valid_types']]
-            K = jax.device_count()
+            nbrs_nm = [[nbrs_nm[i][j] for j in valid_types] for i in valid_types]
             type_count_new = [-(-type_count[i]//K) for i in range(len(type_count))]
             mask = get_mask_by_device(type_count)
-            coord = reorder_by_device(coord, type_count)
             return coord, type_count_new, mask, compress, K, nsel, nbrs_nm
         else:
             return coord, type_count, jnp.ones_like(coord[:,0]), compress, 1, nsel, None
@@ -84,9 +88,12 @@ class DPModel(nn.Module):
             elif self.params['type'] == 'atomic':
                 T_NselYW = T_Nsel3W
             T_nselYW = split(T_NselYW, sel_count, 0, K=K)
-            real_type_count = tuple(static_args['type_count']) + (0,) * (len(type_count) - len(static_args['type_count']))
+            type_idx = np.asarray(static_args['type_idx'])
+            real_type_count = np.bincount(type_idx, minlength=self.params['ntypes'])
             pred = [(f[:,None]*T).sum(-1)[:real_type_count[self.params['nsel'][i]]] for i,(f,T) in enumerate(zip(fit_nselW,T_nselYW))]
             pred = concat([lax.with_sharding_constraint(p, PSpec()) if K > 1 else p for p in pred])
+            inv_perm = atomic_inverse_perm(type_idx, self.params['nsel'])
+            pred = pred[inv_perm]
             if self.params['type'] == 'atomic_t2': # tensor_6to9
                 s = 2**-0.5
                 pred = pred[:, [0,4,3,4,1,5,3,5,2]] * jnp.array([1,s,s,s,1,s,s,s,1])
@@ -105,8 +112,10 @@ class DPModel(nn.Module):
     
     def wc_predict(self, variables, coord_N3, box_33, static_args, nbrs_nm=None):
         wc_relative = self.apply(variables, coord_N3, box_33, static_args, nbrs_nm)[0]
-        coord_ref = [c for i,c in enumerate(split(coord_N3, static_args['type_count'])) if i in self.params['nsel']]
-        return concat(coord_ref) + wc_relative
+        type_idx = np.asarray(static_args['type_idx'])
+        nsel_mask = np.isin(type_idx, self.params['nsel'])
+        coord_ref = coord_N3[nsel_mask]
+        return coord_ref + wc_relative
     
     def get_loss_fn(self, order='l2'):
         if self.params['atomic'] is False:
