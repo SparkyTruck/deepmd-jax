@@ -174,6 +174,10 @@ def npt_nose_hoover(
     combined value_and_grad (force + dU/dV) instead of two; the dU/dV from the
     end of step n is reused as the dU/dV at the start of step n+1.
 
+    Positions are real-space (Å). Parrinello-Rahman scaling rescales them by
+    exp(box-momentum * dt) per step alongside the box; this is the same
+    formula as jax_md.simulate.npt_nose_hoover and assumes real coordinates.
+
     couple_axes: partition of a subset of {0,1,2} into coupled groups. Each
     inner tuple lists axes sharing one scale factor. Axes not listed are fixed.
     Default ((0,1,2),) is isotropic. Other examples: ((0,1),) semi-iso (xy

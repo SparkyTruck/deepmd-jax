@@ -21,7 +21,8 @@ from .simulation_utils import (TypedNeighborList, typed_neighbor_list,
                                get_type_mask_fns, get_idx_mask_fn,
                                min_image_unwrap, print_run_profile,
                                prepare_dumps, write_dump_frame,
-                               stack_typed_nbrs_per_bead)
+                               stack_typed_nbrs_per_bead,
+                               iso_pressure)
 # Back-compat re-export; the ASE calculator now lives in ase_calc.py.
 from .ase_calc import DPJaxCalculator  # noqa: F401
 from .routine import *
@@ -120,9 +121,9 @@ class Simulation:
         self._n_bead = int(n_bead)
         self._is_pimd = self._n_bead > 1
         if self._is_pimd:
-            if routine != 'NVT':
+            if routine not in ('NVT', 'NPT'):
                 raise NotImplementedError(
-                    "Path-integral MD (n_bead > 1) currently only supports routine='NVT'.")
+                    "Path-integral MD (n_bead > 1) currently supports routine='NVT' or 'NPT'.")
             if fixed_indices is not None:
                 raise NotImplementedError("fixed_indices is not supported with n_bead > 1.")
             if len(model_deviation_paths) > 0:
@@ -184,9 +185,7 @@ class Simulation:
             self._initial_box = box
         self._current_box = self._initial_box
         self._static_args = self._get_static_args(initial_position, use_neighbor_list_when_possible)
-        self._displacement_fn, shift = jax_md.space.periodic_general(            
-            self._initial_box, fractional_coordinates="NPT" in self._routine
-        )
+        self._displacement_fn, shift = jax_md.space.periodic_general(self._initial_box, fractional_coordinates=False)
 
         # Create mask for constraining atoms
         mobile = np.ones(self._natoms)
@@ -245,9 +244,7 @@ class Simulation:
                 'kT': self._temperature * TEMP_UNIT_CONVERSION,
                 'gamma': 1.0 / tau_t,
             }
-        elif self._routine == "NPT":
-            box33 = jnp.diag(self._initial_box) if self._initial_box.shape == (3,) else self._initial_box
-            initial_position = initial_position @ jnp.linalg.inv(box33)
+        elif self._routine == "NPT" and not self._is_pimd:
             self._routine_fn = npt_nose_hoover
             if pressure is None:
                 raise ValueError("Missing argument 'pressure' (in bar) for routine 'NPT'")
@@ -266,6 +263,30 @@ class Simulation:
                                       'chain_steps': chain_steps_t,
                                       'sy_steps': sy_steps_t},
                 'couple_axes': self._couple_axes,
+            }
+            self._pressure = pressure
+        elif self._routine == "NPT" and self._is_pimd:
+            if pressure is None:
+                raise ValueError("Missing argument 'pressure' (in bar) for routine 'NPT'")
+            groups, n_per_group_np, self._group_ids_np, membership_np = _parse_couple_axes(couple_axes)
+            self._couple_axes = groups
+            self._moving_mask_np = (self._group_ids_np >= 0)
+            # Bead momenta: PILE-L (critically damped internal modes, centroid -> 1/tau_t).
+            gamma_P = 2.0 * self._nm_freqs
+            gamma_P[0] = 1.0 / tau_t
+            self._routine_fn = _pimd.npt_langevin_pimd
+            # ml_energy_fn is filled in inside _gen_fn once it has been built.
+            self._routine_args = {
+                'pressure': pressure * PRESS_UNIT_CONVERSION,
+                'kT_phys': self._temperature * TEMP_UNIT_CONVERSION,
+                'kT_eff': self._temperature * self._n_bead * TEMP_UNIT_CONVERSION,
+                'gamma_P': jnp.asarray(gamma_P),
+                'gamma_box': 1.0 / tau_p,
+                'nm_trans': jnp.asarray(self._nm_trans),
+                'membership': membership_np,
+                'n_per_group': n_per_group_np,
+                'group_ids': self._group_ids_np,
+                'tau_p': tau_p,
             }
             self._pressure = pressure
         else:
@@ -300,12 +321,12 @@ class Simulation:
         # ML potential only (reported as PE). The ring-polymer spring term,
         # if present, is added on top below to produce the integrator energy.
         self._ml_energy_fn = self._get_energy_fn()
-        spring_fn = self._get_spring_energy_fn()  # None unless PIMD
-        if spring_fn is None:
+        self._spring_energy_fn = self._get_spring_energy_fn()  # None unless PIMD
+        if self._spring_energy_fn is None:
             self._energy_fn = self._ml_energy_fn
         else:
             def _total_energy_with_spring(coord, **kwargs):
-                return self._ml_energy_fn(coord, **kwargs) + spring_fn(coord, **kwargs)
+                return self._ml_energy_fn(coord, **kwargs) + self._spring_energy_fn(coord, **kwargs)
             self._energy_fn = _total_energy_with_spring
         if self._mobile is not None:
             _inner_energy_fn = self._energy_fn
@@ -316,19 +337,20 @@ class Simulation:
         self._force_fn = lambda coord, **kwargs: -jax.grad(self._energy_fn)(coord, **kwargs)
         
         def pressure_fn(state, box, nbrs_nm):
-            KE = jax_md.quantity.kinetic_energy(momentum=state.momentum, mass=state.mass)
-            return jax_md.quantity.pressure(
-                        self._energy_fn,
-                        state.position,
-                        box,
-                        KE,
-                        nbrs_nm=nbrs_nm,
-                    ) / PRESS_UNIT_CONVERSION
+            # Classical: full energy_fn. PIMD: ML-only (spring is V-independent
+            # in real coords and must not enter the pressure).
+            e_fn = self._ml_energy_fn if self._is_pimd else self._energy_fn
+            kT = self._temperature * TEMP_UNIT_CONVERSION
+            return iso_pressure(e_fn, state.position, box, self._natoms, kT,
+                                nbrs_nm=nbrs_nm) / PRESS_UNIT_CONVERSION
         self._pressure_fn = pressure_fn
         if self._use_model_deviation:
             self._deviation_energy_fns = [
                 self._get_energy_fn(load_model(path)) for path in self._model_deviation_paths
             ]
+        # PIMD-NPT needs the ML-only energy fn alongside the full energy_fn.
+        if self._routine == "NPT" and self._is_pimd:
+            self._routine_args['ml_energy_fn'] = self._ml_energy_fn
         init_fn, apply_fn = self._routine_fn(self._energy_fn,
                                                      self._shift_fn,
                                                      self._dt,
@@ -391,9 +413,6 @@ class Simulation:
                 box = box * jnp.eye(3)
             elif box.shape == (3,):
                 box = jnp.diag(box)
-            # NPT is computed in fractional coordinates; but we need real space forces returned by grad(energy_fn)
-            if 'NPT' in self._routine:
-                coord = jax.lax.stop_gradient(coord @ box) + coord - jax.lax.stop_gradient(coord)
             # Atoms are reordered and grouped by type in neural network inputs.
             # Applied along the atom axis, which is the last-but-one axis for
             # both (N,3) and (P,N,3).
@@ -501,21 +520,20 @@ class Simulation:
                                         )
         elif self._routine == "NPT":
             self._reporters["Pressure"] = lambda state, nbrs_nm: self._pressure_fn(state, state.box, nbrs_nm)
-            # One column per moving axis (axis letter labels the actual box length).
-            # Fixed axes are omitted since they never change. Axes in the same
-            # coupled group will track exactly in the log but their absolute
-            # lengths can differ when the reference box is non-cubic.
+            # One column per moving axis. Fixed axes are omitted; axes in the
+            # same coupled group track exactly but their absolute lengths can
+            # differ when the reference box is non-cubic.
             axis_letters = ['x', 'y', 'z']
-            moving_axes = [a for g in self._couple_axes for a in g]
-            for a in sorted(moving_axes):
+            for a in sorted(a for g in self._couple_axes for a in g):
                 self._reporters[f'box_{axis_letters[a]}'] = (lambda state, _, a=a: state.box[a])
-            self._reporters["Invariant"] = lambda state, nbrs_nm: npt_nose_hoover_invariant(
-                                            self._energy_fn,
-                                            state,
-                                            self._pressure * PRESS_UNIT_CONVERSION,
-                                            self._temperature * TEMP_UNIT_CONVERSION,
-                                            nbrs_nm=nbrs_nm,
-                                        )
+            if not self._is_pimd:
+                self._reporters["Invariant"] = lambda state, nbrs_nm: npt_nose_hoover_invariant(
+                                                self._energy_fn,
+                                                state,
+                                                self._pressure * PRESS_UNIT_CONVERSION,
+                                                self._temperature * TEMP_UNIT_CONVERSION,
+                                                nbrs_nm=nbrs_nm,
+                                            )
         if self._use_model_deviation:
             self._reporters["Model_Devi"] = lambda state, nbrs_nm: jnp.array([
                 -jax.grad(fn)(
@@ -566,13 +584,13 @@ class Simulation:
                                                  self._type_count,
                                                  self._model.params['rcut'] + self._neighbor_skin,
                                                  self._neighbor_buffer_ratio)
-        real_pos = self._getRealPosition(position)
+        pos = self._state.position if position is None else position
         if self._is_pimd:
             self._typed_nbrs = stack_typed_nbrs_per_bead(
-                self._typed_nbr_fn, real_pos, self._current_box, self._n_bead)
+                self._typed_nbr_fn, pos, self._current_box, self._n_bead)
         else:
             self._typed_nbrs = self._typed_nbr_fn.allocate(
-                real_pos, box=self._current_box)
+                pos, box=self._current_box)
 
     def _get_check_hard_overflow_fn(self):
 
@@ -625,7 +643,7 @@ class Simulation:
                     self._construct_nbr_and_nbr_fn()
                 else:
                     self._typed_nbrs = self._typed_nbr_fn.allocate(
-                        self._getRealPosition(), box=self._current_box)
+                        self._state.position, box=self._current_box)
             FLAG_4 = True
         elif self._error_code & 8: # Not fully implemented yet!!!
             self._static_args = self._get_static_args(self._state.position, use_neighbor_list=False)
@@ -643,11 +661,9 @@ class Simulation:
         '''
         if self._static_args['use_neighbor_list']:
             self._typed_nbrs, _ = jax.jit(self._soft_update_nbrs)(
-                                                    self._typed_nbrs,
-                                                    self._state.position * self._state.box if "NPT" in self._routine else self._state.position,
-                                                    self._current_box,
-                                                    self._neighbor_update_profile
-                                                )
+                self._typed_nbrs, self._state.position, self._current_box,
+                self._neighbor_update_profile,
+            )
             self._error_code = jax.jit(self._check_hard_overflow)(self._state, self._typed_nbrs)
         else:
             self._error_code = jax.jit(self._check_hard_overflow)(self._state, None)
@@ -704,9 +720,6 @@ class Simulation:
 
         return soft_update_nbrs
 
-    def _unwrap_positions(self, previous_position, current_position, box):
-        return min_image_unwrap(previous_position, current_position, box,
-                                fractional="NPT" in self._routine)
 
     def remove_com_motion(self):
         '''
@@ -738,10 +751,8 @@ class Simulation:
 
             # soft update neighbor list before a step
             if self._static_args['use_neighbor_list']:
-                typed_nbrs, profile = self._soft_update_nbrs(typed_nbrs,
-                                                             self._getRealPosition(state.position, current_box),
-                                                             current_box,
-                                                             profile)
+                typed_nbrs, profile = self._soft_update_nbrs(
+                    typed_nbrs, state.position, current_box, profile)
 
             # check if there is any hard overflow
             error_code = error_code | self._check_hard_overflow(state, typed_nbrs)
@@ -751,29 +762,21 @@ class Simulation:
                                 state,
                                 nbrs_nm=typed_nbrs.nbrs_nm if typed_nbrs else None,
                             )
-            new_position = self._unwrap_positions(previous_state_position,
-                                                  state.position,
-                                                  state.box if "NPT" in self._routine else self._current_box)
-            state = state.set(position=new_position)
+            box_now = state.box if "NPT" in self._routine else self._current_box
+            state = state.set(position=min_image_unwrap(
+                previous_state_position, state.position, box_now))
             if self._remove_com_motion:
                 mobile_mass = state.mass * (self._mobile[:, None] if self._mobile is not None else jnp.ones_like(state.mass, dtype=bool))
                 velocity = state.velocity - (state.velocity * mobile_mass).sum(0) / mobile_mass.sum()
                 state = state.set(momentum=state.mass * velocity)
-            pos_stored = (state.position * state.box if "NPT" in self._routine
-                          else state.position)
-            box_for_centroid = (state.box if "NPT" in self._routine
-                                else self._initial_box)
+            box_now = state.box if "NPT" in self._routine else self._initial_box
             # Under PIMD, emit the centroid with a minimum-image reduction.
             if self._is_pimd:
-                centroid_frame = _pimd.centroid(pos_stored, box_for_centroid)
+                centroid_frame = _pimd.centroid(state.position, box_now)
             else:
-                centroid_frame = pos_stored
+                centroid_frame = state.position
             return ((state, typed_nbrs, error_code, profile),
-                    (pos_stored,
-                     state.velocity,
-                     state.box if "NPT" in self._routine else self._initial_box,
-                     centroid_frame,
-                    ))
+                    (state.position, state.velocity, box_now, centroid_frame))
 
         @partial(jax.jit, static_argnums=(1,))
         def multiple_inner_step(states, length):
@@ -925,25 +928,11 @@ class Simulation:
     def _print_run_profile(self, steps, elapsed_time):
         print_run_profile(steps, elapsed_time, self._state.position.shape[0], self._dt)
 
-    def _getRealPosition(self, position=None, box=None):
-        '''
-            Returns the real space position (Å) of the atoms.
-        '''
-        box = self._current_box if (box is None) else box
-        if position is None:
-            position = self._state.position
-        if not "NPT" in self._routine:
-            return position
-        elif box.size == 3:
-            return position * box
-        else:
-            return position @ box
-
     def getPosition(self):
         '''
             Returns the current position (Å). Shape (N, 3); (P, N, 3) under PIMD.
         '''
-        return np.array(self._getRealPosition())
+        return np.array(self._state.position)
 
     def getCentroidPosition(self):
         '''
@@ -951,10 +940,9 @@ class Simulation:
             getPosition() in classical MD. Beads are minimum-image-shifted
             onto a common periodic image before averaging.
         '''
-        pos = self._getRealPosition()
         if self._is_pimd:
-            return np.array(_pimd.centroid(pos, self._current_box))
-        return np.array(pos)
+            return np.array(_pimd.centroid(self._state.position, self._current_box))
+        return np.array(self._state.position)
 
     def setPosition(self, position, box=None):
         '''
@@ -979,14 +967,7 @@ class Simulation:
             if not jnp.allclose(box, self._current_box * scale, rtol=1e-4, atol=1e-6):
                 raise ValueError("Only isotropic box fluctuations are allowed in the current implementation.")
             self._current_box = jnp.array(box)
-        if not "NPT" in self._routine:
-            self._state = self._state.set(position=position)
-        else:
-            if self._current_box.size == 3:
-                fractional_position = position / self._current_box
-            else:
-                fractional_position = position @ jnp.linalg.inv(self._current_box)
-            self._state = self._state.set(position=fractional_position)
+        self._state = self._state.set(position=position)
         self._keep_nbr_or_lattice_up_to_date()
         self._state = self._state.set(force=jax.jit(self._force_fn)(
                             self._state.position,
@@ -1037,8 +1018,9 @@ class Simulation:
     def getEnergy(self):
         '''
             Returns the energy (eV) of the current state.
+            Spring term excluded under PIMD.
         '''
-        return jax.jit(self._energy_fn)(
+        return jax.jit(self._ml_energy_fn)(
                             self._state.position,
                             box=self._current_box,
                             nbrs_nm=self._typed_nbrs.nbrs_nm if self._static_args['use_neighbor_list'] else None,
@@ -1046,9 +1028,19 @@ class Simulation:
 
     def getForce(self):
         '''
-            Returns the force (eV/Å) of the current state.
+            Returns the force (eV/Å) of the current state, shape (N, 3) or
+            (P, N, 3) under PIMD. Spring term excluded under PIMD.
         '''
-        return np.array(self._state.force)
+        if not self._is_pimd:
+            return np.array(self._state.force)
+        # _ml_energy_fn is bead-averaged; multiply by n_bead so each bead's
+        # gradient yields its own ML force.
+        f = -jax.jit(jax.grad(lambda r, **kw: self._n_bead * self._ml_energy_fn(r, **kw)))(
+            self._state.position,
+            box=self._current_box,
+            nbrs_nm=self._typed_nbrs.nbrs_nm if self._static_args['use_neighbor_list'] else None,
+        )
+        return np.array(f)
 
     def getPressure(self):
         '''

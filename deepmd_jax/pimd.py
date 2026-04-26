@@ -217,3 +217,273 @@ def physical_temperature(state, n_bead):
     The primitive velocities sample at ``kT_eff = P * kT_phys``; divide by P.
     """
     return quantity.temperature(momentum=state.momentum, mass=state.mass) / n_bead
+
+
+def cv_pressure_from_dUdV_iso(N, dUdV_iso, V, kT_phys):
+    """Centroid-virial pressure (eV/Å^3) from the isotropic ML strain derivative.
+
+    P_cv = (N kT - (1/3) dU_ml/d_eps_iso) / V.
+
+    dU_ml/d_eps is the bead-averaged ML energy's derivative under uniform strain
+    eps -> (1+eps) on both R and box. PBC is handled inside the energy_fn (via
+    box scaling), so this is the correct estimator under periodic boundaries.
+    """
+    return (N * kT_phys - dUdV_iso / 3.0) / V
+
+
+# -----------------------------------------------------------------------------
+# NPT-PIMD: Parrinello-Rahman on the centroid mode + Langevin barostat.
+# -----------------------------------------------------------------------------
+
+
+@jax_md.dataclasses.dataclass
+class PIMDNPTLangevinState:
+    """State for BAOAB Langevin PIMD with PILE-L thermostat and a Langevin barostat.
+
+    Position/momentum/force are ``(P, N, 3)``; box DOF is ``(G,)`` per couple-axes
+    group. ``dUdV`` is the ML-only ``dU/d_eps`` (centroid-virial); the spring
+    term is V-independent in real coords and never enters the barostat.
+    """
+    position: jnp.ndarray
+    momentum: jnp.ndarray
+    force: jnp.ndarray
+    mass: jnp.ndarray
+
+    reference_box: jnp.ndarray
+
+    box_position: jnp.ndarray
+    box_momentum: jnp.ndarray
+    box_mass: jnp.ndarray
+
+    dUdV: jnp.ndarray
+    group_ids: jnp.ndarray
+    rng: jnp.ndarray
+
+    @property
+    def velocity(self):
+        return self.momentum / self.mass
+
+    @property
+    def box(self):
+        scales_g = jnp.exp(self.box_position)
+        safe = jnp.maximum(self.group_ids, 0)
+        per_axis = jnp.where(self.group_ids >= 0, scales_g[safe], 1.)
+        return self.reference_box * per_axis
+
+
+@_jms.initialize_momenta.register(PIMDNPTLangevinState)
+def _initialize_momenta_pimd_npt(state, key, kT):
+    """Maxwell-Boltzmann at the *effective* temperature (kT_eff = P * kT_phys)."""
+    p = jnp.sqrt(state.mass * kT) * jax.random.normal(
+        key, state.position.shape, dtype=state.position.dtype)
+    return state.set(momentum=p)
+
+
+def _sinhx_x(x):
+    return (1 + x ** 2 / 6 + x ** 4 / 120 + x ** 6 / 5040
+            + x ** 8 / 362_880 + x ** 10 / 39_916_800)
+
+
+def npt_langevin_pimd(
+    energy_fn,
+    shift_fn,
+    dt,
+    *,
+    ml_energy_fn,
+    pressure,
+    kT_phys,
+    kT_eff,
+    gamma_P,
+    gamma_box,
+    nm_trans,
+    membership,
+    n_per_group,
+    group_ids,
+    tau_p,
+):
+    """BAOAB Langevin integrator for NPT path-integral MD.
+
+    Centroid mode follows Parrinello-Rahman; internal modes drift freely. The
+    Langevin barostat couples only to the centroid (its ideal-gas drive uses
+    physical kT, not the effective kT_eff that the bead momenta sample at).
+
+    Two energy functions:
+        energy_fn    - ML + spring (full integrator energy, used for force).
+        ml_energy_fn - bead-averaged ML potential (its dU/d_eps is the
+                       centroid-virial virial that drives the barostat).
+    The spring term is V-independent in real coords and never enters dU/dV.
+    """
+    f32 = jnp.float32
+    dt = f32(dt)
+    dt_2 = f32(dt / 2)
+    G = n_per_group.shape[0]
+    membership = jnp.asarray(membership)
+    n_per_group = jnp.asarray(n_per_group, dtype=f32)
+    group_ids = jnp.asarray(group_ids)
+
+    def ml_force_stress_fn(R, box, **kwargs):
+        """Returns (E_ml_avg, F_ml_per_bead, dU_ml_avg/d_eps_per_group)."""
+        n_bead = R.shape[0]
+        def U(R_, eps):
+            perturbation = 1.0 + membership @ eps
+            # Multiply by n_bead before differentiating so grad(R) gives
+            # natural per-bead ML forces (-grad V_ML(R_k)).
+            return n_bead * ml_energy_fn(R_, box=box, perturbation=perturbation, **kwargs)
+        eps0 = jnp.zeros(G, dtype=R.dtype)
+        E, grads = jax.value_and_grad(U, argnums=(0, 1))(R, eps0)
+        return E / n_bead, -grads[0], grads[1] / n_bead
+
+    full_force_fn = jax_md.quantity.canonicalize_force(energy_fn)
+
+    def force_full_and_dUdV(R, box, **kwargs):
+        """Bead force = -grad(ML + spring); dUdV = ML-only (centroid-virial)."""
+        _, _, dUdV_ml = ml_force_stress_fn(R, box, **kwargs)
+        F_full = full_force_fn(R, box=box, **kwargs)
+        # Energy reported is informational; use ML + spring for completeness.
+        E_full = energy_fn(R, box=box, **kwargs)
+        return E_full, F_full, dUdV_ml
+
+    def _box_and_vol(R_b, ref_box):
+        scales_g = jnp.exp(R_b)
+        per_axis = membership @ scales_g + (1.0 - membership.sum(axis=1))
+        box = ref_box * per_axis
+        V = jnp.linalg.det(box) if box.ndim == 2 else jnp.prod(box)
+        return box, V
+
+    def _per_axis_rate(V_b, N_f):
+        V_b_per_axis = membership @ V_b
+        tr_Vb = jnp.sum(n_per_group * V_b)
+        return V_b_per_axis + tr_Vb / N_f
+
+    def box_force_cv(V, dUdV, P_centroid, mass, P_target, N_f):
+        """Box-momentum driver. KE2 uses centroid momentum so the equilibrium
+        ideal-gas drive is N kT_phys (not N P_bead kT_eff)."""
+        KE2_axis = jnp.sum(P_centroid ** 2 / mass, axis=0)            # (3,)
+        KE2_group = membership.T @ KE2_axis                            # (G,)
+        KE2_total = jnp.sum(KE2_axis)
+        return (KE2_group + (n_per_group / N_f) * KE2_total
+                - dUdV - P_target * V * n_per_group)
+
+    def exp_iL2_pimd(P, F, V_b, N_f):
+        """Half-step momentum update with PR rescale on centroid mode only."""
+        rate = _per_axis_rate(V_b, N_f)
+        x = rate * dt_2
+        x_2 = x / 2
+        sinhP = _sinhx_x(x_2)
+        P_c = P.mean(axis=0)
+        F_c = F.mean(axis=0)
+        # Centroid: classical exp_iL2.
+        P_c_new = P_c * jnp.exp(-x) + dt_2 * F_c * sinhP * jnp.exp(-x_2)
+        # Internal modes: simple B kick.
+        P_int_new = (P - P_c[None]) + dt_2 * (F - F_c[None])
+        return P_c_new[None] + P_int_new
+
+    def exp_iL1_pimd(box, R, V, V_b, dt_step, **kwargs):
+        """Position drift with PR scaling on centroid only.
+           dR_k = dt_step * V_k + (centroid PR adjustment, broadcast across beads).
+        """
+        V_b_per_axis = membership @ V_b
+        x = V_b_per_axis * dt_step
+        x_2 = x / 2
+        sinhV = _sinhx_x(x_2)
+        R_c = R.mean(axis=0)
+        V_c = V.mean(axis=0)
+        # Adjustment lifts free drift to PR drift on the centroid:
+        #   centroid_pr - centroid_free = R_c*(exp(x)-1) + dt*V_c*(exp(x/2)*sinh - 1)
+        adjustment = (R_c * (jnp.exp(x) - 1)
+                      + dt_step * V_c * (jnp.exp(x_2) * sinhV - 1.0))
+        dR = dt_step * V + adjustment[None]
+        return shift_fn(R, dR, box=box, **kwargs)
+
+    def init_fn(key, R, box, mass=f32(1.0), **kwargs):
+        N = R.shape[1]
+        dim = R.shape[2]
+        _kT_eff = kwargs.get('kT', kT_eff)
+
+        if jnp.isscalar(box) or box.ndim == 0:
+            box = jnp.eye(dim) * box
+
+        box_position = jnp.zeros(G, dtype=R.dtype)
+        box_momentum = jnp.zeros(G, dtype=R.dtype)
+        # Box mass tied to the physical (not effective) temperature.
+        box_mass = jnp.asarray(n_per_group * (N + 1) * kT_phys * tau_p ** 2,
+                               dtype=R.dtype)
+
+        _, F, dUdV = force_full_and_dUdV(R, box,
+                                         **{k: v for k, v in kwargs.items() if k != 'kT'})
+        key, split = jax.random.split(key)
+
+        state = PIMDNPTLangevinState(
+            position=R, momentum=None, force=F, mass=mass,
+            reference_box=box,
+            box_position=box_position, box_momentum=box_momentum, box_mass=box_mass,
+            dUdV=dUdV, group_ids=group_ids, rng=key,
+        )
+        state = _jms.canonicalize_mass(state)
+        return _jms.initialize_momenta(state, split, _kT_eff)
+
+    @jax.jit
+    def step_fn(state, **kwargs):
+        _kT_eff = kwargs.pop('kT', kT_eff)
+        _P_target = kwargs.pop('pressure', pressure)
+
+        R, P, M, F = state.position, state.momentum, state.mass, state.force
+        R_b, P_b, M_b = state.box_position, state.box_momentum, state.box_mass
+        ref_box = state.reference_box
+        dUdV = state.dUdV
+
+        N = R.shape[1]
+        dim = R.shape[2]
+        N_f = f32(dim * N)
+
+        # 1. Half barostat kick.
+        _, vol = _box_and_vol(R_b, ref_box)
+        G_e = box_force_cv(vol, dUdV, P.mean(axis=0), M, _P_target, N_f)
+        P_b = P_b + dt_2 * G_e
+
+        # 2. Half momentum kick (B with PR on centroid).
+        P = exp_iL2_pimd(P, F, P_b / M_b, N_f)
+
+        # 3. Half box-position + half position drift (A).
+        R_b = R_b + dt_2 * P_b / M_b
+        box, _ = _box_and_vol(R_b, ref_box)
+        R = exp_iL1_pimd(box, R, P / M, P_b / M_b, dt_2, **kwargs)
+
+        # 4. O step: PILE-L on bead momenta + Langevin on box momentum.
+        rng = state.rng
+        rng, sub1, sub2 = jax.random.split(rng, 3)
+        # PILE-L:
+        P_nm = jnp.tensordot(nm_trans.T, P, axes=(1, 0))
+        c1 = jnp.exp(-gamma_P * dt)[:, None, None]
+        c2 = jnp.sqrt(jnp.maximum(_kT_eff * (1.0 - c1**2), 0.0))
+        noise = jax.random.normal(sub1, shape=P_nm.shape, dtype=P_nm.dtype)
+        P_nm = c1 * P_nm + c2 * jnp.sqrt(M) * noise
+        P = jnp.tensordot(nm_trans, P_nm, axes=(1, 0))
+        # Langevin barostat at kT_phys:
+        c1_b = jnp.exp(-gamma_box * dt)
+        c2_b = jnp.sqrt(jnp.maximum(kT_phys * (1.0 - c1_b**2), 0.0))
+        noise_b = jax.random.normal(sub2, shape=P_b.shape, dtype=P_b.dtype)
+        P_b = c1_b * P_b + c2_b * jnp.sqrt(M_b) * noise_b
+
+        # 5. Half box-position + half position drift (A).
+        R_b = R_b + dt_2 * P_b / M_b
+        box, vol = _box_and_vol(R_b, ref_box)
+        R = exp_iL1_pimd(box, R, P / M, P_b / M_b, dt_2, **kwargs)
+
+        # 6. Force evaluation at new (R, box).
+        _, F, dUdV = force_full_and_dUdV(R, box, **kwargs)
+
+        # 7. Half momentum kick (B with PR on centroid).
+        P = exp_iL2_pimd(P, F, P_b / M_b, N_f)
+
+        # 8. Half barostat kick.
+        G_e = box_force_cv(vol, dUdV, P.mean(axis=0), M, _P_target, N_f)
+        P_b = P_b + dt_2 * G_e
+
+        return state.set(
+            position=R, momentum=P, force=F,
+            box_position=R_b, box_momentum=P_b,
+            dUdV=dUdV, rng=rng,
+        )
+
+    return init_fn, step_fn

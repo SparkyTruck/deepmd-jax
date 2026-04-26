@@ -16,21 +16,37 @@ from jax.sharding import PartitionSpec as PSpec
 from .utils import split, reorder_by_device, get_mask_by_device
 
 
-def min_image_unwrap(previous_position, current_position, box, fractional=False):
-    '''Unwrap a step's positions against the previous step (no time-jumps).
+def iso_pressure(energy_fn, position, box, n_atoms, kT, **kwargs):
+    """Isotropic pressure (eV/Å^3) from a uniform-strain derivative.
 
-    fractional=True is for NPT, where coordinates already live in [0,1) modulo
-    the time-varying box and the wrap is in fractional space.
+    P = (N kT - dU/dε / 3) / V, where dU/dε is taken under
+    perturbation=(1+ε) on both real-space coord and box. PBC-correct since
+    the energy_fn handles the box internally.
+
+    For classical MD pass the full ``energy_fn``. For PIMD pass the bead-
+    averaged ML-only energy (the spring is V-independent in real coords and
+    must not enter the pressure).
+
+    The instantaneous-KE form ``(2KE - dU/dε) / (3V)`` would be equivalent at
+    equilibrium for classical MD; using N kT directly gives the same
+    expectation with smaller per-step noise, and is the centroid-virial
+    estimator for PIMD.
+    """
+    def U(eps):
+        return energy_fn(position, box=box, perturbation=(1 + eps), **kwargs)
+    dUdε = jax.grad(U)(jnp.zeros((), position.dtype))
+    V = jnp.linalg.det(box) if box.ndim == 2 else jnp.prod(box)
+    return (n_atoms * kT - dUdε / 3.0) / V
+
+
+def min_image_unwrap(previous_position, current_position, box):
+    '''Unwrap a step's real-space positions against the previous step,
+    undoing the box-length jumps the periodic shift_fn may have introduced.
     '''
-    if fractional:
-        return previous_position + (current_position - previous_position + 0.5) % 1 - 0.5
     if box.size == 3:
         return previous_position + (current_position - previous_position + box/2) % box - box/2
-    inv = jnp.linalg.inv(box)
-    frac_prev = previous_position @ inv
-    frac_curr = current_position @ inv
-    frac_curr = frac_prev + (frac_curr - frac_prev + 0.5) % 1 - 0.5
-    return frac_curr @ box
+    delta_frac = (current_position - previous_position) @ jnp.linalg.inv(box)
+    return previous_position + (delta_frac - jnp.round(delta_frac)) @ box
 
 
 def print_run_profile(steps, elapsed_time, natoms, dt):
