@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import time, datetime
 import flax.linen as nn
 from functools import partial
-from .utils import get_p3mlr_fn, get_p3mlr_grid_size, load_model, save_model, compress_model, save_dataset
+from .utils import get_p3mlr_fn, get_p3mlr_grid_size, load_model, save_model, compress_model, save_dataset, dplr_charges
 from .data import DPDataset
 from .dpmodel import DPModel
 from typing import Union, List
@@ -152,7 +152,7 @@ def train(
     # load dataset
     if 'atomic' in model_type and atomic_data_prefix is None:
         atomic_data_prefix = 'atomic_dipole' if model_type == 'atomic' else 'atomic_polarizability'
-    if model_type == 'energy' or model_type == 'dplr':
+    if model_type in ('energy', 'dplr'):
         labels = ['coord', 'box', 'force', 'energy']
     elif 'atomic' in model_type:
         labels = ['coord', 'box', atomic_data_prefix]
@@ -362,7 +362,6 @@ def train(
     else:
         state = {'loss_avg': 0., 'iteration': 0}
     if hybrid:
-        state_obs = {}
         _single_state_obs = {'lobs_avg': 0., 'obs_term_avg': 0., 'obs_mean': 0., 'logweights': [0.], 'ESS': 1. }
         state_obs = {k: _single_state_obs for k in range(len(obs_train_data_path))}
 
@@ -545,7 +544,7 @@ def test(
         print('# Note: Currently only one device will be used for evaluation.')
     
     model, variables = load_model(model_path, replicate=False)
-    if model.params['type'] == 'energy' or model.params['type'] == 'dplr':
+    if model.params['type'] in ('energy', 'dplr'):
         labels = ['coord', 'box', 'force', 'energy']
         atomic_sel = None
     elif 'atomic' in model.params['type']:
@@ -568,7 +567,7 @@ def test(
                                       *model.params['dplr_wannier_model_and_variables'])
     test_data.pointer = 0
     remaining = test_data.nframes
-    if model.params['type'] == 'energy' or model.params['type'] == 'dplr':
+    if model.params['type'] in ('energy', 'dplr'):
         evaluate_fn = model.energy_and_force
         predictions = {'energy': [], 'force': []}
         ground_truth = {'energy': [], 'force': []}
@@ -585,7 +584,7 @@ def test(
         remaining -= bs
         static_args = nn.FrozenDict({'type_idx': type_idx, 'lattice': lattice_args})
         pred = evaluate_fn(variables, batch['coord'], batch['box'], static_args)
-        if model.params['type'] == 'energy' or model.params['type'] == 'dplr':
+        if model.params['type'] in ('energy', 'dplr'):
             predictions['energy'].append(pred[0])
             predictions['force'].append(pred[1])
             ground_truth['energy'].append(batch['energy'])
@@ -601,7 +600,7 @@ def test(
         ground_truth[key] = np.concatenate(ground_truth[key], axis=0)
         rmse[key] = (((predictions[key] - ground_truth[key]) ** 2).mean() ** 0.5).item()
         mae[key] = np.abs(predictions[key] - ground_truth[key]).mean().item()
-    if model.params['type'] == 'energy' or model.params['type'] == 'dplr':
+    if model.params['type'] in ('energy', 'dplr'):
         natoms = predictions['force'].shape[1]
         rmse['energy'] /= natoms
         mae['energy'] /= natoms
@@ -686,12 +685,8 @@ def process_long_range_subset(subset, dplr_q_atoms, dplr_q_wc, dplr_beta, dplr_r
     if not lattice_args['ortho']:
         raise ValueError('For "dplr" currently only orthorhombic boxes are supported.')
     type_idx = np.asarray(type_idx)
-    nsel = list(wc_model.params['nsel'])
-    pos_in_nsel = np.full(wc_model.params['ntypes'], -1, dtype=int)
-    pos_in_nsel[np.asarray(nsel)] = np.arange(len(nsel))
-    nsel_mask = np.isin(type_idx, nsel)
-    qatoms = np.asarray(dplr_q_atoms)[type_idx]
-    qwc = np.asarray(dplr_q_wc)[pos_in_nsel[type_idx[nsel_mask]]]
+    qatoms, qwc = dplr_charges(type_idx, dplr_q_atoms, dplr_q_wc,
+                               wc_model.params['nsel'], wc_model.params['ntypes'])
     static_args = nn.FrozenDict({'type_idx': tuple(type_idx), 'lattice': lattice_args})
 
     def lr_energy(coord, box, Ngrid):

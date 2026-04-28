@@ -5,7 +5,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax_md import quantity, util
-from jax_md import simulate as _jms
+from jax_md import simulate
 
 def nvt_nose_hoover_invariant(energy_fn,
                     state: jax_md.simulate.NVTNoseHooverState,
@@ -108,8 +108,8 @@ class CachedNPTNoseHooverState:
     box_momentum: jnp.ndarray
     box_mass: jnp.ndarray
 
-    barostat: _jms.NoseHooverChain
-    thermostat: _jms.NoseHooverChain
+    barostat: simulate.NoseHooverChain
+    thermostat: simulate.NoseHooverChain
 
     dUdV: jnp.ndarray
     group_ids: jnp.ndarray
@@ -194,11 +194,11 @@ def npt_nose_hoover(
     membership = jnp.asarray(membership_np)  # (3, G), per-axis one-hot over groups
     n_per_group = jnp.asarray(n_per_group_np, dtype=f32)  # (G,)
 
-    barostat_kwargs = _jms.default_nhc_kwargs(1000 * dt, barostat_kwargs)
-    barostat = _jms.nose_hoover_chain(dt, **barostat_kwargs)
+    barostat_kwargs = simulate.default_nhc_kwargs(1000 * dt, barostat_kwargs)
+    barostat = simulate.nose_hoover_chain(dt, **barostat_kwargs)
 
-    thermostat_kwargs = _jms.default_nhc_kwargs(100 * dt, thermostat_kwargs)
-    thermostat = _jms.nose_hoover_chain(dt, **thermostat_kwargs)
+    thermostat_kwargs = simulate.default_nhc_kwargs(100 * dt, thermostat_kwargs)
+    thermostat = simulate.nose_hoover_chain(dt, **thermostat_kwargs)
 
     def force_stress_fn(position, box, **kwargs):
         def U(position, eps):
@@ -296,9 +296,9 @@ def npt_nose_hoover(
             dUdV=dUdV,
             group_ids=group_ids,
         )
-        state = _jms.canonicalize_mass(state)
-        state = _jms.initialize_momenta(state, key, _kT)
-        KE = _jms.kinetic_energy(state)
+        state = simulate.canonicalize_mass(state)
+        state = simulate.initialize_momenta(state, key, _kT)
+        KE = simulate.kinetic_energy(state)
         return state.set(
             thermostat=thermostat.initialize(quantity.count_dof(R), KE, _kT)
         )

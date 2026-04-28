@@ -352,6 +352,20 @@ def reorder_by_device(coord, type_idx, K=None):
     return jax.lax.with_sharding_constraint(coord, PSpec())
 
 
+def dplr_charges(type_idx, q_atoms, q_wc, nsel, ntypes):
+    '''Per-atom and per-wc charges in raw atom order.
+    qatoms: (N,), one entry per real atom; qwc: (M,) in raw order over atoms
+    whose type is in nsel (matching wc_predict's output ordering).'''
+    type_idx = np.asarray(type_idx)
+    nsel_arr = np.asarray(list(nsel))
+    pos_in_nsel = np.full(ntypes, -1, dtype=int)
+    pos_in_nsel[nsel_arr] = np.arange(len(nsel_arr))
+    nsel_mask = np.isin(type_idx, nsel_arr)
+    qatoms = np.asarray(q_atoms)[type_idx]
+    qwc = np.asarray(q_wc)[pos_in_nsel[type_idx[nsel_mask]]]
+    return qatoms, qwc
+
+
 def assert_type_idx_in_valid_types(type_idx, valid_types):
     '''Reject atom types the model was not trained on.'''
     type_idx = np.asarray(type_idx)
