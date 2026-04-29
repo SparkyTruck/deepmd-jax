@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import time, datetime
 import flax.linen as nn
 from functools import partial
-from .utils import get_p3mlr_fn, get_p3mlr_grid_size, load_model, save_model, compress_model, save_dataset, dplr_charges
+from .utils import get_p3mlr_fn, get_p3mlr_grid_size, load_model, save_model, compress_model, dplr_charges
 from .data import DPDataset
 from .dpmodel import DPModel
 from typing import Union, List

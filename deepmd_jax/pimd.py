@@ -15,7 +15,6 @@ import jax.numpy as jnp
 import numpy as np
 import jax_md
 from jax_md import simulate
-from jax_md import quantity
 
 HBAR = 6.582119569e-16 * 1e15  # reduced Planck's constant, eV*fs
 
@@ -54,25 +53,30 @@ class PIMDLangevinState:
     position, momentum, force : ``(P, N, 3)`` arrays.
     mass : ``(N, 1)`` array (canonicalized from a ``(N,)`` input).
     rng : PRNG key.
+    thermostat_work : scalar; cumulative work done by the PILE-L thermostat
+        (sum of ``KE_after_O - KE_before_O`` across O steps). Subtracting this
+        from the ring-polymer Hamiltonian yields a quantity conserved up to
+        BA-step discretization error — the Langevin analogue of the NVE
+        invariant.
     """
     position: jnp.ndarray
     momentum: jnp.ndarray
     force: jnp.ndarray
     mass: jnp.ndarray
     rng: jnp.ndarray
+    thermostat_work: jnp.ndarray
 
     @property
     def velocity(self):
         return self.momentum / self.mass
 
 
-@simulate.initialize_momenta.register(PIMDLangevinState)
-def _initialize_momenta_pimd(state, key, kT):
-    shape = state.position.shape  # (P, N, 3)
-    n_bead = shape[0]
-    p = jnp.sqrt(state.mass * kT * n_bead) * jax.random.normal(
-        key, shape, dtype=state.position.dtype)
-    return state.set(momentum=p)
+def initial_pimd_momentum(R, mass, kT, key):
+    """Maxwell-Boltzmann sample at the ring-polymer temperature P·kT.
+       R: (P, N, 3); mass: (N, 1)."""
+    n_bead = R.shape[0]
+    return jnp.sqrt(mass * kT * n_bead) * jax.random.normal(
+        key, R.shape, dtype=R.dtype)
 
 
 def spring_energy(R, mass, box, omega_P):
@@ -92,14 +96,19 @@ def _pile_l_stochastic_step(state, dt, kT, gamma_P, nm_trans):
     nm_trans : ``(P, P)`` orthogonal transform ``C``.
     """
     n_bead = state.position.shape[0]
-    P_nm = jnp.tensordot(nm_trans.T, state.momentum, axes=(1, 0))  # (P, N, 3)
+    P_old = state.momentum
+    P_nm = jnp.tensordot(nm_trans.T, P_old, axes=(1, 0))             # (P, N, 3)
     c1 = jnp.exp(-gamma_P * dt)[:, None, None]                       # (P, 1, 1)
     c2 = jnp.sqrt(jnp.maximum(kT * n_bead * (1.0 - c1**2), 0.0))     # (P, 1, 1)
     key, split = jax.random.split(state.rng)
     noise = jax.random.normal(split, shape=P_nm.shape, dtype=P_nm.dtype)
     P_nm = c1 * P_nm + c2 * jnp.sqrt(state.mass) * noise
     momentum = jnp.tensordot(nm_trans, P_nm, axes=(1, 0))
-    return state.set(momentum=momentum, rng=key)
+    delta_KE = 0.5 * jnp.sum((momentum ** 2 - P_old ** 2) / state.mass)
+    return state.set(
+        momentum=momentum, rng=key,
+        thermostat_work=state.thermostat_work + delta_KE,
+    )
 
 
 def nvt_langevin_pimd(
@@ -138,7 +147,8 @@ def nvt_langevin_pimd(
     omega_P = n_bead * kT / HBAR
 
     def total_energy_fn(R, mass, **kwargs):
-        return (energy_fn(R, box=box, **kwargs)
+        kwargs.pop('box', None)
+        return (n_bead * energy_fn(R, box=box, **kwargs)
                 + spring_energy(R, mass, box, omega_P))
 
     def total_force_fn(R, mass, **kwargs):
@@ -150,10 +160,11 @@ def nvt_langevin_pimd(
         key, split = jax.random.split(key)
         state = PIMDLangevinState(
             position=R, momentum=None, force=None, mass=mass, rng=key,
+            thermostat_work=jnp.zeros((), dtype=R.dtype),
         )
         state = simulate.canonicalize_mass(state)
         state = state.set(force=total_force_fn(R, state.mass, **kwargs))
-        return simulate.initialize_momenta(state, split, _kT)
+        return state.set(momentum=initial_pimd_momentum(R, state.mass, _kT, split))
 
     @jax.jit
     def step_fn(state, **kwargs):
@@ -192,6 +203,16 @@ def unwrap_across_beads(coord, box):
     return ref + delta
 
 
+def unwrap_step_position(previous_position, current_position, box):
+    """Put ``current_position`` on the nearest periodic image to ``previous_position``."""
+    if box.size == 3:
+        return (previous_position
+                + (current_position - previous_position + box / 2) % box
+                - box / 2)
+    delta_frac = (current_position - previous_position) @ jnp.linalg.inv(box)
+    return previous_position + (delta_frac - jnp.round(delta_frac)) @ box
+
+
 def centroid(coord, box):
     """Ring-polymer centroid with correct handling of periodic wrapping.
 
@@ -200,25 +221,6 @@ def centroid(coord, box):
     without reimplementing the unwrap.
     """
     return unwrap_across_beads(coord, box).mean(axis=0)
-
-
-def primitive_kinetic_energy(state):
-    """Kinetic energy of the extended ring-polymer system (all P*N primitive DOFs)."""
-    return quantity.kinetic_energy(momentum=state.momentum, mass=state.mass)
-
-
-def physical_temperature(state, n_bead):
-    """Physical temperature (in the same units as ``quantity.temperature``)."""
-    return quantity.temperature(momentum=state.momentum, mass=state.mass) / n_bead
-
-
-def cv_pressure_from_dUdV_iso(N, dUdV_iso, V, kT):
-    """Centroid-virial pressure (eV/Å^3) from the isotropic strain derivative.
-    P_cv = (N kT - (1/3) dU/d_eps_iso) / V.
-    dU/d_eps is the bead-averaged energy's derivative under uniform strain
-    eps -> (1+eps) on both R and box.
-    """
-    return (N * kT - dUdV_iso / 3.0) / V
 
 
 # -----------------------------------------------------------------------------
@@ -231,9 +233,9 @@ class PIMDNPTLangevinState:
     """State for BAOAB Langevin PIMD with PILE-L thermostat and a Langevin barostat.
 
     Position/momentum/force are ``(P, N, 3)``; box DOF is ``(G,)`` per couple-axes
-    group. ``dUdV`` here is ``dU/d_eps`` (centroid-virial) from the user-supplied
-    potential only; the spring term is independent of the cell in real coords
-    and never enters the barostat.
+    group. ``dUdV`` here is the bead-averaged ``dU/d_eps`` centroid-virial
+    strain derivative of the user-supplied potential only; the spring term is
+    independent of the cell in real coords and never enters the barostat.
     """
     position: jnp.ndarray
     momentum: jnp.ndarray
@@ -250,6 +252,9 @@ class PIMDNPTLangevinState:
     group_ids: jnp.ndarray
     rng: jnp.ndarray
 
+    thermostat_work: jnp.ndarray
+    box_thermostat_work: jnp.ndarray
+
     @property
     def velocity(self):
         return self.momentum / self.mass
@@ -260,14 +265,6 @@ class PIMDNPTLangevinState:
         safe = jnp.maximum(self.group_ids, 0)
         per_axis = jnp.where(self.group_ids >= 0, scales_g[safe], 1.)
         return self.reference_box * per_axis
-
-
-@simulate.initialize_momenta.register(PIMDNPTLangevinState)
-def _initialize_momenta_pimd_npt(state, key, kT):
-    n_bead = state.position.shape[0]
-    p = jnp.sqrt(state.mass * kT * n_bead) * jax.random.normal(
-        key, state.position.shape, dtype=state.position.dtype)
-    return state.set(momentum=p)
 
 
 def _sinhx_x(x):
@@ -297,7 +294,9 @@ def npt_langevin_pimd(
     added internally; the caller passes the bead-averaged potential only.
 
     In real coords the spring depends only on bead positions (not the cell),
-    so it never enters dU/dV.
+    so it never enters dU/dV. The potential virial is the centroid-virial
+    derivative: the centroid and box are strained together, while bead
+    displacements from the centroid are held fixed.
     """
     f32 = jnp.float32
     dt = f32(dt)
@@ -310,15 +309,23 @@ def npt_langevin_pimd(
     group_ids = jnp.asarray(group_ids)
 
     def force_stress_fn(R, box, **kwargs):
-        """Returns (F_per_bead, dU_avg/d_eps_per_group) from the user-supplied energy."""
+        """Returns (F_per_bead, dU/d_eps_per_group) from the user potential.
+
+        The centroid-virial strain derivative is evaluated as the ordinary
+        full-coordinate strain derivative plus the internal-mode virial
+        correction, so only centroid separations contribute to the cell force.
+        """
         def U(R_, eps):
             perturbation = 1.0 + membership @ eps
-            # energy_fn is bead-averaged; multiply by n_bead so grad(R) yields
-            # the natural per-bead force on each bead.
-            return n_bead * energy_fn(R_, box=box, perturbation=perturbation, **kwargs)
+            return n_bead * energy_fn(R_, box=box, perturbation=perturbation,
+                                      **kwargs)
         eps0 = jnp.zeros(G, dtype=R.dtype)
         _, grads = jax.value_and_grad(U, argnums=(0, 1))(R, eps0)
-        return -grads[0], grads[1] / n_bead
+        F = -grads[0]
+        R_uw = unwrap_across_beads(R, box)
+        dR_internal = R_uw - R_uw.mean(axis=0, keepdims=True)
+        internal_virial_axis = jnp.sum(dR_internal * F, axis=(0, 1))
+        return F, (grads[1] + membership.T @ internal_virial_axis) / n_bead
 
     def force_and_dUdV(R, mass, box, **kwargs):
         """Bead force from (energy_fn + spring); dUdV is from energy_fn only."""
@@ -368,14 +375,18 @@ def npt_langevin_pimd(
         x = vel_b_per_axis * dt_step
         x_2 = x / 2
         sinh_factor = _sinhx_x(x_2)
-        R_c = R.mean(axis=0)
+        # Use the same periodic-image convention as the centroid-virial stress.
+        # The periodic shift_fn can wrap beads between the two half drifts, and
+        # a raw bead mean would move the wrong centroid when a ring polymer
+        # straddles a boundary.
+        R_c = unwrap_across_beads(R, box).mean(axis=0)
         vel_c = vel.mean(axis=0)
         # Adjustment lifts free drift to PR drift on the centroid:
         #   centroid_pr - centroid_free = R_c*(exp(x)-1) + dt*vel_c*(exp(x/2)*sinh - 1)
         adjustment = (R_c * (jnp.exp(x) - 1)
                       + dt_step * vel_c * (jnp.exp(x_2) * sinh_factor - 1.0))
         dR = dt_step * vel + adjustment[None]
-        return shift_fn(R, dR, box=box, **kwargs)
+        return unwrap_step_position(R, shift_fn(R, dR, box=box, **kwargs), box)
 
     def init_fn(key, R, box, mass=f32(1.0), **kwargs):
         N = R.shape[1]
@@ -396,12 +407,14 @@ def npt_langevin_pimd(
             reference_box=box,
             box_position=box_position, box_momentum=box_momentum, box_mass=box_mass,
             dUdV=None, group_ids=group_ids, rng=key,
+            thermostat_work=jnp.zeros((), dtype=R.dtype),
+            box_thermostat_work=jnp.zeros((), dtype=R.dtype),
         )
         state = simulate.canonicalize_mass(state)
         F, dUdV = force_and_dUdV(R, state.mass, box,
                                  **{k: v for k, v in kwargs.items() if k != 'kT'})
         state = state.set(force=F, dUdV=dUdV)
-        return simulate.initialize_momenta(state, split, _kT)
+        return state.set(momentum=initial_pimd_momentum(R, state.mass, _kT, split))
 
     @jax.jit
     def step_fn(state, **kwargs):
@@ -434,17 +447,21 @@ def npt_langevin_pimd(
         rng = state.rng
         rng, sub1, sub2 = jax.random.split(rng, 3)
         # PILE-L:
+        P_old = P
         P_nm = jnp.tensordot(nm_trans.T, P, axes=(1, 0))
         c1 = jnp.exp(-gamma_P * dt)[:, None, None]
         c2 = jnp.sqrt(jnp.maximum(_kT * n_bead * (1.0 - c1**2), 0.0))
         noise = jax.random.normal(sub1, shape=P_nm.shape, dtype=P_nm.dtype)
         P_nm = c1 * P_nm + c2 * jnp.sqrt(M) * noise
         P = jnp.tensordot(nm_trans, P_nm, axes=(1, 0))
+        delta_KE = 0.5 * jnp.sum((P ** 2 - P_old ** 2) / M)
         # Langevin barostat:
+        P_b_old = P_b
         c1_b = jnp.exp(-gamma_box * dt)
         c2_b = jnp.sqrt(jnp.maximum(_kT * (1.0 - c1_b**2), 0.0))
         noise_b = jax.random.normal(sub2, shape=P_b.shape, dtype=P_b.dtype)
         P_b = c1_b * P_b + c2_b * jnp.sqrt(M_b) * noise_b
+        delta_KE_box = 0.5 * jnp.sum((P_b ** 2 - P_b_old ** 2) / M_b)
 
         # 5. Half box-position + half position drift (A).
         R_b = R_b + dt_2 * P_b / M_b
@@ -465,6 +482,8 @@ def npt_langevin_pimd(
             position=R, momentum=P, force=F,
             box_position=R_b, box_momentum=P_b,
             dUdV=dUdV, rng=rng,
+            thermostat_work=state.thermostat_work + delta_KE,
+            box_thermostat_work=state.box_thermostat_work + delta_KE_box,
         )
 
     return init_fn, step_fn

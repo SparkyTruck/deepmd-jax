@@ -1,5 +1,4 @@
 from typing import List, Optional
-import sys
 
 import jax_md
 import jax
@@ -8,33 +7,22 @@ import numpy as np
 import flax.linen as nn
 import gc
 from time import time
-from ase import io, Atoms
 from jax.sharding import PartitionSpec as PSpec
-from ase.calculators.calculator import Calculator, all_changes
 
 from .data import compute_lattice_candidate
-from .utils import (split, concat, load_model, norm_ortho_box,
-                    get_p3mlr_fn, get_p3mlr_grid_size,
-                    reorder_by_device, get_mask_by_device, dplr_charges)
-from .md_utils import (TypedNeighborList, typed_neighbor_list,
-                               typed_neighbor_list_fn,
-                               get_type_mask_fns, get_idx_mask_fn,
-                               min_image_unwrap, print_run_profile,
-                               prepare_dumps, write_dump_frame,
-                               stack_typed_nbrs_per_bead,
-                               iso_pressure)
+from .utils import (load_model, norm_ortho_box, get_p3mlr_fn, reorder_by_device, dplr_charges)
+from .md_utils import (typed_neighbor_list, min_image_unwrap, print_run_profile,
+            prepare_dumps, write_dump_frame, stack_typed_nbrs_per_bead, iso_pressure)
 # Back-compat re-export; the ASE calculator now lives in ase_calc.py.
 from .ase_calc import DPJaxCalculator  # noqa: F401
 from .routine import *
 from .routine import _parse_couple_axes
 from . import pimd as _pimd
-from typing import Callable
 from functools import partial
 
 MASS_UNIT_CONVERSION = 1.036427e2 # from Dalton to eV * fs^2 / Å^2
 TEMP_UNIT_CONVERSION = 8.617333e-5 # from Kelvin to eV
 PRESS_UNIT_CONVERSION = 6.241509e-7 # from bar to eV / Å^3
-
 
 
 class Simulation:
@@ -195,8 +183,8 @@ class Simulation:
         else: 
             self._mobile = None
 
-        if self._mobile is not None and self._routine not in ('NVT', 'NVE'):
-            raise NotImplementedError("Fixing atoms currently limited to NVE and NVT routines.")
+        if self._mobile is not None and self._routine not in ('NVT', 'NVE', 'NVT_langevin'):
+            raise NotImplementedError("Fixing atoms currently limited to NVE, NVT, and NVT_langevin routines.")
 
         def _shift_fn_wrapper(x, dx, **kwargs):
             if self._mobile is not None:
@@ -258,18 +246,10 @@ class Simulation:
             self._deviation_energy_fns = [
                 self._get_energy_fn(load_model(path)) for path in self._model_deviation_paths
             ]
-        init_fn, apply_fn = self._routine_fn(self._energy_fn,
-                                                     self._shift_fn,
-                                                     self._dt,
-                                                     **self._routine_args)
-        
-        if self._routine == "NVT" and self._mobile is not None:
-            self._init_fn, self._apply_fn = nvt_with_fixed_atoms(init_fn, apply_fn, self._mobile)
-        elif self._routine == "NVE" and self._mobile is not None:
-            self._init_fn, self._apply_fn = nve_with_fixed_atoms(init_fn, apply_fn, self._mobile)
-        else:
-            self._init_fn = init_fn
-            self._apply_fn = apply_fn
+        self._init_fn, self._apply_fn = self._routine_fn(self._energy_fn,
+                                                         self._shift_fn,
+                                                         self._dt,
+                                                         **self._routine_args)
 
         self._report_fn = self._generate_report_fn()
         self._soft_update_nbrs = self._get_soft_update_nbrs_fn()
@@ -295,13 +275,14 @@ class Simulation:
 
         key = (self._routine, self._is_pimd)
         if key == ("NVE", False):
-            return jax_md.simulate.nve, {}
+            return nve, {'mobile_mask': self._mobile}
         if key == ("NVT", False):
-            return jax_md.simulate.nvt_nose_hoover, {
+            return nvt_nose_hoover, {
                 'kT': kT, 'tau': tau_t,
                 'chain_length': chain_length_t,
                 'chain_steps': chain_steps_t,
                 'sy_steps': sy_steps_t,
+                'mobile_mask': self._mobile,
             }
         if key == ("NVT", True):
             # PILE-L: critically damped internal modes, centroid friction = 1/tau_t.
@@ -314,7 +295,10 @@ class Simulation:
                 'nm_trans': jnp.asarray(self._nm_trans),
             }
         if key == ("NVT_langevin", False):
-            return jax_md.simulate.nvt_langevin, {'kT': kT, 'gamma': 1.0 / tau_t}
+            return nvt_langevin, {
+                'kT': kT, 'gamma': 1.0 / tau_t,
+                'mobile_mask': self._mobile,
+            }
         if key == ("NPT", False):
             return npt_nose_hoover, {
                 'pressure': pressure * PRESS_UNIT_CONVERSION,
@@ -357,18 +341,15 @@ class Simulation:
                             resolution=model.params['dplr_resolution'],
                         )
             qatoms_np, qwc_np = dplr_charges(
-                self._type_idx,
-                model.params['dplr_q_atoms'], model.params['dplr_q_wc'],
+                self._type_idx, model.params['dplr_q_atoms'], model.params['dplr_q_wc'],
                 wc_model.params['nsel'], self._model.params['ntypes'])
-            qatoms = jnp.array(qatoms_np)
-            qwc = jnp.array(qwc_np)
+            qatoms, qwc = jnp.array(qatoms_np), jnp.array(qwc_np)
 
         def _single_conf_energy(coord, box, nbrs_nm):
             '''Evaluate the ML (and optional DPLR) potential on one configuration.'''
             E = model.apply(variables, coord, box, self._static_args, nbrs_nm)[0]
             if model.params['type'] == 'dplr':
-                wc = wc_model.wc_predict(
-                    wc_variables, coord, box, self._static_args, nbrs_nm)
+                wc = wc_model.wc_predict(wc_variables, coord, box, self._static_args, nbrs_nm)
                 E = E + p3mlr_fn(
                     jnp.concatenate([coord, wc]),
                     jnp.concatenate([qatoms, qwc]),
@@ -399,12 +380,10 @@ class Simulation:
 
             if not self._is_pimd:
                 return _single_conf_energy(coord, box, nbrs_nm)
-            # Bead axis vmapped; neighbor lists (when used) are per-bead, box shared.
-            nbrs_axes = None if nbrs_nm is None else 0
-            E_per_bead = jax.vmap(
-                _single_conf_energy, in_axes=(0, None, nbrs_axes)
-            )(coord, box, nbrs_nm)                                   # (P,)
-            return jnp.sum(E_per_bead) / self._n_bead
+            else:
+                nbrs_axes = None if nbrs_nm is None else 0
+                E_per_bead = jax.vmap(_single_conf_energy, in_axes=(0, None, nbrs_axes))(coord, box, nbrs_nm) # (P,)
+                return jnp.sum(E_per_bead) / self._n_bead # average over beads
 
         return energy_fn
 
@@ -468,6 +447,20 @@ class Simulation:
                                             self._temperature * TEMP_UNIT_CONVERSION,
                                             nbrs_nm=nbrs_nm,
                                         )
+        elif self._routine == "NVT_langevin":
+            self._reporters["Invariant"] = lambda state, nbrs_nm: (
+                jax_md.simulate.kinetic_energy(state)
+                + self._energy_fn(state.position, box=self._initial_box, nbrs_nm=nbrs_nm)
+                - state.thermostat_work
+            )
+        elif self._routine == "NVT" and self._is_pimd:
+            omega_P = self._n_bead * self._temperature * TEMP_UNIT_CONVERSION / _pimd.HBAR
+            def _pimd_nvt_invariant(state, nbrs_nm):
+                return (jax_md.simulate.kinetic_energy(state)
+                        + self._n_bead * self._energy_fn(state.position, box=self._initial_box, nbrs_nm=nbrs_nm)
+                        + _pimd.spring_energy(state.position, state.mass, self._initial_box, omega_P)
+                        - state.thermostat_work)
+            self._reporters["Invariant"] = _pimd_nvt_invariant
         elif self._routine == "NPT":
             self._reporters["Pressure"] = lambda state, nbrs_nm: self._pressure_fn(state, state.box, nbrs_nm)
             # One column per moving axis. Fixed axes are omitted; axes in the
@@ -484,6 +477,26 @@ class Simulation:
                                                 self._temperature * TEMP_UNIT_CONVERSION,
                                                 nbrs_nm=nbrs_nm,
                                             )
+            else:
+                omega_P = self._n_bead * self._temperature * TEMP_UNIT_CONVERSION / _pimd.HBAR
+                P_target = self._pressure * PRESS_UNIT_CONVERSION
+                def _pimd_npt_invariant(state, nbrs_nm):
+                    box = state.box
+                    V = jnp.prod(box) if box.ndim == 1 else jnp.linalg.det(box)
+                    KE_box = 0.5 * jnp.sum(state.box_momentum ** 2 / state.box_mass)
+                    # The implemented PIMD piston acts on the physical centroid
+                    # variables, so the conserved system enthalpy is the
+                    # bead-averaged ring-polymer Hamiltonian.
+                    H_rp = (jax_md.simulate.kinetic_energy(state)
+                            + self._n_bead * self._energy_fn(
+                                state.position, box=box, nbrs_nm=nbrs_nm)
+                            + _pimd.spring_energy(
+                                state.position, state.mass, box, omega_P))
+                    return (H_rp / self._n_bead
+                            + KE_box + P_target * V
+                            - state.thermostat_work / self._n_bead
+                            - state.box_thermostat_work)
+                self._reporters["Invariant"] = _pimd_npt_invariant
         if self._use_model_deviation:
             self._reporters["Model_Devi"] = lambda state, nbrs_nm: jnp.array([
                 -jax.grad(fn)(
@@ -731,18 +744,27 @@ class Simulation:
 
         return multiple_inner_step
 
-    def _initialize_run(self, steps, has_dumps=False):
+    def _initialize_run(self, steps,
+                        dump_position=None, dump_velocity=None,
+                        dump_centroid=None, dump_interval=None):
         '''
             Reset trajectory for each new run; if the simulation has not been
-            run before, include the initial state. When has_dumps=True, skip
-            the in-memory trajectory buffers entirely and stream to disk.
+            run before, include the initial state. When any ``dump_*`` path is
+            given, set up streaming to disk instead of preallocating in-memory
+            trajectory buffers, and write the initial state to file.
         '''
+        self._dumps, self._write_interval = prepare_dumps(
+            {'position': dump_position, 'velocity': dump_velocity,
+             'centroid': dump_centroid},
+            self._type_idx, self._type_symbols, self._n_bead,
+            default_interval=self.report_interval, dump_interval=dump_interval)
+        self._has_dumps = len(self._dumps) > 0
+
         print(f'# Running {steps} steps...')
         traj_length = steps + int(self._is_initial_state)
         self._offset = self.step - int(self._is_initial_state)
         traj_dtype = np.float64 if jax.config.read('jax_enable_x64') else np.float32
-        self._has_dumps = has_dumps
-        if not has_dumps:
+        if not self._has_dumps:
             # preallocate space for trajectory
             frame_shape = ((self._n_bead, self._natoms, 3) if self._is_pimd
                            else (self._natoms, 3))
@@ -769,11 +791,16 @@ class Simulation:
                 self._box_trajectory[0] = self.getBox()
                 if self._is_pimd:
                     self._centroid_trajectory[0] = self.getCentroidPosition()
+        else:
+            if self._is_initial_state and (self.step % self._write_interval == 0):
+                write_dump_frame(self._dumps,
+                                 self.getPosition(), self.getVelocity(),
+                                 self.getCentroidPosition() if self._is_pimd else None,
+                                 self._current_box)
         self._tic_of_this_run = time()
         self._tic_between_report = time()
         self._error_code = 0
         self._print_report()
-        self._is_initial_state_at_run_start = self._is_initial_state
         self._is_initial_state = False
 
     def run(self, steps,
@@ -785,19 +812,11 @@ class Simulation:
             Run for ``steps`` steps. Returns a trajectory dict, or ``None`` if
             any ``dump_*`` kwarg is given (frames stream to XYZ instead).
         '''
-        dumps, write_interval = prepare_dumps(
-            {'position': dump_position, 'velocity': dump_velocity,
-             'centroid': dump_centroid},
-            self._type_idx, self._type_symbols, self._n_bead,
-            default_interval=self.report_interval, dump_interval=dump_interval)
-        has_dumps = len(dumps) > 0
-
-        self._initialize_run(steps, has_dumps=has_dumps)
-        if has_dumps and self._is_initial_state_at_run_start and (self.step % write_interval == 0):
-            write_dump_frame(dumps,
-                             self.getPosition(), self.getVelocity(),
-                             self.getCentroidPosition() if self._is_pimd else None,
-                             self._current_box)
+        self._initialize_run(steps,
+                             dump_position=dump_position,
+                             dump_velocity=dump_velocity,
+                             dump_centroid=dump_centroid,
+                             dump_interval=dump_interval)
 
         remaining_steps = steps
         while remaining_steps > 0:
@@ -831,12 +850,12 @@ class Simulation:
             if "NPT" in self._routine:
                 self._current_box = self._state.box
             pos_traj, vel_traj, box_traj, centroid_traj = traj
-            if has_dumps:
+            if self._has_dumps:
                 base = int(self.step)
                 for i in range(next_chunk):
-                    if (base + i + 1) % write_interval == 0:
+                    if (base + i + 1) % self._write_interval == 0:
                         write_dump_frame(
-                            dumps,
+                            self._dumps,
                             np.asarray(pos_traj[i]),
                             np.asarray(vel_traj[i]),
                             np.asarray(centroid_traj[i]) if self._is_pimd else None,
@@ -858,7 +877,7 @@ class Simulation:
 
         self._print_run_profile(steps, time() - self._tic_of_this_run)
         self._keep_nbr_or_lattice_up_to_date()
-        if has_dumps:
+        if self._has_dumps:
             return None
         trajectory = {
             'position': self._position_trajectory,
@@ -996,183 +1015,9 @@ class Simulation:
                             ).item()
 
 
-class TrajDump:
-    '''
-        .. deprecated::
-            Use ``Simulation.run(..., dump_position='traj.xyz', dump_interval=10)``
-    '''
-    def __init__(
-        self,
-        atoms: Atoms,
-        fname: str,
-        interval: int,
-        vel: bool = False,
-        **kwargs,
-    ) -> None:
-        import warnings
-        warnings.warn(
-            "TrajDump is deprecated. Use Simulation.run(..., dump_position=..., "
-            "dump_velocity=..., dump_centroid=..., dump_interval=...) instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        self.fname = fname
-        self.interval = interval
-        self.vel = vel
-        self.atoms = atoms
-
-        self.write_settings = kwargs
-
-    def write(self, positions, cell):
-        self.atoms.set_positions(positions)
-        self.atoms.set_cell(cell)
-        io.write(
-            self.fname,
-            self.atoms,
-            **self.write_settings,
-        )
-
-
-class TrajDumpSimulation(Simulation):
-    """
-    Example
-    -------
-    # setup simulation
-    sim = TrajDumpSimulation(
-        model_path="model.pkl",  # Has to be an 'energy' or 'dplr' model
-        box=box,  # Angstroms
-        type_idx=type_idx,  # here the index-element map (e.g. 0-Oxygen, 1-Hydrogen) must match the dataset used to train the model
-        mass=[15.9994, 1.0078, 195.08],  # Oxygen, Hydrogen
-        routine="NVT",  # 'NVE', 'NVT', 'NPT' (Nosé-Hoover)
-        dt=0.5,  # femtoseconds
-        initial_position=initial_position,  # Angstroms
-        temperature=330,  # Kelvin
-        report_interval=10,  # Report every 100 steps
-        seed=np.random.randint(1, 1e5),  # Random seed
-    )
-
-    sim.run(
-        n_steps,
-        [
-            TrajDump(atoms, "pos_traj.xyz", 10, append=True),
-            TrajDump(atoms, "vel_traj.xyz", 10, vel=True, append=True),
-        ],
-    )
-
-    """
-
-    def __init__(
-        self,
-        model_path,
-        box,
-        type_idx,
-        mass,
-        routine,
-        dt,
-        initial_position,
-        log_file: Optional[str] = "deepmd_jax.stdout",
-        **kwargs,
-    ):
-        import warnings
-        warnings.warn(
-            "TrajDumpSimulation is deprecated. Use Simulation(..., "
-            "type_symbols=[...]) together with Simulation.run(..., "
-            "dump_position=..., dump_velocity=..., dump_centroid=..., "
-            "dump_interval=...) instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        super().__init__(
-            model_path,
-            box,
-            type_idx,
-            mass,
-            routine,
-            dt,
-            initial_position,
-            **kwargs,
-        )
-        self.log_file = log_file
-        if log_file is not None:
-            # export all stdout to log_file
-            self._stdout = sys.stdout
-            sys.stdout = open(log_file, "w", encoding="utf-8")
-
-    def __del__(self):
-        if self.log_file is not None:
-            sys.stdout.close()
-            sys.stdout = self._stdout
-
-    def _initialize_run(self, steps):
-        """
-        Reset trajectory for each new run;
-        if the simulation has not been run before, include the initial state.
-        Initialize run variables.
-        """
-        print(f"# Running {steps} steps...")
-        self._offset = self.step - int(self._is_initial_state)
-        self._tic_of_this_run = time()
-        self._tic_between_report = time()
-        self._error_code = 0
-        self._print_report()
-        self._is_initial_state = False
-
-    def run(self, steps, dump_list: List[TrajDump]):
-        """
-        Run the simulation for a number of steps.
-        """
-        self._initialize_run(steps)
-        remaining_steps = steps
-        while remaining_steps > 0:
-            # run the simulation for a jit-compiled chunk of steps
-            next_chunk = min(
-                self.report_interval - self.step % self.report_interval,
-                self._step_chunk_size,
-                remaining_steps,
-            )
-            states = (
-                self._state,
-                self._typed_nbrs if self._static_args["use_neighbor_list"] else None,
-                self._error_code,
-                self._neighbor_update_profile,
-            )
-            states_new, traj = self._multiple_inner_step_fn(states, next_chunk)
-            state_new, typed_nbrs_new, error_code, profile = states_new
-            self._error_code |= error_code
-
-            if self._error_code & 16:
-                print("# Warning: Nan or Inf encountered in simulation. Terminating.")
-                remaining_steps = 0
-
-            # If there is any hard overflow, we have to re-run the chunk
-            if not (
-                self._error_code == 0 or self._error_code == 4 or self._error_code == 16
-            ):
-                self._resolve_error_code()
-                continue
-
-            # If nothing overflows, update the tracked state and record the trajectory
-            self._keep_nbr_or_lattice_up_to_date()
-            self._state = state_new
-            self._typed_nbrs = typed_nbrs_new
-            self._neighbor_update_profile = profile
-            if "NPT" in self._routine:
-                self._current_box = self._state.box
-            pos_traj, vel_traj, box_traj, _centroid_traj = traj
-            self.step += next_chunk
-            remaining_steps -= next_chunk
-
-            # Report at preset regular intervals
-            if self.step % self.report_interval == 0 or remaining_steps == 0:
-                self._print_report()
-
-            for dump in dump_list:
-                if self.step % dump.interval == 0 or remaining_steps == 0:
-                    cell = np.concatenate([np.array(box_traj[-1]), [90, 90, 90]])
-                    dump.write(pos_traj[-1] if not dump.vel else vel_traj[-1], cell)
-
-        self._print_run_profile(steps, time() - self._tic_of_this_run)
-        self._keep_nbr_or_lattice_up_to_date()
 
 
 
+# Back-compat re-exports; these classes have moved to deprecated.py.
+# Imported at the bottom to avoid circular import (deprecated.py imports Simulation).
+from .deprecated import TrajDump, TrajDumpSimulation  # noqa: E402, F401

@@ -4,25 +4,13 @@ import jax_md
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax_md import quantity, util
-from jax_md import simulate
+from jax_md import quantity, util, simulate
 
 def nvt_nose_hoover_invariant(energy_fn,
                     state: jax_md.simulate.NVTNoseHooverState,
                     kT: float,
                     **kwargs) -> float:
-    """The conserved quantity for the NVT ensemble with a Nose-Hoover thermostat.
-
-    This function is adapted from jax_md.simulate to define the DOF differently.
-
-    Arguments:
-        energy_fn: The energy function of the Nose-Hoover system.
-        state: The current state of the system.
-        kT: The current goal temperature of the system.
-
-    Returns:
-        The Hamiltonian of the extended NVT dynamics.
-    """
+    """Adapted from jax_md.simulate to define the DOF differently."""
     PE = energy_fn(state.position, **kwargs)
     KE = jax_md.simulate.kinetic_energy(state)
 
@@ -36,30 +24,99 @@ def nvt_nose_hoover_invariant(energy_fn,
         E += p ** 2 / (2 * m) + kT * r
     return E
 
-def nve_with_fixed_atoms(nve_init_fn, nve_apply_fn, mobile_mask):
-    """Wrap NVE init/step functions to handle fixed atoms correctly."""
-    mobile = mobile_mask[:, None].astype(jnp.float32)  # (N, 1)
+@jax_md.dataclasses.dataclass
+class NVTLangevinStateWithWork:
+    """Like ``jax_md.simulate.NVTLangevinState`` plus a cumulative thermostat
+    work accumulator. Subtracting ``thermostat_work`` from ``KE + PE`` yields
+    the Langevin conserved quantity (analogue of the NVE invariant), exact
+    under BAOAB up to BA-step discretization error.
+    """
+    position: jnp.ndarray
+    momentum: jnp.ndarray
+    force: jnp.ndarray
+    mass: jnp.ndarray
+    rng: jnp.ndarray
+    thermostat_work: jnp.ndarray
 
-    def init_fn(key, R, *args, **kwargs):
-        state = nve_init_fn(key, R, *args, **kwargs)
-        return state.set(momentum=state.momentum * mobile)
+    @property
+    def velocity(self):
+        return self.momentum / self.mass
 
-    def apply_fn(state, *args, **kwargs):
-        state = nve_apply_fn(state, *args, **kwargs)
-        return state.set(momentum=state.momentum * mobile)
 
-    return init_fn, apply_fn
+def nvt_langevin(energy_or_force_fn, shift_fn, dt, kT, gamma=0.1,
+                 mobile_mask=None, **sim_kwargs):
+    """BAOAB Langevin integrator that mirrors ``jax_md.simulate.nvt_langevin``.
 
-def nvt_with_fixed_atoms(nvt_init_fn, nvt_apply_fn, mobile_mask):
-    """Wrap NVT init/step functions to handle fixed atoms correctly."""
+    Differences from the upstream version:
+      * the state carries ``thermostat_work``, the cumulative work done by the
+        O step (Σ KE_after_O − KE_before_O); subtract it from KE + PE to get
+        the Langevin invariant.
+      * ``mobile_mask`` (optional, shape ``(N,)``): atoms with mask=False keep
+        zero momentum throughout — both at init and during each O step — so
+        they never enter ``thermostat_work``. Forces on those atoms are
+        expected to be zero already (use ``stop_gradient`` in the energy fn).
+    """
+    force_fn = quantity.canonicalize_force(energy_or_force_fn)
+    if mobile_mask is not None:
+        mobile = jnp.asarray(mobile_mask, dtype=jnp.float32)[:, None]
+    else:
+        mobile = None
+
+    @jax.jit
+    def init_fn(key, R, mass=jnp.float32(1.0), **kwargs):
+        _kT = kwargs.pop('kT', kT)
+        key, split = jax.random.split(key)
+        force = force_fn(R, **kwargs)
+        state = NVTLangevinStateWithWork(
+            position=R, momentum=None, force=force, mass=mass, rng=key,
+            thermostat_work=jnp.zeros((), dtype=R.dtype),
+        )
+        state = simulate.canonicalize_mass(state)
+        state = simulate.initialize_momenta(state, split, _kT)
+        if mobile is not None:
+            state = state.set(momentum=state.momentum * mobile)
+        return state
+
+    @jax.jit
+    def step_fn(state, **kwargs):
+        _dt = kwargs.pop('dt', dt)
+        _kT = kwargs.pop('kT', kT)
+        dt_2 = _dt / 2
+
+        state = simulate.momentum_step(state, dt_2)
+        state = simulate.position_step(state, shift_fn, dt_2, **kwargs)
+        # O step (inlined so we can record ΔKE and mask noise on fixed atoms).
+        P_old = state.momentum
+        c1 = jnp.exp(-gamma * _dt)
+        c2 = jnp.sqrt(jnp.maximum(_kT * (1.0 - c1 ** 2), 0.0))
+        key, split = jax.random.split(state.rng)
+        noise = jax.random.normal(split, shape=P_old.shape, dtype=P_old.dtype)
+        if mobile is not None:
+            noise = noise * mobile
+        P_new = c1 * P_old + c2 * jnp.sqrt(state.mass) * noise
+        delta_KE = 0.5 * jnp.sum((P_new ** 2 - P_old ** 2) / state.mass)
+        state = state.set(
+            momentum=P_new, rng=key,
+            thermostat_work=state.thermostat_work + delta_KE,
+        )
+        state = simulate.position_step(state, shift_fn, dt_2, **kwargs)
+        state = state.set(force=force_fn(state.position, **kwargs))
+        state = simulate.momentum_step(state, dt_2)
+        return state
+
+    return init_fn, step_fn
+
+
+def with_fixed_atoms(init_fn, apply_fn, mobile_mask):
+    """Wrap NVE / Nose-Hoover NVT to constrain fixed atoms. Masks momenta;
+    fixes Nose-Hoover chain DOF / mass / KE if the state has a ``chain``.
+    Not suitable for Langevin (use the integrator's own ``mobile_mask``)."""
     mobile = mobile_mask[:, None].astype(jnp.float32)  # (N, 1)
     dof = int(3 * jnp.sum(mobile_mask))
 
-    def init_fn(key, R, *args, **kwargs):
-        state = nvt_init_fn(key, R, *args, **kwargs)
-        # Zero fixed atom velocities
+    def wrapped_init(key, R, *args, **kwargs):
+        state = init_fn(key, R, *args, **kwargs)
         state = state.set(momentum=state.momentum * mobile)
-        # Fix thermostat chain: correct DOF, chain mass Q[0], and stored KE
         if hasattr(state, "chain"):
             KE = jax_md.simulate.kinetic_energy(state)
             new_mass = state.chain.mass.at[0].multiply(dof / R.size)
@@ -70,27 +127,40 @@ def nvt_with_fixed_atoms(nvt_init_fn, nvt_apply_fn, mobile_mask):
             ))
         return state
 
-    def apply_fn(state, *args, **kwargs):
-        # Ensure thermostat DOF is correct before step
+    def wrapped_apply(state, *args, **kwargs):
         if hasattr(state, "chain"):
             state = state.set(chain=state.chain.set(degrees_of_freedom=dof))
+        state = apply_fn(state, *args, **kwargs)
+        return state.set(momentum=state.momentum * mobile)
 
-        state = nvt_apply_fn(state, *args, **kwargs)
+    return wrapped_init, wrapped_apply
 
-        # Zero fixed momenta after thermostat update
-        state = state.set(momentum=state.momentum * mobile)
-        return state
 
-    return init_fn, apply_fn
+def nve(energy_or_force_fn, shift_fn, dt, mobile_mask=None, **kwargs):
+    """jax_md NVE integrator with optional fixed-atom support."""
+    init_fn, apply_fn = simulate.nve(energy_or_force_fn, shift_fn, dt, **kwargs)
+    if mobile_mask is None:
+        return init_fn, apply_fn
+    return with_fixed_atoms(init_fn, apply_fn, mobile_mask)
+
+
+def nvt_nose_hoover(energy_or_force_fn, shift_fn, dt, kT, tau=None,
+                    chain_length=3, chain_steps=1, sy_steps=1,
+                    mobile_mask=None):
+    """jax_md NVT Nose-Hoover integrator with optional fixed-atom support."""
+    init_fn, apply_fn = simulate.nvt_nose_hoover(
+        energy_or_force_fn, shift_fn, dt, kT,
+        tau=tau, chain_length=chain_length,
+        chain_steps=chain_steps, sy_steps=sy_steps,
+    )
+    if mobile_mask is None:
+        return init_fn, apply_fn
+    return with_fixed_atoms(init_fn, apply_fn, mobile_mask)
 
 
 @jax_md.dataclasses.dataclass
 class CachedNPTNoseHooverState:
-    """Mirrors jax_md.simulate.NPTNoseHooverState with an extra cached dU/dV.
-
-    Storing dUdV lets inner_step skip the initial stress_fn call and perform a
-    single combined value_and_grad per step (see jax-md issue #330).
-
+    """Mirrors jax_md.simulate.NPTNoseHooverState with an extra cached dUdV.
     Supports orthorhombic anisotropic NPT where axes are partitioned into G
     coupled groups (each sharing a single scale factor) plus optionally fixed
     axes. group_ids is a (3,) int array: entry a is the group index of axis a,
@@ -128,7 +198,6 @@ class CachedNPTNoseHooverState:
 
 def _parse_couple_axes(couple_axes):
     """Validate couple_axes and return (n_per_group, group_ids_np, membership_np).
-
     couple_axes is a tuple-of-tuples partitioning a subset of {0,1,2} into
     coupled groups. Any axis not listed is held fixed.
     """
@@ -168,16 +237,9 @@ def npt_nose_hoover(
     thermostat_kwargs=None,
     couple_axes=((0, 1, 2),),
 ):
-    """NPT Nose-Hoover integrator that caches dU/dV across steps.
-
-    Adapted from jax_md.simulate.npt_nose_hoover. Each step needs only one
-    combined value_and_grad (force + dU/dV) instead of two; the dU/dV from the
+    """Adapted from jax_md.simulate.npt_nose_hoover. dUdV from the
     end of step n is reused as the dU/dV at the start of step n+1.
-
-    Positions are real-space (Å). Parrinello-Rahman scaling rescales them by
-    exp(box-momentum * dt) per step alongside the box; this is the same
-    formula as jax_md.simulate.npt_nose_hoover and assumes real coordinates.
-
+    Positions are real-space (Å). 
     couple_axes: partition of a subset of {0,1,2} into coupled groups. Each
     inner tuple lists axes sharing one scale factor. Axes not listed are fixed.
     Default ((0,1,2),) is isotropic. Other examples: ((0,1),) semi-iso (xy
@@ -278,9 +340,7 @@ def npt_nose_hoover(
         if jnp.isscalar(box) or box.ndim == 0:
             box = jnp.eye(R.shape[-1]) * box
 
-        # One combined call seeds both force and dU/dV for the cache.
-        _, F, dUdV = force_stress_fn(R, box,
-                                     **{k: v for k, v in kwargs.items() if k != 'kT'})
+        _, F, dUdV = force_stress_fn(R, box, **{k: v for k, v in kwargs.items() if k != 'kT'})
 
         state = CachedNPTNoseHooverState(
             position=R,
@@ -325,7 +385,6 @@ def npt_nose_hoover(
         box, vol = _box_and_vol(state)
         R = exp_iL1(box, R, P / M, P_b / M_b)
 
-        # Single combined gradient call per step.
         _, F, dUdV = force_stress_fn(R, box, **kwargs)
 
         P = exp_iL2(P, F, P_b / M_b, N_f)
@@ -368,12 +427,7 @@ def npt_nose_hoover(
 
 
 def npt_nose_hoover_invariant(energy_fn, state, pressure, kT, **kwargs):
-    """Conserved quantity for CachedNPTNoseHooverState (multi-group NPT).
-
-    Handles iso, semi_iso, uniaxial, and fully anisotropic ortho with any
-    partition of moving axes into coupled groups. Per-axis scale is built
-    from per-group positions via group_ids.
-    """
+    """Conserved quantity for CachedNPTNoseHooverState (multi-group NPT)."""
     ref = state.reference_box
     dim = state.position.shape[1]
     V_0 = quantity.volume(dim, ref)

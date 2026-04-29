@@ -19,24 +19,24 @@ from .utils import split, reorder_by_device, get_mask_by_device
 def iso_pressure(energy_fn, position, box, n_atoms, kT, **kwargs):
     """Isotropic pressure (eV/Å^3) from a uniform-strain derivative.
 
-    P = (N kT - dU/dε / 3) / V, where dU/dε is taken under
-    perturbation=(1+ε) on both real-space coord and box. PBC-correct since
+    P = (N kT - dU/deps / 3) / V, where dU/deps is taken under
+    perturbation=(1+eps) on both real-space coord and box. PBC-correct since
     the energy_fn handles the box internally.
 
     For classical MD pass the full ``energy_fn``. For PIMD pass the bead-
     averaged ML-only energy (the spring is V-independent in real coords and
     must not enter the pressure).
 
-    The instantaneous-KE form ``(2KE - dU/dε) / (3V)`` would be equivalent at
+    The instantaneous-KE form ``(2KE - dU/deps) / (3V)`` would be equivalent at
     equilibrium for classical MD; using N kT directly gives the same
     expectation with smaller per-step noise, and is the centroid-virial
     estimator for PIMD.
     """
     def U(eps):
         return energy_fn(position, box=box, perturbation=(1 + eps), **kwargs)
-    dUdε = jax.grad(U)(jnp.zeros((), position.dtype))
+    dUdeps = jax.grad(U)(jnp.zeros((), position.dtype))
     V = jnp.linalg.det(box) if box.ndim == 2 else jnp.prod(box)
-    return (n_atoms * kT - dUdε / 3.0) / V
+    return (n_atoms * kT - dUdeps / 3.0) / V
 
 
 def min_image_unwrap(previous_position, current_position, box):
