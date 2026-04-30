@@ -20,6 +20,58 @@ def _flatten_paths(paths):
 
 
 def Dataset(paths, labels, params=None, chemical_types=None):
+    """
+    Create a dataset object from file paths.
+
+    This function dispatches to the appropriate dataset class based on the input paths
+    and formats. It supports DeepMD (DP) format (.npy files in directories) and
+    extended XYZ format (.xyz/.extxyz files).
+
+    Parameters
+    ----------
+    paths : str, list of str, or list of list of str
+        File paths to load data from. For DP format, paths should be strings pointing
+        to directories containing 'type.raw' and 'set.*/' subdirectories with .npy files.
+        For extxyz format, paths should be strings ending in '.xyz' or '.extxyz'.
+        If paths[0] is a list, it creates a composite dataset from multiple subsets.
+    labels : list of str
+        List of data labels to load, e.g., ['coord', 'energy', 'force'].
+    params : dict, optional
+        Additional parameters for dataset configuration, such as 'atomic_sel'.
+    chemical_types : list of int, optional
+        List of atomic numbers defining the chemical types. If None, inferred from data.
+
+    Returns
+    -------
+    DatasetLeaf, DatasetGroup, ExtXYZDataset, or DPDataset
+        - DatasetLeaf: For single composition groups.
+        - DatasetGroup: For composite datasets with multiple subsets.
+        - ExtXYZDataset: For extxyz files, groups frames by composition into DatasetLeaf subsets.
+        - DPDataset: For DP format directories.
+
+    Notes
+    -----
+    Dispatch Rules:
+    - If paths[0] is a list, recursively creates subsets and returns DatasetGroup.
+    - Otherwise, determines format from file extensions:
+        - extxyz: Returns ExtXYZDataset (supports multiple files, groups by composition).
+        - dp: Returns DPDataset.
+
+    Constraints:
+    - Mixing DP directories and extxyz files in the same paths list is not supported.
+    - All paths must be of the same format unless using list-of-lists for subsets.
+
+    Examples
+    --------
+    Load DP data:
+    >>> ds = Dataset(['path/to/dp/dir'], ['coord', 'energy'])
+
+    Load extxyz data:
+    >>> ds = Dataset(['file.xyz'], ['coord', 'energy', 'force'])
+
+    Create composite dataset:
+    >>> ds = Dataset([['file1.xyz'], ['file2.xyz']], ['coord', 'energy'])
+    """
     if isinstance(paths[0], list):
         subsets = [Dataset(path, labels, params, chemical_types) for path in paths]
         return DatasetGroup(subsets, chemical_types)
@@ -32,6 +84,41 @@ def Dataset(paths, labels, params=None, chemical_types=None):
 
 
 class DatasetLeaf:
+    """
+    Internal dataset class for in-memory data of a single composition.
+
+    A "leaf" dataset holds data for one composition group without subsets.
+    Used internally by ExtXYZDataset and DPDataset; not for direct user instantiation.
+
+    Parameters
+    ----------
+    labels : list of str
+        Data labels, e.g., ['coord', 'energy'].
+    params : dict
+        Configuration parameters.
+    type_arr : array-like
+        Atom types for each atom.
+    data : dict
+        Data dictionary with required 'coord' (nframes, natoms, 3) and 'box' (nframes, 3, 3).
+        Other labels like 'energy' (nframes,), 'force' (nframes, natoms, 3) optional.
+    paths : list of str, optional
+        File paths for logging.
+
+    Attributes
+    ----------
+    type : ndarray
+        Sorted atom types (int array).
+    type_count : ndarray
+        Count of each atom type.
+    valid_types : ndarray
+        Indices of types that appear in data.
+    data : dict
+        Processed data arrays, sorted by atom type.
+
+    Notes
+    -----
+    Lifecycle: Call compute_lattice_candidate(rcut) before get_stats(rcut, bs).
+    """
     def __init__(self, labels, params, type_arr, data, paths=None):
         self.chemical_types = getattr(self, 'chemical_types', None)
         self.type = np.array(type_arr, dtype=int)
@@ -144,6 +231,29 @@ class DatasetLeaf:
 
 
 class DPDataset(DatasetLeaf):
+    """
+    Dataset for DeepMD (DP) format directories.
+
+    Loads data from DP training directories containing type.raw and set.*/ subdirs
+    with .npy files. Concatenates data across all sets and directories.
+
+    Parameters
+    ----------
+    paths : list of str
+        Paths to DP directories. Each should contain 'type.raw' and 'set.*/' subdirs
+        with .npy files (e.g., coord.npy, energy.npy).
+    labels : list of str
+        Data labels to load.
+    params : dict, optional
+        Configuration parameters.
+    chemical_types : list of int, optional
+        Atomic numbers; inferred if None.
+
+    Notes
+    -----
+    Directory structure: path/type.raw, path/set.000/, path/set.001/, etc.
+    Each set.*/ contains label.npy files. Data is concatenated over all sets/paths.
+    """
     def __init__(self, paths, labels, params=None, chemical_types=None):
         self.chemical_types = tuple(chemical_types) if chemical_types else None
         type_arr = np.genfromtxt(paths[0] + '/type.raw').astype(int)
@@ -157,6 +267,13 @@ class DPDataset(DatasetLeaf):
 
 
 class DatasetGroup:
+    """
+    Composite dataset made from multiple subset datasets.
+
+    A DatasetGroup represents a mixture of DatasetLeaf subsets. Sampling across
+    subsets is weighted by subset size, stored in self.prob, so larger subsets are
+    selected more often during batch generation.
+    """
     def __init__(self, subsets, chemical_types=None):
         self.subsets = subsets
         self.chemical_types = tuple(chemical_types) if chemical_types else None
@@ -224,6 +341,33 @@ class DatasetGroup:
 
 
 class ExtXYZDataset(DatasetGroup):
+    """
+    Dataset for extended XYZ (.xyz/.extxyz) files.
+
+    Parses frames using ASE and groups them by composition before constructing
+    internal DatasetLeaf subsets. Each composition group becomes one leaf,
+    permitting multiple leaf datasets inside this composite DatasetGroup.
+
+    Parameters
+    ----------
+    paths : list of str
+        Paths to .xyz or .extxyz files.
+    labels : list of str
+        Data labels to load from each frame.
+    params : dict, optional
+        Configuration parameters forwarded to DatasetLeaf.
+    chemical_types : list of int, optional
+        Atomic numbers defining the type ordering. If None, inferred from all
+        atoms in the input files.
+
+    Notes
+    -----
+    - ASE reads each frame via `read(path, index=':')`.
+    - `chemical_types` is inferred from all atomic numbers present, or validated
+      against provided chemical_types.
+    - Frames are grouped by composition using a type-count tuple (`type_count`).
+    - Each distinct composition produces a separate DatasetLeaf internally.
+    """
     def __init__(self, paths, labels, params=None, chemical_types=None):
         raw_frames = []
         all_zs = set()
