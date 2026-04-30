@@ -19,9 +19,7 @@ def _flatten_paths(paths):
             yield p
 
 
-def Dataset(paths, labels, params=None, chemical_types=None, _in_memory=None):
-    if _in_memory is not None:
-        return DatasetLeaf(labels, params or {}, _in_memory['type'], _in_memory['data'])
+def Dataset(paths, labels, params=None, chemical_types=None):
     if isinstance(paths[0], list):
         subsets = [Dataset(path, labels, params, chemical_types) for path in paths]
         return DatasetGroup(subsets, chemical_types)
