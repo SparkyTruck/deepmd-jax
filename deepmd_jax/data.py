@@ -29,11 +29,11 @@ def Dataset(paths, labels, params=None, chemical_types=None):
 
     Parameters
     ----------
-    paths : str, list of str, or list of list of str
+    paths : str or list of str
         File paths to load data from. For DP format, paths should be strings pointing
         to directories containing 'type.raw' and 'set.*/' subdirectories with .npy files.
         For extxyz format, paths should be strings ending in '.xyz' or '.extxyz'.
-        If paths[0] is a list, it creates a composite dataset from multiple subsets.
+        If paths is a list, it creates a composite dataset from multiple subsets.
     labels : list of str
         List of data labels to load, e.g., ['coord', 'energy', 'force'].
     params : dict, optional
@@ -47,19 +47,10 @@ def Dataset(paths, labels, params=None, chemical_types=None):
         - DatasetLeaf: For single composition groups.
         - DatasetGroup: For composite datasets with multiple subsets.
         - ExtXYZDataset: For extxyz files, groups frames by composition into DatasetLeaf subsets.
-        - DPDataset: For DP format directories.
-
-    Notes
-    -----
-    Dispatch Rules:
-    - If paths[0] is a list, recursively creates subsets and returns DatasetGroup.
-    - Otherwise, determines format from file extensions:
-        - extxyz: Returns ExtXYZDataset (supports multiple files, groups by composition).
-        - dp: Returns DPDataset.
+        - DPDataset: For a DP format directory.
 
     Constraints:
     - Mixing DP directories and extxyz files in the same paths list is not supported.
-    - All paths must be of the same format unless using list-of-lists for subsets.
 
     Examples
     --------
@@ -70,17 +61,24 @@ def Dataset(paths, labels, params=None, chemical_types=None):
     >>> ds = Dataset(['file.xyz'], ['coord', 'energy', 'force'])
 
     Create composite dataset:
-    >>> ds = Dataset([['file1.xyz'], ['file2.xyz']], ['coord', 'energy'])
+    >>> ds = Dataset(['file1.xyz', 'file2.xyz'], ['coord', 'energy'])
     """
-    if isinstance(paths[0], list):
-        subsets = [Dataset(path, labels, params, chemical_types) for path in paths]
-        return DatasetGroup(subsets, chemical_types)
-    formats = {_classify_path(p) for p in _flatten_paths(paths)}
+    if isinstance(paths, str) or len(paths) == 1:
+        path = paths if isinstance(paths, str) else paths[0]
+        if _classify_path(path) == 'extxyz':
+            return ExtXYZDataset([path], labels, params, chemical_types)
+        else:
+            return DPDataset(path, labels, params, chemical_types)
+    
+    formats = {_classify_path(p) for p in paths}
     if len(formats) > 1:
-        raise ValueError('Mixing DP-directory and extxyz dataset paths is not supported; got both in %s' % (paths,))
+        raise ValueError('Mixing DP and extxyz paths is not supported: %s' % (paths,))
+    
     if formats == {'extxyz'}:
         return ExtXYZDataset(paths, labels, params, chemical_types)
-    return DPDataset(paths, labels, params, chemical_types)
+    else:
+        leaves = [DPDataset(p, labels, params, chemical_types) for p in paths]
+        return DatasetGroup(leaves, chemical_types)
 
 
 class DatasetLeaf:
@@ -239,8 +237,8 @@ class DPDataset(DatasetLeaf):
 
     Parameters
     ----------
-    paths : list of str
-        Paths to DP directories. Each should contain 'type.raw' and 'set.*/' subdirs
+    path : str
+        Path to DP directory. Should contain 'type.raw' and 'set.*/' subdirs
         with .npy files (e.g., coord.npy, energy.npy).
     labels : list of str
         Data labels to load.
@@ -254,17 +252,14 @@ class DPDataset(DatasetLeaf):
     Directory structure: path/type.raw, path/set.000/, path/set.001/, etc.
     Each set.*/ contains label.npy files. Data is concatenated over all sets/paths.
     """
-    def __init__(self, paths, labels, params=None, chemical_types=None):
+    def __init__(self, path, labels, params=None, chemical_types=None):
         self.chemical_types = tuple(chemical_types) if chemical_types else None
-        type_arr = np.genfromtxt(paths[0] + '/type.raw').astype(int)
+        type_arr = np.genfromtxt(path + '/type.raw').astype(int)
         data = {
-            l: np.concatenate(sum(
-                [[np.load(set + l + '.npy') for set in sorted(glob(path + '/set.*/'))]
-                 for path in paths], []))
+            l: np.concatenate([np.load(s + l + '.npy') for s in sorted(glob(path + '/set.*/'))])
             for l in labels
         }
-        super().__init__(labels, params or {}, type_arr, data, paths=paths)
-
+        super().__init__(labels, params or {}, type_arr, data, paths=[path])
 
 class DatasetGroup:
     """

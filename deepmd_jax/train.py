@@ -160,10 +160,6 @@ def train(
         assert type(atomic_sel) == list, ' Must provide atomic_sel properly for model_type "atomic"/"atomic_t2".'
     else:
         raise ValueError('model_type should be "energy", "atomic", "atomic_t2", or "dplr".')
-    if type(train_data_path) == str:
-        train_data_path = [train_data_path]
-    else:
-        train_data_path = [[path] for path in train_data_path]
     train_data = Dataset(train_data_path,
                            labels,
                            {'atomic_sel':atomic_sel})
@@ -246,7 +242,7 @@ def train(
         # Load observable data
         train_data_obs = []
         for i in range(n_paths):
-            single_data_obs = Dataset([obs_train_data_path[i]],
+            single_data_obs = Dataset(obs_train_data_path[i],
                                         labels_obs,
                                         {'atomic_sel':atomic_sel},
                                         chemical_types=chemical_types)
@@ -255,10 +251,6 @@ def train(
 
     use_val_data = val_data_path is not None
     if use_val_data:
-        if type(val_data_path) == str:
-            val_data_path = [val_data_path]
-        else:
-            val_data_path = [[path] for path in val_data_path]
         val_data = Dataset(val_data_path,
                              labels,
                              {'atomic_sel':atomic_sel},
@@ -556,7 +548,7 @@ def test(
         atomic_sel = model.params['nsel']
     else:
         raise ValueError('Model type should be "energy", "atomic", "atomic_t2", or "dplr".')
-    test_data = Dataset([data_path],
+    test_data = Dataset(data_path,
                           labels,
                           {'atomic_sel':atomic_sel},
                           chemical_types=model.params.get('chemical_types'))
