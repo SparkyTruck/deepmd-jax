@@ -6,7 +6,7 @@ import time, datetime
 import flax.linen as nn
 from functools import partial
 from .utils import get_p3mlr_fn, get_p3mlr_grid_size, load_model, save_model, compress_model, save_dataset
-from .data import DPDataset
+from .data import Dataset
 from .dpmodel import DPModel
 from typing import Union, List
 import tempfile
@@ -160,14 +160,11 @@ def train(
         assert type(atomic_sel) == list, ' Must provide atomic_sel properly for model_type "atomic"/"atomic_t2".'
     else:
         raise ValueError('model_type should be "energy", "atomic", "atomic_t2", or "dplr".')
-    if type(train_data_path) == str:
-        train_data_path = [train_data_path]
-    else:
-        train_data_path = [[path] for path in train_data_path]
-    train_data = DPDataset(train_data_path,
+    train_data = Dataset(train_data_path,
                            labels,
                            {'atomic_sel':atomic_sel})
     train_data.compute_lattice_candidate(rcut)
+    chemical_types = train_data.chemical_types
 
     # Setup for hybrid training
     if hybrid:
@@ -245,21 +242,19 @@ def train(
         # Load observable data
         train_data_obs = []
         for i in range(n_paths):
-            single_data_obs = DPDataset([obs_train_data_path[i]],
+            single_data_obs = Dataset(obs_train_data_path[i],
                                         labels_obs,
-                                        {'atomic_sel':atomic_sel})
+                                        {'atomic_sel':atomic_sel},
+                                        chemical_types=chemical_types)
             single_data_obs.compute_lattice_candidate(rcut)
             train_data_obs.append(single_data_obs)
 
     use_val_data = val_data_path is not None
     if use_val_data:
-        if type(val_data_path) == str:
-            val_data_path = [val_data_path]
-        else:
-            val_data_path = [[path] for path in val_data_path]
-        val_data = DPDataset(val_data_path,
+        val_data = Dataset(val_data_path,
                              labels,
-                             {'atomic_sel':atomic_sel})
+                             {'atomic_sel':atomic_sel},
+                             chemical_types=chemical_types)
         val_data.compute_lattice_candidate(rcut)
     else:
         val_data = None
@@ -553,9 +548,10 @@ def test(
         atomic_sel = model.params['nsel']
     else:
         raise ValueError('Model type should be "energy", "atomic", "atomic_t2", or "dplr".')
-    test_data = DPDataset([data_path],
+    test_data = Dataset(data_path,
                           labels,
-                          {'atomic_sel':atomic_sel})
+                          {'atomic_sel':atomic_sel},
+                          chemical_types=model.params.get('chemical_types'))
     test_data.compute_lattice_candidate(model.params['rcut'])
     if 'dplr' in model.params['type']:
         subsets = test_data.get_flattened_data()
@@ -566,53 +562,127 @@ def test(
                                       model.params['dplr_beta'],
                                       model.params['dplr_resolution'],
                                       *model.params['dplr_wannier_model_and_variables'])
-    test_data.pointer = 0
-    remaining = test_data.nframes
-    if model.params['type'] == 'energy' or model.params['type'] == 'dplr':
+
+    if model.params['type'] in ['energy', 'dplr']:
         evaluate_fn = model.energy_and_force
+
+        # running stats
+        stats = {
+            'energy': {'sq': 0.0, 'abs': 0.0, 'count': 0},
+            'force': {'sq': 0.0, 'abs': 0.0, 'count': 0},
+            'force_l1_sum': 0.0,
+            'force_l1_count': 0,
+            'energy_l1_sum': 0.0,
+            'energy_l1_count': 0,
+        }
+
+        # optional storage
         predictions = {'energy': [], 'force': []}
         ground_truth = {'energy': [], 'force': []}
+
     else:
+        key = model.params['atomic_data_prefix']
         evaluate_fn = lambda variables, coord, box, static_args: model.apply(variables, coord, box, static_args)
-        predictions = {model.params['atomic_data_prefix']: []}
-        ground_truth = {model.params['atomic_data_prefix']: []}
-    evaluate_fn = jax.jit(jax.vmap(evaluate_fn,
-                                   in_axes=(None,0,0,None)),
-                                   static_argnames=('static_args',))
-    while remaining > 0:
-        bs = min(batch_size, remaining)
-        batch, type_count, lattice_args = test_data.get_batch(bs)
-        remaining -= bs
-        static_args = nn.FrozenDict({'type_count': type_count, 'lattice': lattice_args})
-        pred = evaluate_fn(variables, batch['coord'], batch['box'], static_args)
-        if model.params['type'] == 'energy' or model.params['type'] == 'dplr':
-            predictions['energy'].append(pred[0])
-            predictions['force'].append(pred[1])
-            ground_truth['energy'].append(batch['energy'])
-            ground_truth['force'].append(batch['force'])
-        else:
-            predictions[model.params['atomic_data_prefix']].append(pred[0])
-            ground_truth[model.params['atomic_data_prefix']].append(batch['atomic'])
+
+        stats = {
+            key: {'sq': 0.0, 'abs': 0.0, 'count': 0},
+            'l1_sum': 0.0,
+            'l1_count': 0,
+        }
+
+        predictions = {key: []}
+        ground_truth = {key: []}
+
+    evaluate_fn = jax.jit(
+        jax.vmap(evaluate_fn, in_axes=(None, 0, 0, None)),
+        static_argnames=('static_args',)
+    )
+
+    for leaf in test_data.get_leaves():
+        leaf.pointer = 0
+        remaining = leaf.nframes
+        while remaining > 0:
+            bs = min(batch_size, remaining)
+            batch, type_count, lattice_args = leaf.get_batch(bs)
+            remaining -= bs
+
+            static_args = nn.FrozenDict({'type_count': type_count, 'lattice': lattice_args})
+            pred = evaluate_fn(variables, batch['coord'], batch['box'], static_args)
+
+            if model.params['type'] in ['energy', 'dplr']:
+                E_pred, F_pred = pred
+                E_true = batch['energy']
+                F_true = batch['force']
+
+                # store if desired
+                predictions['energy'].append(E_pred)
+                predictions['force'].append(F_pred)
+                ground_truth['energy'].append(E_true)
+                ground_truth['force'].append(F_true)
+
+                # --- ENERGY (per-atom normalized) ---
+                natoms = F_pred.shape[1]
+
+                dE = (E_pred - E_true) / natoms
+                stats['energy']['sq'] += (dE**2).sum()
+                stats['energy']['abs'] += np.abs(dE).sum()
+                stats['energy']['count'] += dE.size
+
+                stats['energy_l1_sum'] += np.abs(dE).sum()
+                stats['energy_l1_count'] += dE.size
+
+                # --- FORCES ---
+                diffF = F_pred - F_true
+
+                stats['force']['sq'] += (diffF**2).sum()
+                stats['force']['abs'] += np.abs(diffF).sum()
+                stats['force']['count'] += diffF.size
+
+                # mixed L1 (per-atom norm)
+                per_atom = (diffF**2).mean(-1)**0.5
+                stats['force_l1_sum'] += per_atom.sum()
+                stats['force_l1_count'] += per_atom.size
+
+            else:
+                key = model.params['atomic_data_prefix']
+                pred_val = pred[0]
+                true_val = batch['atomic']
+
+                predictions[key].append(pred_val)
+                ground_truth[key].append(true_val)
+
+                diff = pred_val - true_val
+
+                stats[key]['sq'] += (diff**2).sum()
+                stats[key]['abs'] += np.abs(diff).sum()
+                stats[key]['count'] += diff.size
+
+                per_atom = (diff**2).mean(-1)**0.5
+                stats['l1_sum'] += per_atom.sum()
+                stats['l1_count'] += per_atom.size
+
+    # --- FINAL METRICS ---
     rmse = {}
     mae = {}
     l1_mixed = {}
-    for key in predictions.keys():
-        predictions[key] = np.concatenate(predictions[key], axis=0)
-        ground_truth[key] = np.concatenate(ground_truth[key], axis=0)
-        rmse[key] = (((predictions[key] - ground_truth[key]) ** 2).mean() ** 0.5).item()
-        mae[key] = np.abs(predictions[key] - ground_truth[key]).mean().item()
-    # reorder force back; will delete in future when reordering is moved into dpmodel.py
-    if model.params['type'] == 'energy' or model.params['type'] == 'dplr':
-        ground_truth['force'] = ground_truth['force'][:, test_data.type.argsort(kind='stable').argsort(kind='stable')]
-        predictions['force'] = predictions['force'][:, test_data.type.argsort(kind='stable').argsort(kind='stable')]
-        natoms = predictions['force'].shape[1]
-        rmse['energy'] /= natoms
-        mae['energy'] /= natoms
-        l1_mixed['energy'] = (np.abs(predictions['energy'] - ground_truth['energy']).mean() / natoms).item()
-        l1_mixed['force'] = (((predictions['force'] - ground_truth['force'])**2).mean(-1)**0.5).mean().item()
+
+    if model.params['type'] in ['energy', 'dplr']:
+        rmse['energy'] = (stats['energy']['sq'] / stats['energy']['count'])**0.5
+        mae['energy'] = stats['energy']['abs'] / stats['energy']['count']
+
+        rmse['force'] = (stats['force']['sq'] / stats['force']['count'])**0.5
+        mae['force'] = stats['force']['abs'] / stats['force']['count']
+
+        l1_mixed['energy'] = stats['energy_l1_sum'] / stats['energy_l1_count']
+        l1_mixed['force'] = stats['force_l1_sum'] / stats['force_l1_count']
+
     else:
         key = model.params['atomic_data_prefix']
-        l1_mixed[key] = (((predictions[key] - ground_truth[key])**2).mean(-1)**0.5).mean().item()
+
+        rmse[key] = (stats[key]['sq'] / stats[key]['count'])**0.5
+        mae[key] = stats[key]['abs'] / stats[key]['count']
+        l1_mixed[key] = stats['l1_sum'] / stats['l1_count']
+
     return rmse, mae, l1_mixed, predictions, ground_truth
         
 def evaluate(
@@ -628,7 +698,8 @@ def evaluate(
             model_path: path to the trained model.
             coord: atomic coordinates of shape (n_frames, n_atoms, 3).
             box: simulation box of shape (n_frames) + (,) or (1,) or (3,) or (9), or (3,3).
-            type_idx: atomic type indices of shape (Natoms,)
+            type_idx: atomic type indices of shape (Natoms,). If the model was trained with
+                chemical_types (extxyz path), type_idx is interpreted as atomic numbers (Z).
             batch_size: Increase for potentially faster evaluation, but requires more memory.
     '''
     # input shape check
@@ -655,6 +726,15 @@ def evaluate(
                          'type_idx (n_atoms).')
     
     model, _ = load_model(model_path, replicate=False)
+    ct = model.params.get('chemical_types')
+    if ct is not None:
+        type_idx_np = np.array(type_idx, dtype=int)
+        unknown = set(type_idx_np.tolist()) - set(ct)
+        if unknown:
+            raise ValueError('Atomic numbers %s in type_idx are not in model.params["chemical_types"]=%s'
+                             % (sorted(unknown), ct))
+        z_to_idx = {z: i for i, z in enumerate(ct)}
+        type_idx = np.array([z_to_idx[z] for z in type_idx_np], dtype=int)
 
     # create dataset in temp directory and use test() to evaluate
     with tempfile.TemporaryDirectory() as temp_dir:
