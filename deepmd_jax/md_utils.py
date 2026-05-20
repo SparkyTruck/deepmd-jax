@@ -16,6 +16,61 @@ from jax.sharding import PartitionSpec as PSpec
 from .utils import split, reorder_by_device, get_mask_by_device
 
 
+_DUMP_KINDS = ('position', 'velocity', 'centroid')
+_DUMP_MODES = ('overwrite', 'append')
+
+
+def _normalize_dump_mode(dump_mode):
+    if dump_mode not in _DUMP_MODES:
+        raise ValueError(
+            "dump_mode must be 'overwrite' or 'append'; got %r."
+            % (dump_mode,))
+    return dump_mode
+
+
+def _normalize_dump_content(dump_content, n_bead):
+    is_pimd = n_bead > 1
+    if isinstance(dump_content, str):
+        if dump_content == 'all':
+            return _DUMP_KINDS if is_pimd else ('position', 'velocity')
+        requested = (dump_content,)
+    else:
+        try:
+            requested = tuple(dump_content)
+        except TypeError as exc:
+            raise ValueError(
+                "dump_content must be 'all', a dump kind string, or an iterable "
+                "of dump kind strings.") from exc
+    if len(requested) == 0:
+        raise ValueError("dump_content must not be empty when dump_prefix is set.")
+    bad_types = [item for item in requested if not isinstance(item, str)]
+    if bad_types:
+        raise ValueError(
+            "dump_content entries must be strings; got %r." % (bad_types,))
+    unknown = sorted(set(requested) - set(_DUMP_KINDS))
+    if unknown:
+        raise ValueError(
+            "Unknown dump_content entries %s. Allowed entries are %s, or 'all'."
+            % (unknown, list(_DUMP_KINDS)))
+    if 'centroid' in requested and not is_pimd:
+        raise ValueError(
+            "dump_content includes 'centroid', which is only meaningful when "
+            "n_bead > 1.")
+    return tuple(kind for kind in _DUMP_KINDS if kind in requested)
+
+
+def _requested_dumps_from_prefix(dump_prefix, dump_content, n_bead):
+    if dump_prefix is None:
+        if not (isinstance(dump_content, str) and dump_content == 'all'):
+            raise ValueError("dump_content requires dump_prefix to be set.")
+        return {}
+    prefix = os.fspath(dump_prefix)
+    if prefix == '':
+        raise ValueError("dump_prefix must be a non-empty path prefix.")
+    content = _normalize_dump_content(dump_content, n_bead)
+    return {kind: f"{prefix}_{kind}.xyz" for kind in content}
+
+
 def iso_pressure(energy_fn, position, box, n_atoms, kT, **kwargs):
     """Isotropic pressure (eV/Å^3) from a uniform-strain derivative.
 
@@ -60,23 +115,41 @@ def print_run_profile(steps, elapsed_time, natoms, dt):
 
 
 def prepare_dumps(requested, type_idx, type_symbols, n_bead, default_interval,
-                  dump_interval=None):
+                  dump_interval=None, dump_prefix=None, dump_content='all',
+                  dump_mode='overwrite'):
     '''Validate dump kwargs and build a list of (kind, path, ase.Atoms) entries.
 
-    requested: ``{'position'|'velocity'|'centroid': path or None}``.
-    Returns ``([], None)`` if nothing was requested. Each existing dump file is
-    truncated so every run() call produces its own output.
+    requested: legacy ``{'position'|'velocity'|'centroid': path or None}``.
+    Preferred usage is ``dump_prefix='traj'`` and ``dump_content='all'`` or a
+    subset of ``('position', 'velocity', 'centroid')``. Generated files are
+    named ``{dump_prefix}_{kind}.xyz``.
+
+    Returns ``([], None)`` if nothing was requested. Existing dump files are
+    truncated by default; pass ``dump_mode='append'`` to keep appending frames.
     '''
     requested = {k: v for k, v in requested.items() if v is not None}
+    if dump_prefix is not None:
+        if requested:
+            raise ValueError(
+                "Do not combine dump_prefix with dump_position, dump_velocity, "
+                "or dump_centroid.")
+        requested = _requested_dumps_from_prefix(dump_prefix, dump_content, n_bead)
+    elif requested:
+        if not (isinstance(dump_content, str) and dump_content == 'all'):
+            raise ValueError("dump_content is only used together with dump_prefix.")
+    else:
+        requested = _requested_dumps_from_prefix(None, dump_content, n_bead)
     if not requested:
         return [], None
+    dump_mode = _normalize_dump_mode(dump_mode)
     if type_symbols is None:
         raise ValueError(
-            "Simulation.run(dump_*=...) requires `type_symbols=[...]` at "
-            "Simulation(...) construction so XYZ output can label atoms.")
+            "Simulation.run(dump_prefix=... or dump_*=...) requires "
+            "`type_symbols=[...]` at Simulation(...) construction so XYZ "
+            "output can label atoms.")
     is_pimd = n_bead > 1
     if 'centroid' in requested and not is_pimd:
-        raise ValueError("dump_centroid is only meaningful when n_bead > 1.")
+        raise ValueError("Centroid dumping is only meaningful when n_bead > 1.")
     interval = int(dump_interval) if dump_interval is not None else int(default_interval)
     if interval <= 0:
         raise ValueError(f"dump_interval must be positive; got {interval}")
@@ -88,14 +161,17 @@ def prepare_dumps(requested, type_idx, type_symbols, n_bead, default_interval,
         flatten = is_pimd and kind != 'centroid'
         syms = symbols_PN if flatten else symbols_N
         atoms = Atoms(symbols=list(syms), positions=np.zeros((len(syms), 3)), pbc=True)
-        if os.path.exists(path):
+        if dump_mode == 'overwrite' and os.path.exists(path):
             os.remove(path)
         dumps.append((kind, path, atoms))
     return dumps, interval
 
 
-def write_dump_frame(dumps, pos_frame, vel_frame, centroid_frame, box_frame):
-    '''Append one frame to each dump file.'''
+def write_dump_frame(dumps, pos_frame, vel_frame, centroid_frame, box_frame, step=None):
+    '''Append one frame to each dump file.
+
+    When provided, ``step`` is written into the XYZ comment/metadata line.
+    '''
     if box_frame.shape == (3,):
         cell = np.concatenate([np.array(box_frame), [90, 90, 90]])
     else:
@@ -107,6 +183,10 @@ def write_dump_frame(dumps, pos_frame, vel_frame, centroid_frame, box_frame):
             data = data.reshape(-1, 3)
         atoms.set_positions(data)
         atoms.set_cell(cell)
+        if step is None:
+            atoms.info.pop('step', None)
+        else:
+            atoms.info['step'] = int(step)
         io.write(path, atoms, append=True)
 
 

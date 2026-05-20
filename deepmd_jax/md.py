@@ -1,5 +1,6 @@
 from typing import List, Optional
 
+from ase.data import chemical_symbols
 import jax_md
 import jax
 import jax.numpy as jnp
@@ -23,6 +24,19 @@ from functools import partial
 MASS_UNIT_CONVERSION = 1.036427e2 # from Dalton to eV * fs^2 / Å^2
 TEMP_UNIT_CONVERSION = 8.617333e-5 # from Kelvin to eV
 PRESS_UNIT_CONVERSION = 6.241509e-7 # from bar to eV / Å^3
+
+
+def _routine_run_label(routine, is_pimd):
+    key = (routine, bool(is_pimd))
+    labels = {
+        ('NVE', False): ('NVE run', 'velocity-Verlet integrator'),
+        ('NVT', False): ('NVT run', 'Nose-Hoover thermostat'),
+        ('NVT_langevin', False): ('NVT Langevin run', 'BAOAB Langevin thermostat'),
+        ('NPT', False): ('NPT run', 'Nose-Hoover thermostat/barostat'),
+        ('NVT', True): ('NVT PIMD run', 'PILE-L Langevin thermostat'),
+        ('NPT', True): ('NPT PIMD run', 'PILE-L Langevin thermostat and Langevin barostat'),
+    }
+    return labels.get(key, (f'{routine} run', 'custom integrator'))
 
 
 class Simulation:
@@ -99,7 +113,7 @@ class Simulation:
             chain_length: Nose-Hoover thermostat/barostat chain length
             chain_steps: Nose-Hoover thermostat/barostat chain steps
             sy_steps: Nose-Hoover thermostat/barostat number of Suzuki-Yoshida steps (must be 1,3,5,7)
-            type_symbols: chemical symbols per atom type (e.g. ['O','H']); required only to use dump_* kwargs on run() since XYZ output needs element labels.
+            type_symbols: chemical symbols per atom type (e.g. ['O','H']); required to dump XYZ files unless the loaded model stores chemical_types, in which case symbols are inferred.
             fixed_indices: zero-based indices of atoms that should remain fixed (constrained position) in the simulation.
             couple_axes: NPT-only partition of a subset of {0,1,2} into coupled groups. Each inner tuple lists axes sharing one scale factor; axes not listed are held fixed. Examples: ((0,1,2),) iso (default); ((0,1),) semi-iso (xy couple, z fixed); ((0,),) uniaxial (only x moves); ((0,),(1,),(2,)) fully anisotropic ortho; ((0,1),(2,)) xy couple + z independent.
             n_bead: number of ring-polymer beads. 1 (default) = classical MD. n_bead > 1 switches routine='NVT' to path-integral MD using PILE-L thermostat (internal modes critically damped, centroid friction = 1/tau_t). initial_position may be (N,3) (replicated across beads) or (P,N,3).
@@ -163,6 +177,8 @@ class Simulation:
             type_idx_np = np.array([z_to_idx[z] for z in type_idx_np], dtype=int)
         self._type_idx = type_idx_np
         self._mass = jnp.array(np.array(mass)[np.array(self._type_idx)]) # AMU
+        if type_symbols is None and ct is not None:
+            type_symbols = [chemical_symbols[int(z)] for z in ct]
         if type_symbols is not None:
             n_types_needed = int(self._type_idx.max()) + 1
             if len(type_symbols) < n_types_needed:
@@ -237,7 +253,8 @@ class Simulation:
             init_info.append(f"n_beads={self._n_bead}")
             init_info.append(f"pimd_lambda={self._pimd_lambda:g}")
         suffix = f" ({', '.join(init_info)})" if init_info else ""
-        print(f"# Initialized {self._routine} simulation with {self._natoms} atoms{suffix}")
+        run_label, method_label = _routine_run_label(self._routine, self._is_pimd)
+        print(f"# Initialized {run_label} ({method_label}) with {self._natoms} atoms{suffix}")
         if self._is_pimd and self._pimd_print_invariant:
             print("# Warning: PIMD invariant is a finite-step diagnostic and may drift more visibly as n_beads increases.")
 
@@ -782,18 +799,23 @@ class Simulation:
 
     def _initialize_run(self, steps,
                         dump_position=None, dump_velocity=None,
-                        dump_centroid=None, dump_interval=None):
+                        dump_centroid=None, dump_interval=None,
+                        dump_prefix=None, dump_content='all',
+                        dump_mode='overwrite'):
         '''
             Reset trajectory for each new run; if the simulation has not been
-            run before, include the initial state. When any ``dump_*`` path is
-            given, set up streaming to disk instead of preallocating in-memory
-            trajectory buffers, and write the initial state to file.
+            run before, include the initial state. When dump_prefix or any
+            legacy ``dump_*`` path is given, set up streaming to disk instead
+            of preallocating in-memory trajectory buffers, and write the
+            initial state to file.
         '''
         self._dumps, self._write_interval = prepare_dumps(
             {'position': dump_position, 'velocity': dump_velocity,
              'centroid': dump_centroid},
             self._type_idx, self._type_symbols, self._n_bead,
-            default_interval=self.report_interval, dump_interval=dump_interval)
+            default_interval=self.report_interval, dump_interval=dump_interval,
+            dump_prefix=dump_prefix, dump_content=dump_content,
+            dump_mode=dump_mode)
         self._has_dumps = len(self._dumps) > 0
 
         print(f'# Running {steps} steps...')
@@ -816,11 +838,11 @@ class Simulation:
                 if self._is_pimd:
                     self._centroid_trajectory = np.zeros((traj_length,) + centroid_shape, dtype=traj_dtype)
             except MemoryError:
-                raise MemoryError("Trajectory too large to fit in CPU RAM. Please pass dump_position=... (and friends) to stream to disk, or split into multiple shorter runs.")
+                raise MemoryError("Trajectory too large to fit in CPU RAM. Please pass dump_prefix=... to stream to disk, or split into multiple shorter runs.")
             try:
                 safe_buffer = np.zeros((traj_length, 10*natoms_eff, 3), dtype=traj_dtype)
             except MemoryError:
-                print("# Warning: A long trajectory may exhaust CPU RAM. Consider dump_position=... to stream to disk.")
+                print("# Warning: A long trajectory may exhaust CPU RAM. Consider dump_prefix=... to stream to disk.")
             if self._is_initial_state:
                 self._position_trajectory[0] = self.getPosition()
                 self._velocity_trajectory[0] = self.getVelocity()
@@ -832,7 +854,7 @@ class Simulation:
                 write_dump_frame(self._dumps,
                                  self.getPosition(), self.getVelocity(),
                                  self.getCentroidPosition() if self._is_pimd else None,
-                                 self._current_box)
+                                 self._current_box, step=self.step)
         self._tic_of_this_run = time()
         self._tic_between_report = time()
         self._error_code = 0
@@ -843,16 +865,27 @@ class Simulation:
             dump_position: Optional[str] = None,
             dump_velocity: Optional[str] = None,
             dump_centroid: Optional[str] = None,
-            dump_interval: Optional[int] = None):
+            dump_interval: Optional[int] = None,
+            dump_prefix: Optional[str] = None,
+            dump_content='all',
+            dump_mode='overwrite'):
         '''
             Run for ``steps`` steps. Returns a trajectory dict, or ``None`` if
-            any ``dump_*`` kwarg is given (frames stream to XYZ instead).
+            trajectory frames stream to XYZ files. Preferred dump usage is
+            ``dump_prefix='traj'`` with ``dump_content='all'`` or a subset of
+            ``['position', 'velocity', 'centroid']``. Existing dump files are
+            overwritten unless ``dump_mode='append'`` is passed. The legacy
+            dump_position, dump_velocity, and dump_centroid kwargs still
+            accept exact paths.
         '''
         self._initialize_run(steps,
                              dump_position=dump_position,
                              dump_velocity=dump_velocity,
                              dump_centroid=dump_centroid,
-                             dump_interval=dump_interval)
+                             dump_interval=dump_interval,
+                             dump_prefix=dump_prefix,
+                             dump_content=dump_content,
+                             dump_mode=dump_mode)
 
         remaining_steps = steps
         while remaining_steps > 0:
@@ -889,13 +922,15 @@ class Simulation:
             if self._has_dumps:
                 base = int(self.step)
                 for i in range(next_chunk):
-                    if (base + i + 1) % self._write_interval == 0:
+                    frame_step = base + i + 1
+                    if frame_step % self._write_interval == 0:
                         write_dump_frame(
                             self._dumps,
                             np.asarray(pos_traj[i]),
                             np.asarray(vel_traj[i]),
                             np.asarray(centroid_traj[i]) if self._is_pimd else None,
                             np.asarray(box_traj[i]),
+                            step=frame_step,
                         )
             else:
                 idx_l, idx_r = self.step - self._offset, self.step - self._offset + next_chunk
