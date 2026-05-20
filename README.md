@@ -12,7 +12,7 @@ DeepMD-jax supports:
 
 You can also try the [**DP-MP**](https://pubs.rsc.org/en/content/articlehtml/2024/cp/d4cp01483a) architecture for enhanced accuracy.
 
-DeepMD-jax is a separate package from [DeepMD-kit](https://github.com/deepmodeling/deepmd-kit). It provides a standalone neural-network potential and molecular dynamics engine both implemented in JAX.
+DeepMD-jax provides a standalone neural-network potential and molecular dynamics engine both implemented in JAX, and is a separate package from [DeepMD-kit](https://github.com/deepmodeling/deepmd-kit).
 
 ## Installation
 ```
