@@ -31,7 +31,16 @@ class DPJaxCalculator(Calculator):
         self._model, self._variables = load_model(model_path)
         self._static_args = None
 
-        self._type_idx = np.array(type_idx).astype(int)
+        type_idx_np = np.array(type_idx).astype(int)
+        ct = self._model.params.get('chemical_types')
+        if ct is not None:
+            unknown = set(type_idx_np.tolist()) - set(ct)
+            if unknown:
+                raise ValueError('Atomic numbers %s in type_idx are not in model.params["chemical_types"]=%s'
+                                 % (sorted(unknown), ct))
+            z_to_idx = {z: i for i, z in enumerate(ct)}
+            type_idx_np = np.array([z_to_idx[z] for z in type_idx_np], dtype=int)
+        self._type_idx = type_idx_np
         type_count = np.bincount(self._type_idx)
         self._type_count = np.pad(type_count, (0, self._model.params['ntypes'] - len(type_count)))
 
