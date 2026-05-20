@@ -39,6 +39,12 @@ def _routine_run_label(routine, is_pimd):
     return labels.get(key, (f'{routine} run', 'custom integrator'))
 
 
+def _dump_target_label(dumps, dump_prefix):
+    if dump_prefix is not None:
+        return f'{dump_prefix}_*'
+    return ', '.join(path for _, path, _ in dumps)
+
+
 class Simulation:
     '''
         A deepmd-based simulation class that wraps jax_md.simulate routines.
@@ -818,7 +824,10 @@ class Simulation:
             dump_mode=dump_mode)
         self._has_dumps = len(self._dumps) > 0
 
-        print(f'# Running {steps} steps...')
+        run_message = f'# Running {steps} steps'
+        if self._has_dumps:
+            run_message += f' and dumping to {_dump_target_label(self._dumps, dump_prefix)}'
+        print(run_message + '...')
         traj_length = steps + int(self._is_initial_state)
         self._offset = self.step - int(self._is_initial_state)
         traj_dtype = np.float64 if jax.config.read('jax_enable_x64') else np.float32
