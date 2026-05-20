@@ -51,86 +51,45 @@ def Dataset(paths, labels, params=None, chemical_types=None):
 
     Constraints:
     - Mixing DP directories and extxyz files in the same paths list is not supported.
-
-    Examples
-    --------
-    Load DP data:
-    >>> ds = Dataset(['path/to/dp/dir'], ['coord', 'energy'])
-
-    Load extxyz data:
-    >>> ds = Dataset(['file.xyz'], ['coord', 'energy', 'force'])
-
-    Create composite dataset:
-    >>> ds = Dataset(['file1.xyz', 'file2.xyz'], ['coord', 'energy'])
     """
-    if isinstance(paths, str) or len(paths) == 1:
-        path = paths if isinstance(paths, str) else paths[0]
+    flat_paths = [paths] if isinstance(paths, str) else list(_flatten_paths(paths))
+    if len(flat_paths) == 1:
+        path = flat_paths[0]
         if _classify_path(path) == 'extxyz':
             return ExtXYZDataset([path], labels, params, chemical_types)
-        else:
-            return DPDataset(path, labels, params, chemical_types)
-    
-    formats = {_classify_path(p) for p in paths}
+        return DPDataset(path, labels, params, chemical_types)
+
+    formats = {_classify_path(p) for p in flat_paths}
     if len(formats) > 1:
         raise ValueError('Mixing DP and extxyz paths is not supported: %s' % (paths,))
-    
+
     if formats == {'extxyz'}:
-        return ExtXYZDataset(paths, labels, params, chemical_types)
-    else:
-        leaves = [DPDataset(p, labels, params, chemical_types) for p in paths]
-        return DatasetGroup(leaves, chemical_types)
+        return ExtXYZDataset(flat_paths, labels, params, chemical_types)
+    leaves = [DPDataset(p, labels, params, chemical_types) for p in flat_paths]
+    return DatasetGroup(leaves, chemical_types)
 
 
 class DatasetLeaf:
     """
     Internal dataset class for in-memory data of a single composition.
 
-    A "leaf" dataset holds data for one composition group without subsets.
-    Used internally by ExtXYZDataset and DPDataset; not for direct user instantiation.
-
-    Parameters
-    ----------
-    labels : list of str
-        Data labels, e.g., ['coord', 'energy'].
-    params : dict
-        Configuration parameters.
-    type_arr : array-like
-        Atom types for each atom.
-    data : dict
-        Data dictionary with required 'coord' (nframes, natoms, 3) and 'box' (nframes, 3, 3).
-        Other labels like 'energy' (nframes,), 'force' (nframes, natoms, 3) optional.
-    paths : list of str, optional
-        File paths for logging.
-
-    Attributes
-    ----------
-    type : ndarray
-        Sorted atom types (int array).
-    type_count : ndarray
-        Count of each atom type.
-    valid_types : ndarray
-        Indices of types that appear in data.
-    data : dict
-        Processed data arrays, sorted by atom type.
-
-    Notes
-    -----
-    Lifecycle: Call compute_lattice_candidate(rcut) before get_stats(rcut, bs).
+    Data is stored in the input atom order. The model receives ``type_idx`` and
+    handles type sorting internally.
     """
     def __init__(self, labels, params, type_arr, data, paths=None):
         self.chemical_types = getattr(self, 'chemical_types', None)
-        self.type = np.array(type_arr, dtype=int)
+        self.type_idx = np.array(type_arr, dtype=int)
+        self.type = self.type_idx
         self.data = data
-        self.natoms = len(self.type)
+        self.natoms = len(self.type_idx)
         self.nframes = len(self.data['coord'])
         for l in labels:
             assert self.data[l].shape[0] == self.nframes, \
                 f"{l}.npy has {self.data[l].shape[0]} frames, expected {self.nframes}"
         self.pointer = self.nframes
-        self.type_count = np.array([(self.type == i).sum() for i in range(max(self.type) + 1)])
+        self.type_count = np.array([(self.type_idx == i).sum() for i in range(max(self.type_idx) + 1)])
         self.ntypes = len(self.type_count)
         self.valid_types = np.arange(self.ntypes)
-        self.chemical_types = getattr(self, 'chemical_types', None)
         self.nsel = params.get('atomic_sel', None)
         if self.nsel is not None:
             self.nsel = [i for i in self.nsel if i in range(self.ntypes)]
@@ -138,10 +97,9 @@ class DatasetLeaf:
             self.nlabels = sum(self.type_count[self.nsel])
         else:
             self.nlabels = self.natoms
-        perm = self.type.argsort(kind='stable')
         for l in labels:
             if l in ['coord', 'force']:
-                self.data[l] = self.data[l].reshape(self.data[l].shape[0], -1, 3)[:, perm]
+                self.data[l] = self.data[l].reshape(self.data[l].shape[0], -1, 3)
             if l == 'energy':
                 self.data[l] = self.data[l].reshape(-1)
             if 'atomic' in l:
@@ -150,11 +108,8 @@ class DatasetLeaf:
                     assert self.data[l].shape[2] in (3, 9)
                 except Exception:
                     raise ValueError('Atomic label must have 3 (vector) or 9 (3x3 tensor) components per atom.')
-                sel_type = self.type[np.in1d(self.type, self.nsel)]
-                self.data[l] = self.data[l][:, sel_type.argsort(kind='stable')]
         self.data['box'] = self.data['box'].reshape(-1, 3, 3)
         self.data['coord'] = np.array(vmap(shift)(self.data['coord'], self.data['box']))
-        self.type = self.type[perm]
         if paths is not None:
             print('# Dataset loaded: %d frames/%d atoms. Path:' % (self.nframes, self.natoms),
                   ''.join(['\n# \t\'%s\'' % abspath(path) for path in paths]))
@@ -170,6 +125,7 @@ class DatasetLeaf:
             raise AttributeError("lattice_args not set. Call compute_lattice_candidate(rcut) before get_stats.")
         batch = self.get_batch(bs)[0]
         coord, box = batch['coord'], batch['box']
+        coord = coord[:, np.argsort(self.type_idx, kind='stable')]
         r_Bnm = vmap(get_relative_coord, (0, 0, None, None))(coord, box, self.type_count, self.lattice_args)[1]
         sr_BnM = [sr(jnp.concatenate(r, axis=-1), rcut) for r in r_Bnm]
         sr_sum = np.array([sr.sum() for sr in sr_BnM])
@@ -203,7 +159,7 @@ class DatasetLeaf:
             for l in self.data
         }
         self.pointer += batch_size
-        return batch, tuple(self.type_count), self.lattice_args
+        return batch, tuple(self.type_idx), self.lattice_args
 
     def compute_lattice_candidate(self, rcut):
         self.lattice_args = compute_lattice_candidate(self.data['box'], rcut)
@@ -222,7 +178,7 @@ class DatasetLeaf:
         return [(self.type_count, self.data['energy'].mean())]
 
     def get_flattened_data(self):
-        return [{'data': self.data, 'type_count': self.type_count, 'lattice_args': self.lattice_args}]
+        return [{'data': self.data, 'type_idx': self.type_idx, 'lattice_args': self.lattice_args}]
 
     def get_leaves(self):
         return [self]
@@ -233,24 +189,7 @@ class DPDataset(DatasetLeaf):
     Dataset for DeepMD (DP) format directories.
 
     Loads data from DP training directories containing type.raw and set.*/ subdirs
-    with .npy files. Concatenates data across all sets and directories.
-
-    Parameters
-    ----------
-    path : str
-        Path to DP directory. Should contain 'type.raw' and 'set.*/' subdirs
-        with .npy files (e.g., coord.npy, energy.npy).
-    labels : list of str
-        Data labels to load.
-    params : dict, optional
-        Configuration parameters.
-    chemical_types : list of int, optional
-        Atomic numbers; inferred if None.
-
-    Notes
-    -----
-    Directory structure: path/type.raw, path/set.000/, path/set.001/, etc.
-    Each set.*/ contains label.npy files. Data is concatenated over all sets/paths.
+    with .npy files. Concatenates data across all sets in the directory.
     """
     def __init__(self, path, labels, params=None, chemical_types=None):
         self.chemical_types = tuple(chemical_types) if chemical_types else None
@@ -260,6 +199,7 @@ class DPDataset(DatasetLeaf):
             for l in labels
         }
         super().__init__(labels, params or {}, type_arr, data, paths=[path])
+
 
 class DatasetGroup:
     """
@@ -340,28 +280,7 @@ class ExtXYZDataset(DatasetGroup):
     Dataset for extended XYZ (.xyz/.extxyz) files.
 
     Parses frames using ASE and groups them by composition before constructing
-    internal DatasetLeaf subsets. Each composition group becomes one leaf,
-    permitting multiple leaf datasets inside this composite DatasetGroup.
-
-    Parameters
-    ----------
-    paths : list of str
-        Paths to .xyz or .extxyz files.
-    labels : list of str
-        Data labels to load from each frame.
-    params : dict, optional
-        Configuration parameters forwarded to DatasetLeaf.
-    chemical_types : list of int, optional
-        Atomic numbers defining the type ordering. If None, inferred from all
-        atoms in the input files.
-
-    Notes
-    -----
-    - ASE reads each frame via `read(path, index=':')`.
-    - `chemical_types` is inferred from all atomic numbers present, or validated
-      against provided chemical_types.
-    - Frames are grouped by composition using a type-count tuple (`type_count`).
-    - Each distinct composition produces a separate DatasetLeaf internally.
+    internal DatasetLeaf subsets. Each composition group becomes one leaf.
     """
     def __init__(self, paths, labels, params=None, chemical_types=None):
         raw_frames = []

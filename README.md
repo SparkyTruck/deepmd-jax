@@ -5,13 +5,14 @@ Welcome to **DeepMD-jax v0.2**!
 ## Supported Features
 DeepMD-jax supports:
 - **Deep Potential (DP)**: Fast energy and force predictions.
-- **Deep Wannier (DW)**: Predicting Wannier centers associated to atoms.
-- **DP Long Range (DPLR)**: Incorporate explicit long-range Coulomb interactions.
-- **Hybrid ab initio and empirical DP**: Incorporate empirical data during training ([link to article](https://arxiv.org/abs/2511.14352)).
+- **Deep Wannier (DW)**: Predicting Wannier centers associated with atoms.
+- **DP Long Range (DPLR)**: Explicit long-range Coulomb interactions.
+- **Hybrid ab initio and empirical DP**: Empirical-observable training ([link to article](https://arxiv.org/abs/2511.14352)).
+- **Classical MD and PIMD**: Built-in `NVE`, `NVT`, `NVT_langevin`, and `NPT` simulation, including NVT/NPT path-integral MD. Adapted from [jax-md](https://github.com/jax-md/jax-md)-based routines. Simulations can run on **multiple GPUs**.
 
-Also, you can try the [**DP-MP**](https://pubs.rsc.org/en/content/articlehtml/2024/cp/d4cp01483a) architecture for enhanced accuracy.
+You can also try the [**DP-MP**](https://pubs.rsc.org/en/content/articlehtml/2024/cp/d4cp01483a) architecture for enhanced accuracy.
 
-Currently allows **NVE/NVT/NPT simulations** on **multiple GPUs** based on a backend of [jax-md](https://github.com/jax-md/jax-md).
+DeepMD-jax provides a standalone neural-network potential and molecular dynamics engine both implemented in JAX, and is a separate package from [DeepMD-kit](https://github.com/deepmodeling/deepmd-kit).
 
 ## Installation
 ```
@@ -27,7 +28,7 @@ It is recommended to have one GPU for training and one or more GPUs for simulati
 ## Quick Start
 
 ### Step 1: Prepare Your Dataset
-To train a model, prepare your dataset in the same [DeepMD-kit format](https://docs.deepmodeling.com/projects/deepmd/en/r2/data/system.html). Note: Currently only supports periodic systems.
+Training data can be either [DeepMD-kit format](https://docs.deepmodeling.com/projects/deepmd/en/r2/data/system.html) directories or ASE-readable extended XYZ files (`.xyz`/`.extxyz`). For energy models, extxyz frames should contain lattice/cell, species, positions, energy, and forces. Do not mix DeepMD directories and extxyz files in the same `train_data_path` list. Currently only periodic systems are supported.
 
 ### Step 2: Train a Deep Potential Force Field
 
@@ -47,34 +48,46 @@ The default values for the other arguments in [`train()`](https://github.com/Spa
 
 ### Step 3: Perform a Simulation
 
-To run a simulation, prepare the following numpy arrays:
-
-1. `initial_position`: shape `(n, 3)` where `n` is the number of atoms.
-2. `box`: shape `(,)`, `(1,)`, `(3,)` or `(3, 3)`.
-3. `type_idx`: shape `(n,)`, indicates the type of each atom (similar to `type.raw` in the training dataset).
+Prepare numpy arrays for `initial_position` `(n, 3)`, `box` `()`, `(1,)`, `(3,)`, or `(3, 3)`, and `type_idx` `(n,)`. For DeepMD-format models, `type_idx` uses type indices matching `type.raw`; for extxyz-trained models, it can use atomic numbers. `mass` is per model type, following stored `chemical_types` order for extxyz models.
 
 ```python
 from deepmd_jax.md import Simulation
 
 sim = Simulation(
-    model_path='model.pkl',            # Has to be an 'energy' or 'dplr' model
-    box=box,                           # Angstroms
-    type_idx=type_idx,                 # here the index-element map (e.g. 0-Oxygen, 1-Hydrogen) must match the dataset used to train the model
-    mass=[15.9994, 1.0078],            # Oxygen, Hydrogen
-    routine='NVT',                     # 'NVE', 'NVT', 'NPT' (Nosé-Hoover)
+    model_path='model.pkl',
+    box=box,
+    type_idx=type_idx,
+    mass=[15.9994, 1.0078],
+    routine='NVT',                     # 'NVE', 'NVT', 'NVT_langevin', or 'NPT'
     dt=0.5,                            # femtoseconds
     initial_position=initial_position, # Angstroms
-    temperature=300,                   # Kelvin
+    temperature=300,                   # Kelvin; required for NVT/NPT/PIMD
 )
 
-trajectory = sim.run(10000)            # Run for 10,000 steps
-print(trajectory['position'].shape)    # (100001, n, 3)
-# you can split into multiple runs if needed
-trajectory = sim.run(10000)            # Continue to run another 10,000 steps
-print(trajectory['position'].shape)    # (100000, n, 3), does not include the initial position
+trajectory = sim.run(10000)
+print(trajectory['position'].shape)    # (10001, n, 3), includes the initial frame
+trajectory = sim.run(10000)
+print(trajectory['position'].shape)    # (10000, n, 3), continuation omits the old initial frame
 ```
 
-You can check the `Simulation` class in [`md.py`](https://github.com/SparkyTruck/deepmd-jax/blob/main/deepmd_jax/md.py) for additional arguments, like print control, thermostat parameters, etc. There are also some methods of the `Simulation` class like `getEnergy`, `getForce`, `getPosition`, `setPosition`, etc. that you may find useful.
+Routine choices:
+- `NVE`: velocity-Verlet, no thermostat.
+- `NVT`: Nose-Hoover thermostat.
+- `NVT_langevin`: BAOAB Langevin thermostat, with friction `1/tau_t`.
+- `NPT`: Nose-Hoover thermostat/barostat; set `pressure` in bar. `couple_axes` controls isotropic, semi-isotropic, or anisotropic orthorhombic box fluctuations.
+
+For PIMD, use the same `Simulation(...)` setup and set `n_bead > 1` with `routine='NVT'` or `routine='NPT'`:
+
+```python
+sim = Simulation(
+    ...,
+    routine='NVT',
+    temperature=300,
+    n_bead=16,  # number of ring-polymer beads
+)
+```
+
+`initial_position` may be `(n, 3)` and replicated to all beads, or explicitly `(n_bead, n, 3)`. PIMD `NVT` uses a PILE-L Langevin thermostat; PIMD `NPT` uses PILE-L plus a Langevin barostat. See [`md.py`](https://github.com/SparkyTruck/deepmd-jax/blob/main/deepmd_jax/md.py) for extra controls such as `tau_t`, `tau_p`, `neighbor_skin`, `fixed_indices`, and `couple_axes`.
 
 ## More Features and Usages
 
@@ -90,7 +103,7 @@ root_mean_sq_err, mean_abs_error, l1_mixed_error, predictions, ground_truth = te
 
 Use `evaluate()` on a batch of configurations where no ground truth is needed:
 ```python
-from deepmd_jax.evaluate import evaluate
+from deepmd_jax.train import evaluate
 predictions = evaluate(model_path, coords, boxes, type_idx)
 ```
 
@@ -183,45 +196,27 @@ The default units are Angstrom, eV, femtosecond, and their derived units. The on
 
 ### Printing Trajectories on the Fly
 
-If you want to print the trajectories on the fly, you can use the `TrajDumpSimulation` instead of `Simulation`:
-```python
-from deepmd_jax.md import TrajDump, TrajDumpSimulation
+Pass `dump_prefix` to stream XYZ files instead of keeping the trajectory in memory. The generated files are `{prefix}_position.xyz`, `{prefix}_velocity.xyz`, and, for PIMD, `{prefix}_centroid.xyz`. Each XYZ frame includes `step=<self.step>` in the metadata line. Existing files are overwritten by default; use `dump_mode='append'` to continue an existing trajectory. When `dump_prefix` is set, sim.run() returns `None` instead of a trajectory dictionary.
 
-sim = TrajDumpSimulation(
-    model_path="model.pkl",  # Has to be an 'energy' or 'dplr' model
-    box=box,  # Angstroms
-    type_idx=type_idx,  # here the index-element map (e.g. 0-Oxygen, 1-Hydrogen) must match the dataset used to train the model
-    mass=[15.9994, 1.0078, 195.08],  # Oxygen, Hydrogen
-    routine="NVT",  # 'NVE', 'NVT', 'NPT' (Nosé-Hoover)
-    dt=0.5,  # femtoseconds
-    initial_position=initial_position,  # Angstroms
-    temperature=330,  # Kelvin
-    report_interval=100,  # Report every 100 steps
-)
-# print positions and velocities every 10 steps in xyz format
-sim.run(
-      n_steps,
-      [
-      TrajDump(atoms, "pos_traj.xyz", 10, append=True),
-      TrajDump(atoms, "vel_traj.xyz", 10, vel=True, append=True),
-      ],
-)
-# Run for 100,000 steps
-trajectory = sim.run(100000)
+```python
+# Writes traj_position.xyz and traj_velocity.xyz every 10 steps.
+sim.run(100000, dump_prefix="traj", dump_interval=10)
+
+# Dump select content. Allowed entries are 'position', 'velocity', and 'centroid'.
+sim.run(100000, dump_prefix="traj", dump_content=["position"], dump_interval=10)
+
+# Continue appending frames to existing files.
+sim.run(100000, dump_prefix="traj", dump_interval=10, dump_mode="append")
 ```
+
+For XYZ output, pass `type_symbols=[...]` to `Simulation` unless the model was trained from extxyz (which already stores `chemical_types` in the model).
 
 ## Roadmap
 
 To-do list:
-- [ ] Fix atoms/dummy atoms; Optimize multi-gpu sharding.
-- [ ] Model deviation API;
-- [ ] Misc simulation features: Temperature and pressure control, more thermostats;
-
-Planned features: (v0.3)
+- [ ] Model deviation API.
+- [ ] Non-orthorhombic neighbor list.
 - [ ] Enhanced sampling.
-- [ ] Path-Integral MD.
-- [ ] Non-orthorhomibic neighbor list; Non-isotropic fluctuation in NPT.
-- [ ] Misc: data, dpmodel, utils code cleanup; Glob data path, flatten subset, optimize compute lattice, optimize print output; pair correlation function; move reorder inside dpmodel; train starting from a trained model; training seed control;
 
 This project is in active development, and if you encounter any issues, please feel free to contact me or open an issue on the GitHub page. You are also welcome to make custom modifications and pull requests. Have fun! 🚀
 

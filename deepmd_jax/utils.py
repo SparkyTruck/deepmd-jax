@@ -326,20 +326,68 @@ def periodic_replicate(n_copy, coord, box, type_idx=None, force=None, velocity=N
         ret.append(np.concatenate([velocity]*n_copy.prod()))
     return ret
     
-def reorder_by_device(coord, type_count):
+def reorder_by_device(coord, type_idx, K=None):
     '''
-        For multiple devices, ghost atoms are padded to ensure equal partitioning.
-        Each type of atom is padded and partitioned separately and then concatenated.
+        Sort coord (raw atom order) by type, then for K>1 pad each type to a
+        multiple of K and interleave per-device along the atom axis. type_idx
+        is the (N,) atom-type vector. When K is None it defaults to
+        jax.device_count(); pass K=1 to skip the pad/interleave (sort only).
     '''
-    K = jax.device_count()
+    if K is None:
+        K = jax.device_count()
+    type_idx = np.asarray(type_idx)
+    perm = np.argsort(type_idx, kind='stable')
+    coord = coord[perm]
+    if K == 1:
+        return coord
+    type_count = (np.bincount(type_idx, minlength=int(type_idx.max()) + 1)
+                  if type_idx.size > 0 else np.array([], dtype=int))
     coord = jnp.concatenate(
                 [
                     jnp.pad(c,
                             ((0,-c.shape[0]%K),)+((0,0),)*(c.ndim-1)
                         ).reshape(K,-1,*c.shape[1:])
-                    for c in split(coord,type_count)
+                    for c in split(coord, type_count)
                 ], axis=1).reshape(-1, *coord.shape[1:])
     return jax.lax.with_sharding_constraint(coord, PSpec())
+
+
+def dplr_charges(type_idx, q_atoms, q_wc, nsel, ntypes):
+    '''Per-atom and per-wc charges in raw atom order.
+    qatoms: (N,), one entry per real atom; qwc: (M,) in raw order over atoms
+    whose type is in nsel (matching wc_predict's output ordering).'''
+    type_idx = np.asarray(type_idx)
+    nsel_arr = np.asarray(list(nsel))
+    pos_in_nsel = np.full(ntypes, -1, dtype=int)
+    pos_in_nsel[nsel_arr] = np.arange(len(nsel_arr))
+    nsel_mask = np.isin(type_idx, nsel_arr)
+    qatoms = np.asarray(q_atoms)[type_idx]
+    qwc = np.asarray(q_wc)[pos_in_nsel[type_idx[nsel_mask]]]
+    return qatoms, qwc
+
+
+def assert_type_idx_in_valid_types(type_idx, valid_types):
+    '''Reject atom types the model was not trained on.'''
+    type_idx = np.asarray(type_idx)
+    valid = np.isin(type_idx, np.asarray(valid_types))
+    if not valid.all():
+        bad = sorted(set(type_idx[~valid].tolist()))
+        raise ValueError(
+            f"type index {bad} out of trained scope of model "
+            f"(valid_types={list(valid_types)}).")
+
+
+def atomic_inverse_perm(type_idx, nsel):
+    '''Permutation mapping the model's atomic output (atoms of nsel types,
+    grouped by type in nsel order, stable-sorted within each type) back to
+    raw atom order among nsel-typed atoms. Returns shape (M,) with
+    M = sum(count[t] for t in nsel).'''
+    type_idx = np.asarray(type_idx)
+    if len(nsel) == 0:
+        return np.zeros((0,), dtype=int)
+    sorted_nsel = np.concatenate(
+        [np.where(type_idx == t)[0] for t in nsel])
+    return np.argsort(sorted_nsel, kind='stable')
 
 def get_mask_by_device(type_count):
     '''

@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import time, datetime
 import flax.linen as nn
 from functools import partial
-from .utils import get_p3mlr_fn, get_p3mlr_grid_size, load_model, save_model, compress_model, save_dataset
+from .utils import get_p3mlr_fn, get_p3mlr_grid_size, load_model, save_model, compress_model, dplr_charges
 from .data import Dataset
 from .dpmodel import DPModel
 from typing import Union, List
@@ -152,7 +152,7 @@ def train(
     # load dataset
     if 'atomic' in model_type and atomic_data_prefix is None:
         atomic_data_prefix = 'atomic_dipole' if model_type == 'atomic' else 'atomic_polarizability'
-    if model_type == 'energy' or model_type == 'dplr':
+    if model_type in ('energy', 'dplr'):
         labels = ['coord', 'box', 'force', 'energy']
     elif 'atomic' in model_type:
         labels = ['coord', 'box', atomic_data_prefix]
@@ -317,8 +317,8 @@ def train(
     print('# Model params:', {k:v for k,v in model.params.items() if k != 'dplr_wannier_model_and_variables'})
 
     # initialize model variables
-    batch, type_count, lattice_args = train_data.get_batch(1)
-    static_args = nn.FrozenDict({'type_count': type_count, 'lattice': lattice_args})
+    batch, type_idx, lattice_args = train_data.get_batch(1)
+    static_args = nn.FrozenDict({'type_idx': type_idx, 'lattice': lattice_args})
     if seed is None:
         seed = np.random.randint(65536)
     variables = model.init(
@@ -357,7 +357,6 @@ def train(
     else:
         state = {'loss_avg': 0., 'iteration': 0}
     if hybrid:
-        state_obs = {}
         _single_state_obs = {'lobs_avg': 0., 'obs_term_avg': 0., 'obs_mean': 0., 'logweights': [0.], 'ESS': 1. }
         state_obs = {k: _single_state_obs for k in range(len(obs_train_data_path))}
 
@@ -480,13 +479,13 @@ def train(
             val_batch = get_batch_val()
             loss_val = []
             for one_batch in val_batch:
-                v_batch, type_count, lattice_args = one_batch
-                static_args = nn.FrozenDict({'type_count': tuple(type_count),
+                v_batch, type_idx, lattice_args = one_batch
+                static_args = nn.FrozenDict({'type_idx': tuple(type_idx),
                                              'lattice': lattice_args})
                 loss_val.append(val_step(v_batch, variables, static_args))
 
-        batch, type_count, lattice_args = get_batch_train()
-        static_args = nn.FrozenDict({'type_count': tuple(type_count),
+        batch, type_idx, lattice_args = get_batch_train()
+        static_args = nn.FrozenDict({'type_idx': tuple(type_idx),
                                      'lattice': lattice_args})
         variables, opt_state, state = train_step(batch,
                                                  variables,
@@ -498,8 +497,8 @@ def train(
         if hybrid and iteration % obs_step_every == 0:
             # observable train step
             for i in range(len(obs_train_data_path)):
-                batch, type_count, lattice_args = get_batch_train_obs(obs_position=i)
-                static_args = nn.FrozenDict({'type_count': tuple(type_count),
+                batch, type_idx, lattice_args = get_batch_train_obs(obs_position=i)
+                static_args = nn.FrozenDict({'type_idx': tuple(type_idx),
                                             'lattice': lattice_args})
                 variables, opt_state, state_obs = train_step_obs(batch,
                                                         variables,
@@ -538,9 +537,9 @@ def test(
 
     if jax.device_count() > 1:
         print('# Note: Currently only one device will be used for evaluation.')
-    
+
     model, variables = load_model(model_path, replicate=False)
-    if model.params['type'] == 'energy' or model.params['type'] == 'dplr':
+    if model.params['type'] in ('energy', 'dplr'):
         labels = ['coord', 'box', 'force', 'energy']
         atomic_sel = None
     elif 'atomic' in model.params['type']:
@@ -549,9 +548,9 @@ def test(
     else:
         raise ValueError('Model type should be "energy", "atomic", "atomic_t2", or "dplr".')
     test_data = Dataset(data_path,
-                          labels,
-                          {'atomic_sel':atomic_sel},
-                          chemical_types=model.params.get('chemical_types'))
+                        labels,
+                        {'atomic_sel': atomic_sel},
+                        chemical_types=model.params.get('chemical_types'))
     test_data.compute_lattice_candidate(model.params['rcut'])
     if 'dplr' in model.params['type']:
         subsets = test_data.get_flattened_data()
@@ -563,10 +562,8 @@ def test(
                                       model.params['dplr_resolution'],
                                       *model.params['dplr_wannier_model_and_variables'])
 
-    if model.params['type'] in ['energy', 'dplr']:
+    if model.params['type'] in ('energy', 'dplr'):
         evaluate_fn = model.energy_and_force
-
-        # running stats
         stats = {
             'energy': {'sq': 0.0, 'abs': 0.0, 'count': 0},
             'force': {'sq': 0.0, 'abs': 0.0, 'count': 0},
@@ -575,21 +572,16 @@ def test(
             'energy_l1_sum': 0.0,
             'energy_l1_count': 0,
         }
-
-        # optional storage
         predictions = {'energy': [], 'force': []}
         ground_truth = {'energy': [], 'force': []}
-
     else:
         key = model.params['atomic_data_prefix']
         evaluate_fn = lambda variables, coord, box, static_args: model.apply(variables, coord, box, static_args)
-
         stats = {
             key: {'sq': 0.0, 'abs': 0.0, 'count': 0},
             'l1_sum': 0.0,
             'l1_count': 0,
         }
-
         predictions = {key: []}
         ground_truth = {key: []}
 
@@ -603,46 +595,37 @@ def test(
         remaining = leaf.nframes
         while remaining > 0:
             bs = min(batch_size, remaining)
-            batch, type_count, lattice_args = leaf.get_batch(bs)
+            batch, type_idx, lattice_args = leaf.get_batch(bs)
             remaining -= bs
 
-            static_args = nn.FrozenDict({'type_count': type_count, 'lattice': lattice_args})
+            static_args = nn.FrozenDict({'type_idx': type_idx, 'lattice': lattice_args})
             pred = evaluate_fn(variables, batch['coord'], batch['box'], static_args)
 
-            if model.params['type'] in ['energy', 'dplr']:
+            if model.params['type'] in ('energy', 'dplr'):
                 E_pred, F_pred = pred
                 E_true = batch['energy']
                 F_true = batch['force']
 
-                # store if desired
                 predictions['energy'].append(E_pred)
                 predictions['force'].append(F_pred)
                 ground_truth['energy'].append(E_true)
                 ground_truth['force'].append(F_true)
 
-                # --- ENERGY (per-atom normalized) ---
                 natoms = F_pred.shape[1]
-
                 dE = (E_pred - E_true) / natoms
                 stats['energy']['sq'] += (dE**2).sum()
                 stats['energy']['abs'] += np.abs(dE).sum()
                 stats['energy']['count'] += dE.size
-
                 stats['energy_l1_sum'] += np.abs(dE).sum()
                 stats['energy_l1_count'] += dE.size
 
-                # --- FORCES ---
                 diffF = F_pred - F_true
-
                 stats['force']['sq'] += (diffF**2).sum()
                 stats['force']['abs'] += np.abs(diffF).sum()
                 stats['force']['count'] += diffF.size
-
-                # mixed L1 (per-atom norm)
                 per_atom = (diffF**2).mean(-1)**0.5
                 stats['force_l1_sum'] += per_atom.sum()
                 stats['force_l1_count'] += per_atom.size
-
             else:
                 key = model.params['atomic_data_prefix']
                 pred_val = pred[0]
@@ -652,39 +635,36 @@ def test(
                 ground_truth[key].append(true_val)
 
                 diff = pred_val - true_val
-
                 stats[key]['sq'] += (diff**2).sum()
                 stats[key]['abs'] += np.abs(diff).sum()
                 stats[key]['count'] += diff.size
-
                 per_atom = (diff**2).mean(-1)**0.5
                 stats['l1_sum'] += per_atom.sum()
                 stats['l1_count'] += per_atom.size
 
-    # --- FINAL METRICS ---
     rmse = {}
     mae = {}
     l1_mixed = {}
 
-    if model.params['type'] in ['energy', 'dplr']:
+    for key in predictions.keys():
+        predictions[key] = np.concatenate(predictions[key], axis=0)
+        ground_truth[key] = np.concatenate(ground_truth[key], axis=0)
+
+    if model.params['type'] in ('energy', 'dplr'):
         rmse['energy'] = (stats['energy']['sq'] / stats['energy']['count'])**0.5
         mae['energy'] = stats['energy']['abs'] / stats['energy']['count']
-
         rmse['force'] = (stats['force']['sq'] / stats['force']['count'])**0.5
         mae['force'] = stats['force']['abs'] / stats['force']['count']
-
         l1_mixed['energy'] = stats['energy_l1_sum'] / stats['energy_l1_count']
         l1_mixed['force'] = stats['force_l1_sum'] / stats['force_l1_count']
-
     else:
         key = model.params['atomic_data_prefix']
-
         rmse[key] = (stats[key]['sq'] / stats[key]['count'])**0.5
         mae[key] = stats[key]['abs'] / stats[key]['count']
         l1_mixed[key] = stats['l1_sum'] / stats['l1_count']
 
     return rmse, mae, l1_mixed, predictions, ground_truth
-        
+
 def evaluate(
     model_path: str,
     coord: np.ndarray,
@@ -765,13 +745,13 @@ def process_long_range_subset(subset, dplr_q_atoms, dplr_q_wc, dplr_beta, dplr_r
     '''
         subtracting long range energy and force, keeping short range part only, for dplr models.
     '''
-    data, type_count, lattice_args = subset.values()
+    data, type_idx, lattice_args = subset.values()
     if not lattice_args['ortho']:
         raise ValueError('For "dplr" currently only orthorhombic boxes are supported.')
-    sel_type_count = tuple(np.array(type_count)[wc_model.params['nsel']])
-    qatoms = np.repeat(dplr_q_atoms, type_count)
-    qwc = np.repeat(dplr_q_wc, sel_type_count)
-    static_args = nn.FrozenDict({'type_count': type_count, 'lattice': lattice_args})
+    type_idx = np.asarray(type_idx)
+    qatoms, qwc = dplr_charges(type_idx, dplr_q_atoms, dplr_q_wc,
+                               wc_model.params['nsel'], wc_model.params['ntypes'])
+    static_args = nn.FrozenDict({'type_idx': tuple(type_idx), 'lattice': lattice_args})
 
     def lr_energy(coord, box, Ngrid):
         wc = wc_model.wc_predict(wc_variables, coord, box, static_args)
