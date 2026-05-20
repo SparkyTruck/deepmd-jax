@@ -4,10 +4,10 @@ Provides a BAOAB Langevin integrator that mirrors ``jax_md.simulate.nvt_langevin
 but operates on ring-polymer states shaped ``(P, N, 3)`` and replaces the O step
 with the PILE-L thermostat (Langevin on normal-mode momenta).
 
-The ring-polymer spring is added inside the integrator on top of the
-user-supplied (bead-averaged) potential, so the B step looks exactly like the
-classical Langevin case. The price is a dt limit of roughly 1/omega_max where
-omega_max ~ 2 * n_bead * k_B T / hbar.
+The NVT integrator propagates the free ring-polymer Hamiltonian exactly in
+normal modes and applies physical-force kicks around it. The NPT integrator
+applies the same exact propagation to the internal ring-polymer modes while the
+centroid follows the Parrinello-Rahman barostat flow.
 """
 
 import jax
@@ -119,40 +119,64 @@ def nvt_langevin_pimd(
     box,
     gamma_P,
     nm_trans,
+    nm_freqs,
     **sim_kwargs,
 ):
     """BAOAB Langevin integrator for PIMD with a PILE-L thermostat.
 
-    Mirrors ``jax_md.simulate.nvt_langevin``; only the O (stochastic) step
-    differs. The ring-polymer spring is added internally; the caller passes the
-    bead-averaged potential only.
+    Uses physical-force BAOAB kicks with exact normal-mode propagation of the
+    free ring-polymer Hamiltonian. The caller passes the bead-averaged physical
+    potential only.
 
     Args
     ----
     energy_fn : callable
         ``energy_fn(R, **kwargs) -> scalar`` with ``R`` of shape ``(P, N, 3)``;
-        the bead-averaged potential to which the ring-polymer spring is added.
+        the bead-averaged physical potential; the spring is handled
+        analytically in normal modes.
     shift_fn : callable
-        Shift applied by ``position_step``; must broadcast over a leading bead
-        axis (jax_md's ``periodic`` / ``periodic_general`` do).
+        Accepted for the common routine-constructor interface; NVT exact
+        propagation does not call it.
     dt : float, time step in fs.
     kT : float, temperature (eV).
-    box : jnp.ndarray, the (fixed) simulation cell, used by the spring term.
+    box : jnp.ndarray, the fixed simulation cell, used to unwrap beads consistently.
     gamma_P : jnp.ndarray, shape ``(P,)``
         Per-normal-mode friction coefficient in fs^-1.
     nm_trans : jnp.ndarray, shape ``(P, P)``
         Orthogonal transform ``C`` (primitive <- normal-mode).
+    nm_freqs : jnp.ndarray, shape ``(P,)``
+        Ring-polymer normal-mode angular frequencies in fs^-1.
     """
     n_bead = nm_trans.shape[0]
-    omega_P = n_bead * kT / HBAR
+    nm_freqs = jnp.asarray(nm_freqs)
 
-    def total_energy_fn(R, mass, **kwargs):
+    def physical_energy_fn(R, **kwargs):
         kwargs.pop('box', None)
-        return (n_bead * energy_fn(R, box=box, **kwargs)
-                + spring_energy(R, mass, box, omega_P))
+        return n_bead * energy_fn(R, box=box, **kwargs)
 
-    def total_force_fn(R, mass, **kwargs):
-        return -jax.grad(total_energy_fn)(R, mass, **kwargs)
+    def physical_force_fn(R, **kwargs):
+        return -jax.grad(physical_energy_fn)(R, **kwargs)
+
+    def exact_free_ring_step(state, step_dt):
+        R = unwrap_across_beads(state.position, box)
+        P = state.momentum
+        Q_nm = jnp.tensordot(nm_trans.T, R, axes=(1, 0))
+        P_nm = jnp.tensordot(nm_trans.T, P, axes=(1, 0))
+        w = nm_freqs.astype(R.dtype)[:, None, None]
+        angle = w * step_dt
+        cos = jnp.cos(angle)
+        sin = jnp.sin(angle)
+        safe_w = jnp.where(w == 0, 1.0, w)
+        Q_cent = Q_nm[0:1] + step_dt * P_nm[0:1] / state.mass
+        P_cent = P_nm[0:1]
+        Q_int = Q_nm[1:] * cos[1:] + P_nm[1:] * sin[1:] / (state.mass * safe_w[1:])
+        P_int = P_nm[1:] * cos[1:] - state.mass * safe_w[1:] * Q_nm[1:] * sin[1:]
+        Q_new = jnp.concatenate([Q_cent, Q_int], axis=0)
+        P_new = jnp.concatenate([P_cent, P_int], axis=0)
+        return state.set(
+            position=jnp.tensordot(nm_trans, Q_new, axes=(1, 0)),
+            momentum=jnp.tensordot(nm_trans, P_new, axes=(1, 0)),
+        )
 
     @jax.jit
     def init_fn(key, R, mass=jnp.float32(1.0), **kwargs):
@@ -163,7 +187,7 @@ def nvt_langevin_pimd(
             thermostat_work=jnp.zeros((), dtype=R.dtype),
         )
         state = simulate.canonicalize_mass(state)
-        state = state.set(force=total_force_fn(R, state.mass, **kwargs))
+        state = state.set(force=physical_force_fn(R, **kwargs))
         return state.set(momentum=initial_pimd_momentum(R, state.mass, _kT, split))
 
     @jax.jit
@@ -173,10 +197,10 @@ def nvt_langevin_pimd(
         dt_2 = _dt / 2
 
         state = simulate.momentum_step(state, dt_2)
-        state = simulate.position_step(state, shift_fn, dt_2, **kwargs)
+        state = exact_free_ring_step(state, dt_2)
         state = _pile_l_stochastic_step(state, _dt, _kT, gamma_P, nm_trans)
-        state = simulate.position_step(state, shift_fn, dt_2, **kwargs)
-        state = state.set(force=total_force_fn(state.position, state.mass, **kwargs))
+        state = exact_free_ring_step(state, dt_2)
+        state = state.set(force=physical_force_fn(state.position, **kwargs))
         state = simulate.momentum_step(state, dt_2)
         return state
 
@@ -282,6 +306,7 @@ def npt_langevin_pimd(
     gamma_P,
     gamma_box,
     nm_trans,
+    nm_freqs,
     membership,
     n_per_group,
     group_ids,
@@ -289,9 +314,9 @@ def npt_langevin_pimd(
 ):
     """BAOAB Langevin integrator for NPT path-integral MD.
 
-    Centroid mode follows Parrinello-Rahman; internal modes drift freely. The
-    Langevin barostat couples only to the centroid. The ring-polymer spring is
-    added internally; the caller passes the bead-averaged potential only.
+    Centroid mode follows Parrinello-Rahman; internal modes are propagated
+    exactly in normal modes. The Langevin barostat couples only to the centroid.
+    The caller passes the bead-averaged physical potential only.
 
     In real coords the spring depends only on bead positions (not the cell),
     so it never enters dU/dV. The potential virial is the centroid-virial
@@ -302,7 +327,7 @@ def npt_langevin_pimd(
     dt = f32(dt)
     dt_2 = f32(dt / 2)
     n_bead = nm_trans.shape[0]
-    omega_P = n_bead * kT / HBAR
+    nm_freqs = jnp.asarray(nm_freqs)
     G = n_per_group.shape[0]
     membership = jnp.asarray(membership)
     n_per_group = jnp.asarray(n_per_group, dtype=f32)
@@ -326,12 +351,6 @@ def npt_langevin_pimd(
         dR_internal = R_uw - R_uw.mean(axis=0, keepdims=True)
         internal_virial_axis = jnp.sum(dR_internal * F, axis=(0, 1))
         return F, (grads[1] + membership.T @ internal_virial_axis) / n_bead
-
-    def force_and_dUdV(R, mass, box, **kwargs):
-        """Bead force from (energy_fn + spring); dUdV is from energy_fn only."""
-        F, dUdV = force_stress_fn(R, box, **kwargs)
-        F_spring = -jax.grad(spring_energy)(R, mass, box, omega_P)
-        return F + F_spring, dUdV
 
     def _box_and_vol(R_b, ref_box):
         scales_g = jnp.exp(R_b)
@@ -367,26 +386,34 @@ def npt_langevin_pimd(
         P_int_new = (P - P_c[None]) + dt_2 * (F - F_c[None])
         return P_c_new[None] + P_int_new
 
-    def exp_iL1_pimd(box, R, vel, vel_b, dt_step, **kwargs):
-        """Position drift with PR scaling on centroid only.
-           dR_k = dt_step * vel_k + (centroid PR adjustment, broadcast across beads).
-        """
+    def exp_iL1_centroid_pimd(box, R, vel, vel_b, dt_step, **kwargs):
+        """Centroid PR drift only; internal modes are handled separately."""
         vel_b_per_axis = membership @ vel_b
         x = vel_b_per_axis * dt_step
         x_2 = x / 2
         sinh_factor = _sinhx_x(x_2)
-        # Use the same periodic-image convention as the centroid-virial stress.
-        # The periodic shift_fn can wrap beads between the two half drifts, and
-        # a raw bead mean would move the wrong centroid when a ring polymer
-        # straddles a boundary.
         R_c = unwrap_across_beads(R, box).mean(axis=0)
         vel_c = vel.mean(axis=0)
-        # Adjustment lifts free drift to PR drift on the centroid:
-        #   centroid_pr - centroid_free = R_c*(exp(x)-1) + dt*vel_c*(exp(x/2)*sinh - 1)
-        adjustment = (R_c * (jnp.exp(x) - 1)
-                      + dt_step * vel_c * (jnp.exp(x_2) * sinh_factor - 1.0))
-        dR = dt_step * vel + adjustment[None]
-        return unwrap_step_position(R, shift_fn(R, dR, box=box, **kwargs), box)
+        dR_c = (R_c * (jnp.exp(x) - 1)
+                + dt_step * vel_c * jnp.exp(x_2) * sinh_factor)
+        return unwrap_step_position(R, shift_fn(R, dR_c[None], box=box, **kwargs), box)
+
+    def exact_internal_ring_step(R, P, mass, box, step_dt):
+        """Exact free propagation of non-centroid ring-polymer modes."""
+        R_uw = unwrap_across_beads(R, box)
+        Q_nm = jnp.tensordot(nm_trans.T, R_uw, axes=(1, 0))
+        P_nm = jnp.tensordot(nm_trans.T, P, axes=(1, 0))
+        w = nm_freqs.astype(R.dtype)[:, None, None]
+        angle = w * step_dt
+        cos = jnp.cos(angle)
+        sin = jnp.sin(angle)
+        safe_w = jnp.where(w == 0, 1.0, w)
+        Q_int = Q_nm[1:] * cos[1:] + P_nm[1:] * sin[1:] / (mass * safe_w[1:])
+        P_int = P_nm[1:] * cos[1:] - mass * safe_w[1:] * Q_nm[1:] * sin[1:]
+        Q_new = jnp.concatenate([Q_nm[0:1], Q_int], axis=0)
+        P_new = jnp.concatenate([P_nm[0:1], P_int], axis=0)
+        return (jnp.tensordot(nm_trans, Q_new, axes=(1, 0)),
+                jnp.tensordot(nm_trans, P_new, axes=(1, 0)))
 
     def init_fn(key, R, box, mass=f32(1.0), **kwargs):
         N = R.shape[1]
@@ -411,8 +438,8 @@ def npt_langevin_pimd(
             box_thermostat_work=jnp.zeros((), dtype=R.dtype),
         )
         state = simulate.canonicalize_mass(state)
-        F, dUdV = force_and_dUdV(R, state.mass, box,
-                                 **{k: v for k, v in kwargs.items() if k != 'kT'})
+        F, dUdV = force_stress_fn(
+            R, box, **{k: v for k, v in kwargs.items() if k != 'kT'})
         state = state.set(force=F, dUdV=dUdV)
         return state.set(momentum=initial_pimd_momentum(R, state.mass, _kT, split))
 
@@ -441,7 +468,8 @@ def npt_langevin_pimd(
         # 3. Half box-position + half position drift (A).
         R_b = R_b + dt_2 * P_b / M_b
         box, _ = _box_and_vol(R_b, ref_box)
-        R = exp_iL1_pimd(box, R, P / M, P_b / M_b, dt_2, **kwargs)
+        R = exp_iL1_centroid_pimd(box, R, P / M, P_b / M_b, dt_2, **kwargs)
+        R, P = exact_internal_ring_step(R, P, M, box, dt_2)
 
         # 4. O step: PILE-L on bead momenta + Langevin on box momentum.
         rng = state.rng
@@ -466,10 +494,11 @@ def npt_langevin_pimd(
         # 5. Half box-position + half position drift (A).
         R_b = R_b + dt_2 * P_b / M_b
         box, vol = _box_and_vol(R_b, ref_box)
-        R = exp_iL1_pimd(box, R, P / M, P_b / M_b, dt_2, **kwargs)
+        R = exp_iL1_centroid_pimd(box, R, P / M, P_b / M_b, dt_2, **kwargs)
+        R, P = exact_internal_ring_step(R, P, M, box, dt_2)
 
         # 6. Force evaluation at new (R, box).
-        F, dUdV = force_and_dUdV(R, M, box, **kwargs)
+        F, dUdV = force_stress_fn(R, box, **kwargs)
 
         # 7. Half momentum kick (B with PR on centroid).
         P = exp_iL2_pimd(P, F, P_b / M_b, N_f)

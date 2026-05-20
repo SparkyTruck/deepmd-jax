@@ -69,6 +69,8 @@ class Simulation:
                  couple_axes: tuple = ((0, 1, 2),),
                  n_bead=1,
                  type_symbols: Optional[List[str]] = None,
+                 pimd_lambda=1.0,
+                 pimd_print_invariant=False,
                 ):
         '''
             Initialize a Simulation instance.
@@ -98,6 +100,8 @@ class Simulation:
             fixed_indices: zero-based indices of atoms that should remain fixed (constrained position) in the simulation.
             couple_axes: NPT-only partition of a subset of {0,1,2} into coupled groups. Each inner tuple lists axes sharing one scale factor; axes not listed are held fixed. Examples: ((0,1,2),) iso (default); ((0,1),) semi-iso (xy couple, z fixed); ((0,),) uniaxial (only x moves); ((0,),(1,),(2,)) fully anisotropic ortho; ((0,1),(2,)) xy couple + z independent.
             n_bead: number of ring-polymer beads. 1 (default) = classical MD. n_bead > 1 switches routine='NVT' to path-integral MD using PILE-L thermostat (internal modes critically damped, centroid friction = 1/tau_t). initial_position may be (N,3) (replicated across beads) or (P,N,3).
+            pimd_lambda: PILE internal-mode damping scale for PIMD, where gamma_k = 2 * pimd_lambda * omega_k for non-centroid modes. The centroid friction remains 1/tau_t. Default 1.0 preserves standard PILE behavior.
+            pimd_print_invariant: if True, include the PIMD invariant reporter. Disabled by default because the finite-step diagnostic can drift more visibly as n_bead increases.
             ############################
             Usage:
                 sim = Simulation(...)
@@ -108,6 +112,10 @@ class Simulation:
         self.log = []
         self._n_bead = int(n_bead)
         self._is_pimd = self._n_bead > 1
+        self._pimd_lambda = float(pimd_lambda)
+        self._pimd_print_invariant = bool(pimd_print_invariant)
+        if self._pimd_lambda < 0:
+            raise ValueError("pimd_lambda must be non-negative.")
         if self._is_pimd:
             if routine not in ('NVT', 'NPT'):
                 raise NotImplementedError(
@@ -208,7 +216,18 @@ class Simulation:
             chain_steps_t=chain_steps_t, chain_steps_p=chain_steps_p,
             sy_steps_t=sy_steps_t, sy_steps_p=sy_steps_p,
         )
-        print(f"# Initialized {self._routine} simulation with {self._natoms} atoms")
+        init_info = []
+        if self._temperature is not None and self._routine != "NVE":
+            init_info.append(f"temperature={self._temperature:g} K")
+        if "NPT" in self._routine:
+            init_info.append(f"pressure={pressure:g} bar")
+        if self._is_pimd:
+            init_info.append(f"n_beads={self._n_bead}")
+            init_info.append(f"pimd_lambda={self._pimd_lambda:g}")
+        suffix = f" ({', '.join(init_info)})" if init_info else ""
+        print(f"# Initialized {self._routine} simulation with {self._natoms} atoms{suffix}")
+        if self._is_pimd and self._pimd_print_invariant:
+            print("# Warning: PIMD invariant is a finite-step diagnostic and may drift more visibly as n_beads increases.")
 
         # Initialize neighbor list if needed
         if self._static_args['use_neighbor_list']:
@@ -285,14 +304,15 @@ class Simulation:
                 'mobile_mask': self._mobile,
             }
         if key == ("NVT", True):
-            # PILE-L: critically damped internal modes, centroid friction = 1/tau_t.
-            gamma = 2.0 * self._nm_freqs
+            # PILE-L: internal modes gamma_k = 2 * pimd_lambda * omega_k; centroid friction = 1/tau_t.
+            gamma = 2.0 * self._pimd_lambda * self._nm_freqs
             gamma[0] = 1.0 / tau_t
             return _pimd.nvt_langevin_pimd, {
                 'kT': kT,
                 'box': self._current_box,
                 'gamma_P': jnp.asarray(gamma),
                 'nm_trans': jnp.asarray(self._nm_trans),
+                'nm_freqs': jnp.asarray(self._nm_freqs),
             }
         if key == ("NVT_langevin", False):
             return nvt_langevin, {
@@ -310,7 +330,7 @@ class Simulation:
                 'couple_axes': self._couple_axes,
             }
         if key == ("NPT", True):
-            gamma_P = 2.0 * self._nm_freqs
+            gamma_P = 2.0 * self._pimd_lambda * self._nm_freqs
             gamma_P[0] = 1.0 / tau_t
             return _pimd.npt_langevin_pimd, {
                 'pressure': pressure * PRESS_UNIT_CONVERSION,
@@ -318,6 +338,7 @@ class Simulation:
                 'gamma_P': jnp.asarray(gamma_P),
                 'gamma_box': 1.0 / tau_p,
                 'nm_trans': jnp.asarray(self._nm_trans),
+                'nm_freqs': jnp.asarray(self._nm_freqs),
                 'membership': membership_np,
                 'n_per_group': n_per_group_np,
                 'group_ids': self._group_ids_np,
@@ -454,13 +475,16 @@ class Simulation:
                 - state.thermostat_work
             )
         elif self._routine == "NVT" and self._is_pimd:
-            omega_P = self._n_bead * self._temperature * TEMP_UNIT_CONVERSION / _pimd.HBAR
-            def _pimd_nvt_invariant(state, nbrs_nm):
-                return (jax_md.simulate.kinetic_energy(state)
-                        + self._n_bead * self._energy_fn(state.position, box=self._initial_box, nbrs_nm=nbrs_nm)
-                        + _pimd.spring_energy(state.position, state.mass, self._initial_box, omega_P)
-                        - state.thermostat_work)
-            self._reporters["Invariant"] = _pimd_nvt_invariant
+            if self._pimd_print_invariant:
+                omega_P = self._n_bead * self._temperature * TEMP_UNIT_CONVERSION / _pimd.HBAR
+                def _pimd_nvt_invariant(state, nbrs_nm):
+                    H_rp = (jax_md.simulate.kinetic_energy(state)
+                            + self._n_bead * self._energy_fn(
+                                state.position, box=self._initial_box, nbrs_nm=nbrs_nm)
+                            + _pimd.spring_energy(
+                                state.position, state.mass, self._initial_box, omega_P))
+                    return (H_rp - state.thermostat_work) / self._n_bead
+                self._reporters["Invariant"] = _pimd_nvt_invariant
         elif self._routine == "NPT":
             self._reporters["Pressure"] = lambda state, nbrs_nm: self._pressure_fn(state, state.box, nbrs_nm)
             # One column per moving axis. Fixed axes are omitted; axes in the
@@ -478,25 +502,25 @@ class Simulation:
                                                 nbrs_nm=nbrs_nm,
                                             )
             else:
-                omega_P = self._n_bead * self._temperature * TEMP_UNIT_CONVERSION / _pimd.HBAR
-                P_target = self._pressure * PRESS_UNIT_CONVERSION
-                def _pimd_npt_invariant(state, nbrs_nm):
-                    box = state.box
-                    V = jnp.prod(box) if box.ndim == 1 else jnp.linalg.det(box)
-                    KE_box = 0.5 * jnp.sum(state.box_momentum ** 2 / state.box_mass)
-                    # The implemented PIMD piston acts on the physical centroid
-                    # variables, so the conserved system enthalpy is the
-                    # bead-averaged ring-polymer Hamiltonian.
-                    H_rp = (jax_md.simulate.kinetic_energy(state)
-                            + self._n_bead * self._energy_fn(
-                                state.position, box=box, nbrs_nm=nbrs_nm)
-                            + _pimd.spring_energy(
-                                state.position, state.mass, box, omega_P))
-                    return (H_rp / self._n_bead
-                            + KE_box + P_target * V
-                            - state.thermostat_work / self._n_bead
-                            - state.box_thermostat_work)
-                self._reporters["Invariant"] = _pimd_npt_invariant
+                if self._pimd_print_invariant:
+                    omega_P = self._n_bead * self._temperature * TEMP_UNIT_CONVERSION / _pimd.HBAR
+                    P_target = self._pressure * PRESS_UNIT_CONVERSION
+                    def _pimd_npt_invariant(state, nbrs_nm):
+                        box = state.box
+                        V = jnp.prod(box) if box.ndim == 1 else jnp.linalg.det(box)
+                        KE_box = 0.5 * jnp.sum(state.box_momentum ** 2 / state.box_mass)
+                        # The implemented PIMD piston acts on the physical centroid
+                        # variables, so the conserved system enthalpy is the
+                        # bead-averaged ring-polymer Hamiltonian.
+                        H_rp = (jax_md.simulate.kinetic_energy(state)
+                                + self._n_bead * self._energy_fn(
+                                    state.position, box=box, nbrs_nm=nbrs_nm)
+                                + _pimd.spring_energy(
+                                    state.position, state.mass, box, omega_P))
+                        return ((H_rp - state.thermostat_work) / self._n_bead
+                                + KE_box + P_target * V
+                                - state.box_thermostat_work)
+                    self._reporters["Invariant"] = _pimd_npt_invariant
         if self._use_model_deviation:
             self._reporters["Model_Devi"] = lambda state, nbrs_nm: jnp.array([
                 -jax.grad(fn)(
