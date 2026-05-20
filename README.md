@@ -8,9 +8,9 @@ DeepMD-jax supports:
 - **Deep Wannier (DW)**: Predicting Wannier centers associated with atoms.
 - **DP Long Range (DPLR)**: Explicit long-range Coulomb interactions.
 - **Hybrid ab initio and empirical DP**: Empirical-observable training ([link to article](https://arxiv.org/abs/2511.14352)).
-- **Classical MD and PIMD**: Built-in `NVE`, `NVT`, `NVT_langevin`, and `NPT` simulation, including NVT/NPT path-integral MD.
+- **Classical MD and PIMD**: Built-in `NVE`, `NVT`, `NVT_langevin`, and `NPT` simulation, including NVT/NPT path-integral MD. Adapted from [jax-md](https://github.com/jax-md/jax-md)-based routines. Simulations can run on **multiple GPUs**.
 
-You can also try the [**DP-MP**](https://pubs.rsc.org/en/content/articlehtml/2024/cp/d4cp01483a) architecture for enhanced accuracy. Simulations can run on **multiple GPUs** using [jax-md](https://github.com/jax-md/jax-md)-based routines.
+You can also try the [**DP-MP**](https://pubs.rsc.org/en/content/articlehtml/2024/cp/d4cp01483a) architecture for enhanced accuracy.
 
 ## Installation
 ```
@@ -74,23 +74,18 @@ Routine choices:
 - `NVT_langevin`: BAOAB Langevin thermostat, with friction `1/tau_t`.
 - `NPT`: Nose-Hoover thermostat/barostat; set `pressure` in bar. `couple_axes` controls isotropic, semi-isotropic, or anisotropic orthorhombic box fluctuations.
 
-For PIMD, set `n_bead > 1` with `routine='NVT'` or `routine='NPT'`:
+For PIMD, use the same `Simulation(...)` setup and set `n_bead > 1` with `routine='NVT'` or `routine='NPT'`:
 
 ```python
 sim = Simulation(
-    model_path='model.pkl',
-    box=box,
-    type_idx=type_idx,
-    mass=[15.9994, 1.0078],
+    ...,
     routine='NVT',
-    dt=0.25,
-    initial_position=initial_position, # (n, 3) is replicated to beads
     temperature=300,
-    n_bead=16,                         # number of ring-polymer beads
+    n_bead=16,  # number of ring-polymer beads
 )
 ```
 
-PIMD `NVT` uses a PILE-L Langevin thermostat; PIMD `NPT` uses PILE-L plus a Langevin barostat. See [`md.py`](https://github.com/SparkyTruck/deepmd-jax/blob/main/deepmd_jax/md.py) for extra controls such as `tau_t`, `tau_p`, `neighbor_skin`, `fixed_indices`, and `couple_axes`.
+`initial_position` may be `(n, 3)` and replicated to all beads, or explicitly `(n_bead, n, 3)`. PIMD `NVT` uses a PILE-L Langevin thermostat; PIMD `NPT` uses PILE-L plus a Langevin barostat. See [`md.py`](https://github.com/SparkyTruck/deepmd-jax/blob/main/deepmd_jax/md.py) for extra controls such as `tau_t`, `tau_p`, `neighbor_skin`, `fixed_indices`, and `couple_axes`.
 
 ## More Features and Usages
 
@@ -199,28 +194,27 @@ The default units are Angstrom, eV, femtosecond, and their derived units. The on
 
 ### Printing Trajectories on the Fly
 
-Pass `dump_prefix` to stream XYZ files instead of keeping the trajectory in memory. The generated files are `{prefix}_position.xyz`, `{prefix}_velocity.xyz`, and, for PIMD, `{prefix}_centroid.xyz`. Each XYZ frame includes `step=<self.step>` in the metadata line. Existing files are overwritten by default; use `dump_mode='append'` to continue an existing trajectory.
+Pass `dump_prefix` to stream XYZ files instead of keeping the trajectory in memory. The generated files are `{prefix}_position.xyz`, `{prefix}_velocity.xyz`, and, for PIMD, `{prefix}_centroid.xyz`. Each XYZ frame includes `step=<self.step>` in the metadata line. Existing files are overwritten by default; use `dump_mode='append'` to continue an existing trajectory. When `dump_prefix` is set, sim.run() returns `None` instead of a trajectory dictionary.
 
 ```python
 # Writes traj_position.xyz and traj_velocity.xyz every 10 steps.
 sim.run(100000, dump_prefix="traj", dump_interval=10)
 
-# Dump a subset. Allowed entries are 'position', 'velocity', and 'centroid'.
-sim.run(100000, dump_prefix="traj_pos", dump_content=["position"], dump_interval=10)
+# Dump select content. Allowed entries are 'position', 'velocity', and 'centroid'.
+sim.run(100000, dump_prefix="traj", dump_content=["position"], dump_interval=10)
 
 # Continue appending frames to existing files.
 sim.run(100000, dump_prefix="traj", dump_interval=10, dump_mode="append")
 ```
 
-For XYZ output, pass `type_symbols=[...]` to `Simulation` unless the model was trained from extxyz and stores `chemical_types`.
+For XYZ output, pass `type_symbols=[...]` to `Simulation` unless the model was trained from extxyz (which already stores `chemical_types` in the model).
 
 ## Roadmap
 
 To-do list:
 - [ ] Model deviation API.
-- [ ] Non-orthorhombic neighbor list and broader NPT cell support.
-- [ ] Enhanced sampling and additional thermostats/barostats.
-- [ ] Misc: data/model utility cleanup, pair correlation function, training from a saved model, and training seed control.
+- [ ] Non-orthorhombic neighbor list.
+- [ ] Enhanced sampling.
 
 This project is in active development, and if you encounter any issues, please feel free to contact me or open an issue on the GitHub page. You are also welcome to make custom modifications and pull requests. Have fun! 🚀
 
