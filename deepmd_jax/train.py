@@ -520,6 +520,7 @@ def train(
     save_model(save_path, model, variables)
     print(f'# Training finished in {datetime.timedelta(seconds=int(time.time() - TIC))}.')
 
+
 def test(
     model_path: str,
     data_path: str,
@@ -645,10 +646,6 @@ def test(
     rmse = {}
     mae = {}
     l1_mixed = {}
-
-    for key in predictions.keys():
-        predictions[key] = np.concatenate(predictions[key], axis=0)
-        ground_truth[key] = np.concatenate(ground_truth[key], axis=0)
 
     if model.params['type'] in ('energy', 'dplr'):
         rmse['energy'] = (stats['energy']['sq'] / stats['energy']['count'])**0.5
