@@ -523,19 +523,16 @@ def train(
 
 def test(
     model_path: str,
-    data_path: str,
+    data_path: Union[str, List[str]],
     batch_size: int = 1,
 ):
     '''
-        Testing a trained model on a **single** dataset.
+        Testing a trained model on one or more datasets.
         Input arguments:
             model_path: path to the trained model.
-            data_path: path to the data for evaluation.
+            data_path: path, or list of paths, to the data for evaluation.
             batch_size: Increase for potentially faster evaluation, but requires more memory.
     '''
-    if type(data_path) == list:
-        raise ValueError('Data_path should be a single string path for now.')
-
     if jax.device_count() > 1:
         print('# Note: Currently only one device will be used for evaluation.')
 
@@ -561,7 +558,8 @@ def test(
                                       model.params['dplr_q_wc'],
                                       model.params['dplr_beta'],
                                       model.params['dplr_resolution'],
-                                      *model.params['dplr_wannier_model_and_variables'])
+                                      *model.params['dplr_wannier_model_and_variables'],
+                                      keep_long_range=True)
 
     if model.params['type'] in ('energy', 'dplr'):
         evaluate_fn = model.energy_and_force
@@ -573,8 +571,6 @@ def test(
             'energy_l1_sum': 0.0,
             'energy_l1_count': 0,
         }
-        predictions = {'energy': [], 'force': []}
-        ground_truth = {'energy': [], 'force': []}
     else:
         key = model.params['atomic_data_prefix']
         evaluate_fn = lambda variables, coord, box, static_args: model.apply(variables, coord, box, static_args)
@@ -583,8 +579,7 @@ def test(
             'l1_sum': 0.0,
             'l1_count': 0,
         }
-        predictions = {key: []}
-        ground_truth = {key: []}
+    test_results = []
 
     evaluate_fn = jax.jit(
         jax.vmap(evaluate_fn, in_axes=(None, 0, 0, None)),
@@ -606,11 +601,29 @@ def test(
                 E_pred, F_pred = pred
                 E_true = batch['energy']
                 F_true = batch['force']
+                E_lr = F_lr = None
+                if model.params['type'] == 'dplr':
+                    E_lr = batch['_dplr_long_range_energy']
+                    F_lr = batch['_dplr_long_range_force']
+                    E_pred = E_pred + E_lr
+                    F_pred = F_pred + F_lr
+                    E_true = E_true + E_lr
+                    F_true = F_true + F_lr
 
-                predictions['energy'].append(E_pred)
-                predictions['force'].append(F_pred)
-                ground_truth['energy'].append(E_true)
-                ground_truth['force'].append(F_true)
+                type_idx_arr = np.asarray(type_idx, dtype=int)
+                for i in range(E_pred.shape[0]):
+                    result = {
+                        'box': np.asarray(batch['box'][i]).copy(),
+                        'type_idx': type_idx_arr.copy(),
+                        'predicted_energy': float(np.asarray(E_pred[i])),
+                        'true_energy': float(np.asarray(E_true[i])),
+                        'predicted_force': np.asarray(F_pred[i]).copy(),
+                        'true_force': np.asarray(F_true[i]).copy(),
+                    }
+                    if model.params['type'] == 'dplr':
+                        result['long_range_energy'] = float(np.asarray(E_lr[i]))
+                        result['long_range_force'] = np.asarray(F_lr[i]).copy()
+                    test_results.append(result)
 
                 natoms = F_pred.shape[1]
                 dE = (E_pred - E_true) / natoms
@@ -632,8 +645,15 @@ def test(
                 pred_val = pred[0]
                 true_val = batch['atomic']
 
-                predictions[key].append(pred_val)
-                ground_truth[key].append(true_val)
+                type_idx_arr = np.asarray(type_idx, dtype=int)
+                for i in range(pred_val.shape[0]):
+                    test_results.append({
+                        'box': np.asarray(batch['box'][i]).copy(),
+                        'type_idx': type_idx_arr.copy(),
+                        'atomic_data_prefix': key,
+                        'predicted_atomic': np.asarray(pred_val[i]).copy(),
+                        'true_atomic': np.asarray(true_val[i]).copy(),
+                    })
 
                 diff = pred_val - true_val
                 stats[key]['sq'] += (diff**2).sum()
@@ -660,7 +680,12 @@ def test(
         mae[key] = stats[key]['abs'] / stats[key]['count']
         l1_mixed[key] = stats['l1_sum'] / stats['l1_count']
 
-    return rmse, mae, l1_mixed, predictions, ground_truth
+    error_metrics = {
+        'rmse': rmse,
+        'mae': mae,
+        'l1_mixed': l1_mixed,
+    }
+    return error_metrics, test_results
 
 def evaluate(
     model_path: str,
@@ -734,11 +759,23 @@ def evaluate(
             force_path = os.path.join(set_dir, "force.npy")
             np.save(energy_path, np.zeros(coord.shape[0]))
             np.save(force_path, np.zeros((coord.reshape(coord.shape[0], -1)).shape))
-        _, _, _, predictions, _ = test(model_path, temp_dir, batch_size)
+        _, test_results = test(model_path, temp_dir, batch_size)
 
-    return predictions
+    if model.params['type'] in ('energy', 'dplr'):
+        return {
+            'energy': np.asarray([
+                result['predicted_energy'] for result in test_results]),
+            'force': np.stack([
+                result['predicted_force'] for result in test_results], axis=0),
+        }
+    key = model.params['atomic_data_prefix']
+    return {
+        key: np.stack([
+            result['predicted_atomic'] for result in test_results], axis=0)
+    }
     
-def process_long_range_subset(subset, dplr_q_atoms, dplr_q_wc, dplr_beta, dplr_resolution, wc_model, wc_variables):
+def process_long_range_subset(subset, dplr_q_atoms, dplr_q_wc, dplr_beta, dplr_resolution,
+                              wc_model, wc_variables, keep_long_range=False):
     '''
         subtracting long range energy and force, keeping short range part only, for dplr models.
     '''
@@ -760,8 +797,19 @@ def process_long_range_subset(subset, dplr_q_atoms, dplr_q_wc, dplr_beta, dplr_r
         e, negf = jax.value_and_grad(lr_energy)(coord, box, Ngrid)
         return e, -negf
 
+    if keep_long_range:
+        lr_energy_frames = []
+        lr_force_frames = []
     for i in range(len(data['coord'])):
         Ngrid = get_p3mlr_grid_size(np.diag(data['box'][i]), dplr_beta, resolution=dplr_resolution)
         e_lr, f_lr = lr_energy_and_force(data['coord'][i], data['box'][i], Ngrid)
+        if keep_long_range:
+            lr_energy_frames.append(np.asarray(e_lr))
+            lr_force_frames.append(np.asarray(f_lr))
         data['energy'][i] -= e_lr
         data['force'][i] -= f_lr
+    if keep_long_range:
+        data['_dplr_long_range_energy'] = np.asarray(
+            lr_energy_frames, dtype=data['energy'].dtype).reshape(data['energy'].shape)
+        data['_dplr_long_range_force'] = np.asarray(
+            lr_force_frames, dtype=data['force'].dtype).reshape(data['force'].shape)

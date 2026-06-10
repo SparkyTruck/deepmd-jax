@@ -2,6 +2,8 @@
 
 Welcome to **DeepMD-jax v0.2**!
 
+DeepMD-jax provides a standalone Deep Potential series of neural-network potentials and molecular dynamics engine both implemented in JAX.
+
 ## Supported Features
 DeepMD-jax supports:
 - **Deep Potential (DP)**: Fast energy and force predictions.
@@ -12,7 +14,7 @@ DeepMD-jax supports:
 
 You can also try the [**DP-MP**](https://pubs.rsc.org/en/content/articlehtml/2024/cp/d4cp01483a) architecture for enhanced accuracy.
 
-DeepMD-jax provides a standalone neural-network potential and molecular dynamics engine both implemented in JAX, and is a separate package from [DeepMD-kit](https://github.com/deepmodeling/deepmd-kit).
+DeepMD-jax is a separate package from [DeepMD-kit](https://github.com/deepmodeling/deepmd-kit).
 
 ## Installation
 ```
@@ -96,7 +98,7 @@ sim = Simulation(
 Use `test()` to evaluate a model on a dataset:
 ```python
 from deepmd_jax.train import test
-root_mean_sq_err, mean_abs_error, l1_mixed_error, predictions, ground_truth = test(model_path, data_path)
+error_metrics, test_results = test(model_path, data_path)
 ```
 
 ### Evaluating a Model
@@ -106,6 +108,16 @@ Use `evaluate()` on a batch of configurations where no ground truth is needed:
 from deepmd_jax.train import evaluate
 predictions = evaluate(model_path, coords, boxes, type_idx)
 ```
+API: `test()` returns `(error_metrics, test_results)`; `evaluate()` returns concatenated arrays.
+
+### Loss Metrics
+
+Energy losses for training and testing are reported per atom. Force losses, and losses for other
+atom-wise predictions, are reported per Cartesian component. The default
+training loss is `l1-mixed`, which is an MAE over configurations and atoms, with
+an RMS reduction inside each force or atomic vector; this makes training less
+sensitive to outlier vector components. You can instead pass `loss="l2"` to
+train with the conventional mean-squared loss. Testing reports `l1_mixed`, `rmse` (l2), and `mae` (l1) in `error_metrics`.
 
 ### Atom-wise vector prediction (Deep Wannier/Polarizability)
 ```python
@@ -179,7 +191,7 @@ dyn = Langevin(atoms, timestep=0.5 * units.fs, temperature_K=300, friction=0.01)
 dyn.run(10)  # 10 MD steps
 ```
 
-The ASE calculator may run slower than the built-in `Simulation`, but you can take advantage of the rich ASE features, such as minimization routines, different thermostats, non-isotropic NPT simulations, etc.
+The ASE calculator may run slower than the built-in `Simulation`, but you can take advantage of the rich ASE features, such as minimization routines, enhanced sampling, non-orthorhombic NPT simulations, etc.
 
 ### Precision Settings
 
