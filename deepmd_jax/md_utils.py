@@ -3,6 +3,7 @@
 Split out of md.py so that the training path (which imports utils.py) does not
 pull in jax_md. Everything here is internal infrastructure for Simulation.
 """
+import glob
 import os
 from typing import Callable
 
@@ -10,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import jax_md
 import numpy as np
-from ase import Atoms, io
+from ase import Atoms
 from jax.sharding import PartitionSpec as PSpec
 
 from .utils import split, reorder_by_device, get_mask_by_device
@@ -31,26 +32,34 @@ def _normalize_dump_mode(dump_mode):
 def _normalize_dump_content(dump_content, n_bead):
     is_pimd = n_bead > 1
     if isinstance(dump_content, str):
-        if dump_content == 'all':
-            return _DUMP_KINDS if is_pimd else ('position', 'velocity')
         requested = (dump_content,)
     else:
         try:
             requested = tuple(dump_content)
         except TypeError as exc:
             raise ValueError(
-                "dump_content must be 'all', a dump kind string, or an iterable "
-                "of dump kind strings.") from exc
+                "dump_content must be 'all', 'positions', a dump kind string, "
+                "or an iterable of dump kind strings.") from exc
     if len(requested) == 0:
         raise ValueError("dump_content must not be empty when dump_prefix is set.")
     bad_types = [item for item in requested if not isinstance(item, str)]
     if bad_types:
         raise ValueError(
             "dump_content entries must be strings; got %r." % (bad_types,))
+    expanded = []
+    for item in requested:
+        if item == 'all':
+            expanded.extend(_DUMP_KINDS if is_pimd else ('position', 'velocity'))
+        elif item == 'positions':
+            expanded.extend(('position', 'centroid') if is_pimd else ('position',))
+        else:
+            expanded.append(item)
+    requested = tuple(expanded)
     unknown = sorted(set(requested) - set(_DUMP_KINDS))
     if unknown:
         raise ValueError(
-            "Unknown dump_content entries %s. Allowed entries are %s, or 'all'."
+            "Unknown dump_content entries %s. Allowed entries are %s, "
+            "'positions', or 'all'."
             % (unknown, list(_DUMP_KINDS)))
     if 'centroid' in requested and not is_pimd:
         raise ValueError(
@@ -61,7 +70,8 @@ def _normalize_dump_content(dump_content, n_bead):
 
 def _requested_dumps_from_prefix(dump_prefix, dump_content, n_bead):
     if dump_prefix is None:
-        if not (isinstance(dump_content, str) and dump_content == 'all'):
+        if not (isinstance(dump_content, str)
+                and dump_content in ('all', 'positions')):
             raise ValueError("dump_content requires dump_prefix to be set.")
         return {}
     prefix = os.fspath(dump_prefix)
@@ -69,6 +79,61 @@ def _requested_dumps_from_prefix(dump_prefix, dump_content, n_bead):
         raise ValueError("dump_prefix must be a non-empty path prefix.")
     content = _normalize_dump_content(dump_content, n_bead)
     return {kind: f"{prefix}_{kind}.xyz" for kind in content}
+
+
+def _bead_dump_path(path, bead):
+    root, ext = os.path.splitext(os.fspath(path))
+    return f"{root}_bead{bead}{ext}"
+
+
+def _remove_dump_target(path, bead_split=False):
+    path = os.fspath(path)
+    if os.path.exists(path):
+        os.remove(path)
+    if bead_split:
+        root, ext = os.path.splitext(path)
+        for bead_path in glob.glob(f"{root}_bead*{ext}"):
+            if os.path.exists(bead_path):
+                os.remove(bead_path)
+
+
+def _dump_float_formats(dtype):
+    dtype = np.dtype(dtype)
+    if dtype.kind == 'f' and dtype.itemsize <= 4:
+        return '.8f', '.8f'
+    return '.15f', '.15f'
+
+
+def _format_lattice(cell, fmt):
+    cell = np.asarray(cell)
+    if cell.shape == (3,):
+        cell = np.diag(cell)
+    values = np.reshape(cell.T, 9, order='F')
+    return ' '.join(format(float(x), fmt) for x in values)
+
+
+def _format_pbc(pbc):
+    return ' '.join('T' if flag else 'F' for flag in pbc)
+
+
+def _write_xyz_frame(path, atoms, data, cell, step=None):
+    coord_fmt, scalar_fmt = _dump_float_formats(data.dtype)
+    line_fmt = f'%-2s %{coord_fmt} %{coord_fmt} %{coord_fmt}\n'
+    symbols = atoms.get_chemical_symbols()
+    comment = []
+    if np.asarray(cell).any():
+        comment.append(f'Lattice="{_format_lattice(cell, scalar_fmt)}"')
+    comment.append('Properties=species:S:1:pos:R:3')
+    if step is not None:
+        comment.append(f'step={int(step)}')
+    comment.append(f'pbc="{_format_pbc(atoms.get_pbc())}"')
+
+    lines = [f'{len(symbols)}\n', ' '.join(comment) + '\n']
+    lines.extend(
+        line_fmt % (symbol, xyz[0], xyz[1], xyz[2])
+        for symbol, xyz in zip(symbols, data))
+    with open(path, 'a', encoding='utf-8') as handle:
+        handle.write(''.join(lines))
 
 
 def iso_pressure(energy_fn, position, box, n_atoms, kT, **kwargs):
@@ -114,39 +179,28 @@ def print_run_profile(steps, elapsed_time, natoms, dt):
           (nanosecond_per_day, steps_per_microsecond_per_atom))
 
 
-def prepare_dumps(requested, type_idx, type_symbols, n_bead, default_interval,
-                  dump_interval=None, dump_prefix=None, dump_content='all',
+def prepare_dumps(type_idx, type_symbols, n_bead, default_interval,
+                  dump_interval=None, dump_prefix=None, dump_content='positions',
                   dump_mode='overwrite'):
     '''Validate dump kwargs and build a list of (kind, path, ase.Atoms) entries.
 
-    requested: legacy ``{'position'|'velocity'|'centroid': path or None}``.
-    Preferred usage is ``dump_prefix='traj'`` and ``dump_content='all'`` or a
-    subset of ``('position', 'velocity', 'centroid')``. Generated files are
-    named ``{dump_prefix}_{kind}.xyz``.
+    Preferred usage is ``dump_prefix='traj'`` with the default
+    ``dump_content='positions'``. Use ``dump_content='all'`` or a subset of
+    ``('position', 'velocity', 'centroid')`` to include velocities. Generated
+    classical files are named ``{dump_prefix}_{kind}.xyz``. Under PIMD,
+    position and velocity are split into one file per bead.
 
     Returns ``([], None)`` if nothing was requested. Existing dump files are
     truncated by default; pass ``dump_mode='append'`` to keep appending frames.
     '''
-    requested = {k: v for k, v in requested.items() if v is not None}
-    if dump_prefix is not None:
-        if requested:
-            raise ValueError(
-                "Do not combine dump_prefix with dump_position, dump_velocity, "
-                "or dump_centroid.")
-        requested = _requested_dumps_from_prefix(dump_prefix, dump_content, n_bead)
-    elif requested:
-        if not (isinstance(dump_content, str) and dump_content == 'all'):
-            raise ValueError("dump_content is only used together with dump_prefix.")
-    else:
-        requested = _requested_dumps_from_prefix(None, dump_content, n_bead)
+    requested = _requested_dumps_from_prefix(dump_prefix, dump_content, n_bead)
     if not requested:
         return [], None
     dump_mode = _normalize_dump_mode(dump_mode)
     if type_symbols is None:
         raise ValueError(
-            "Simulation.run(dump_prefix=... or dump_*=...) requires "
-            "`type_symbols=[...]` at Simulation(...) construction so XYZ "
-            "output can label atoms.")
+            "Simulation.run(dump_prefix=...) requires `type_symbols=[...]` "
+            "at Simulation(...) construction so XYZ output can label atoms.")
     is_pimd = n_bead > 1
     if 'centroid' in requested and not is_pimd:
         raise ValueError("Centroid dumping is only meaningful when n_bead > 1.")
@@ -154,16 +208,23 @@ def prepare_dumps(requested, type_idx, type_symbols, n_bead, default_interval,
     if interval <= 0:
         raise ValueError(f"dump_interval must be positive; got {interval}")
     symbols_N = np.array(type_symbols, dtype=object)[type_idx]
-    symbols_PN = np.tile(symbols_N, n_bead) if is_pimd else symbols_N
     dumps = []
     for kind, path in requested.items():
-        # Per-bead position/velocity dumps flatten (P, N, 3) to (P*N, 3).
-        flatten = is_pimd and kind != 'centroid'
-        syms = symbols_PN if flatten else symbols_N
-        atoms = Atoms(symbols=list(syms), positions=np.zeros((len(syms), 3)), pbc=True)
-        if dump_mode == 'overwrite' and os.path.exists(path):
-            os.remove(path)
-        dumps.append((kind, path, atoms))
+        split_beads = is_pimd and kind != 'centroid'
+        if dump_mode == 'overwrite':
+            _remove_dump_target(path, bead_split=split_beads)
+        if split_beads:
+            for bead in range(n_bead):
+                bead_path = _bead_dump_path(path, bead)
+                atoms = Atoms(symbols=list(symbols_N),
+                              positions=np.zeros((len(symbols_N), 3)),
+                              pbc=True)
+                dumps.append((kind, bead_path, atoms, bead))
+        else:
+            atoms = Atoms(symbols=list(symbols_N),
+                          positions=np.zeros((len(symbols_N), 3)),
+                          pbc=True)
+            dumps.append((kind, path, atoms, None))
     return dumps, interval
 
 
@@ -177,9 +238,14 @@ def write_dump_frame(dumps, pos_frame, vel_frame, centroid_frame, box_frame, ste
     else:
         cell = np.array(box_frame)
     sources = {'position': pos_frame, 'velocity': vel_frame, 'centroid': centroid_frame}
-    for kind, path, atoms in dumps:
-        data = np.asarray(sources[kind])
-        if data.ndim == 3:
+    for kind, path, atoms, bead in dumps:
+        data = sources[kind]
+        if data is None:
+            raise ValueError(f"Missing {kind} frame for XYZ dump.")
+        data = np.asarray(data)
+        if bead is not None:
+            data = data[bead]
+        elif data.ndim == 3:
             data = data.reshape(-1, 3)
         atoms.set_positions(data)
         atoms.set_cell(cell)
@@ -187,7 +253,7 @@ def write_dump_frame(dumps, pos_frame, vel_frame, centroid_frame, box_frame, ste
             atoms.info.pop('step', None)
         else:
             atoms.info['step'] = int(step)
-        io.write(path, atoms, append=True)
+        _write_xyz_frame(path, atoms, data, np.asarray(atoms.cell.array), step=step)
 
 
 def stack_typed_nbrs_per_bead(typed_nbr_fn, real_pos_PN3, box, n_bead):

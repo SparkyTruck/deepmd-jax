@@ -87,7 +87,7 @@ sim = Simulation(
 )
 ```
 
-`initial_position` may be `(n, 3)` and replicated to all beads, or explicitly `(n_bead, n, 3)`. PIMD `NVT` uses a PILE-L Langevin thermostat; PIMD `NPT` uses PILE-L plus a Langevin barostat. See [`md.py`](https://github.com/SparkyTruck/deepmd-jax/blob/main/deepmd_jax/md.py) for extra controls such as `tau_t`, `tau_p`, `neighbor_skin`, `fixed_indices`, and `couple_axes`.
+`initial_position` may be `(n, 3)` and replicated to all beads, or explicitly `(n_bead, n, 3)`. PIMD `NVT` uses a PILE-L Langevin thermostat; PIMD `NPT` uses PILE-L plus a Langevin barostat. See [`md.py`](https://github.com/SparkyTruck/deepmd-jax/blob/main/deepmd_jax/md.py) for extra controls such as `tau_t`, `tau_p`, and `couple_axes`.
 
 ## More Features and Usages
 
@@ -196,16 +196,11 @@ The default units are Angstrom, eV, femtosecond, and their derived units. The on
 
 ### Printing Trajectories on the Fly
 
-Pass `dump_prefix` to stream XYZ files instead of keeping the trajectory in memory. The generated files are `{prefix}_position.xyz`, `{prefix}_velocity.xyz`, and, for PIMD, `{prefix}_centroid.xyz`. Each XYZ frame includes `step=<self.step>` in the metadata line. Existing files are overwritten by default; use `dump_mode='append'` to continue an existing trajectory. When `dump_prefix` is set, sim.run() returns `None` instead of a trajectory dictionary.
+Pass `dump_prefix` to stream XYZ files instead of keeping the trajectory in memory. When `dump_prefix` is set, sim.run() returns `None` instead of a trajectory dictionary. The default `dump_content="positions"` writes `{prefix}_position.xyz` for classical MD; for PIMD, positions are split by bead as `{prefix}_position_bead0.xyz` etc., and `{prefix}_centroid.xyz` is also written. Use `dump_content="all"` to also write velocities. Existing files are overwritten by default; use `dump_mode='append'` to continue an existing trajectory.
 
 ```python
-# Writes traj_position.xyz and traj_velocity.xyz every 10 steps.
-sim.run(100000, dump_prefix="traj", dump_interval=10)
-
-# Dump select content. Allowed entries are 'position', 'velocity', and 'centroid'.
-sim.run(100000, dump_prefix="traj", dump_content=["position"], dump_interval=10)
-
-# Continue appending frames to existing files.
+# Writes traj_position.xyz every 10 steps; existing files are overwritten;
+# under PIMD this writes traj_position_bead*.xyz and traj_centroid.xyz;
 sim.run(100000, dump_prefix="traj", dump_interval=10, dump_mode="append")
 ```
 

@@ -42,7 +42,7 @@ def _routine_run_label(routine, is_pimd):
 def _dump_target_label(dumps, dump_prefix):
     if dump_prefix is not None:
         return f'{dump_prefix}_*'
-    return ', '.join(path for _, path, _ in dumps)
+    return ', '.join(entry[1] for entry in dumps)
 
 
 class Simulation:
@@ -804,25 +804,25 @@ class Simulation:
         return multiple_inner_step
 
     def _initialize_run(self, steps,
-                        dump_position=None, dump_velocity=None,
-                        dump_centroid=None, dump_interval=None,
-                        dump_prefix=None, dump_content='all',
+                        dump_interval=None,
+                        dump_prefix=None, dump_content='positions',
                         dump_mode='overwrite'):
         '''
             Reset trajectory for each new run; if the simulation has not been
-            run before, include the initial state. When dump_prefix or any
-            legacy ``dump_*`` path is given, set up streaming to disk instead
-            of preallocating in-memory trajectory buffers, and write the
-            initial state to file.
+            run before, include the initial state. When dump_prefix is given,
+            set up streaming to disk instead of preallocating in-memory
+            trajectory buffers, and write the initial state to file.
         '''
         self._dumps, self._write_interval = prepare_dumps(
-            {'position': dump_position, 'velocity': dump_velocity,
-             'centroid': dump_centroid},
             self._type_idx, self._type_symbols, self._n_bead,
             default_interval=self.report_interval, dump_interval=dump_interval,
             dump_prefix=dump_prefix, dump_content=dump_content,
             dump_mode=dump_mode)
         self._has_dumps = len(self._dumps) > 0
+        self._dump_kinds = {entry[0] for entry in self._dumps}
+        self._writes_position = 'position' in self._dump_kinds
+        self._writes_velocity = 'velocity' in self._dump_kinds
+        self._writes_centroid = 'centroid' in self._dump_kinds
 
         run_message = f'# Running {steps} steps'
         if self._has_dumps:
@@ -861,8 +861,9 @@ class Simulation:
         else:
             if self._is_initial_state and (self.step % self._write_interval == 0):
                 write_dump_frame(self._dumps,
-                                 self.getPosition(), self.getVelocity(),
-                                 self.getCentroidPosition() if self._is_pimd else None,
+                                 self.getPosition() if self._writes_position else None,
+                                 self.getVelocity() if self._writes_velocity else None,
+                                 self.getCentroidPosition() if self._writes_centroid else None,
                                  self._current_box, step=self.step)
         self._tic_of_this_run = time()
         self._tic_between_report = time()
@@ -871,26 +872,20 @@ class Simulation:
         self._is_initial_state = False
 
     def run(self, steps,
-            dump_position: Optional[str] = None,
-            dump_velocity: Optional[str] = None,
-            dump_centroid: Optional[str] = None,
             dump_interval: Optional[int] = None,
             dump_prefix: Optional[str] = None,
-            dump_content='all',
+            dump_content='positions',
             dump_mode='overwrite'):
         '''
             Run for ``steps`` steps. Returns a trajectory dict, or ``None`` if
             trajectory frames stream to XYZ files. Preferred dump usage is
-            ``dump_prefix='traj'`` with ``dump_content='all'`` or a subset of
-            ``['position', 'velocity', 'centroid']``. Existing dump files are
-            overwritten unless ``dump_mode='append'`` is passed. The legacy
-            dump_position, dump_velocity, and dump_centroid kwargs still
-            accept exact paths.
+            ``dump_prefix='traj'`` with the default ``dump_content='positions'``.
+            Use ``dump_content='all'`` or a subset of
+            ``['position', 'velocity', 'centroid']`` to include velocities.
+            Existing dump files are overwritten unless ``dump_mode='append'``
+            is passed.
         '''
         self._initialize_run(steps,
-                             dump_position=dump_position,
-                             dump_velocity=dump_velocity,
-                             dump_centroid=dump_centroid,
                              dump_interval=dump_interval,
                              dump_prefix=dump_prefix,
                              dump_content=dump_content,
@@ -935,9 +930,9 @@ class Simulation:
                     if frame_step % self._write_interval == 0:
                         write_dump_frame(
                             self._dumps,
-                            np.asarray(pos_traj[i]),
-                            np.asarray(vel_traj[i]),
-                            np.asarray(centroid_traj[i]) if self._is_pimd else None,
+                            np.asarray(pos_traj[i]) if self._writes_position else None,
+                            np.asarray(vel_traj[i]) if self._writes_velocity else None,
+                            np.asarray(centroid_traj[i]) if self._writes_centroid else None,
                             np.asarray(box_traj[i]),
                             step=frame_step,
                         )
@@ -969,7 +964,7 @@ class Simulation:
         return trajectory
 
     def _print_run_profile(self, steps, elapsed_time):
-        print_run_profile(steps, elapsed_time, self._state.position.shape[0], self._dt)
+        print_run_profile(steps, elapsed_time, self._natoms * self._n_bead, self._dt)
 
     def getPosition(self):
         '''
