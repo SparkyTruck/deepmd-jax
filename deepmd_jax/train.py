@@ -690,10 +690,13 @@ def test(
         for result in test_results:
             del result['_source_index']
 
+    def _metric_dict_to_float(metric):
+        return {key: float(np.asarray(value).item()) for key, value in metric.items()}
+
     error_metrics = {
-        'rmse': rmse,
-        'mae': mae,
-        'l1_mixed': l1_mixed,
+        'rmse': _metric_dict_to_float(rmse),
+        'mae': _metric_dict_to_float(mae),
+        'l1_mixed': _metric_dict_to_float(l1_mixed),
     }
     return error_metrics, test_results
 
