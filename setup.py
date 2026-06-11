@@ -5,7 +5,7 @@ from setuptools.command.install import install
 
 setup(
     name='deepmd_jax',
-    version='0.2',
+    version='0.2.1',
     packages=find_packages(),
     install_requires=[
         'jax[cuda12]>=0.7.1',

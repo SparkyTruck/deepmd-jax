@@ -172,3 +172,10 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Project-local generated artifacts
+water_pimd_rdf/
+debug_issue*/
+tests/
+*.pkl
+test*

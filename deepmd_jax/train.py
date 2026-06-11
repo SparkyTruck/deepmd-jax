@@ -147,8 +147,6 @@ def train(
             if embed_widths[-1] != fit_widths[-1]:
                 raise ValueError('For atomic models, embed_widths[-1] must equal fit_widths[-1].')
     assert loss in ('l1-mixed', 'l2'), 'loss must be "l1-mixed" or "l2"'
-    print(f'# Using {loss} loss function.')
-
     # load dataset
     if 'atomic' in model_type and atomic_data_prefix is None:
         atomic_data_prefix = 'atomic_dipole' if model_type == 'atomic' else 'atomic_polarizability'
@@ -345,12 +343,13 @@ def train(
     optimizer = optax.adam(learning_rate = lr_scheduler,
                            b2 = beta2)
     opt_state = optimizer.init(variables)
-    print('# Optimizer initialized with initial lr = %.1e. Starting training...' % lr)
 
     # define training step
     loss_fn, loss_and_grad_fn = model.get_loss_fn(order=loss)
+    print(f'# Using {loss} loss function.')
     if hybrid:
         loss_obs, loss_and_grad_obs = model.get_observable_loss_fn()
+    print('# Optimizer initialized with initial lr = %.1e. Starting training...' % lr)
 
     if 'atomic' not in model_type:
         state = {'loss_avg': 0., 'le_avg': 0., 'lf_avg': 0., 'iteration': 0}

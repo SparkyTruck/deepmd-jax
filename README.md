@@ -1,20 +1,26 @@
 # DeepMD-jax
 
-Welcome to **DeepMD-jax v0.2**!
+Welcome to **DeepMD-jax v0.2.1**!
 
-DeepMD-jax provides a standalone Deep Potential series of neural-network potentials and molecular dynamics engine both implemented in JAX.
+<p align="center">
+  <b>Fast, hackable neural-network force fields and molecular dynamics in JAX.</b>
+</p>
+
+> 🧪 **Lean and research-hackable.** All Python. Both the *neural networks* and the *MD engine*. Customize your own routines.
+>
+> ⚡ **Blistering throughput.** A default DeepMD-jax-implemented [Deep Potential](https://doi.org/10.1103/PhysRevLett.120.143001) model benchmarks at **1.1 million MD steps/day** for a **100k-atom** liquid-water system on a single **RTX 4090 GPU** — all without giving up source-level control.
+
+DeepMD-jax is separate from [DeepMD-kit](https://github.com/deepmodeling/deepmd-kit).
 
 ## Supported Features
-DeepMD-jax supports:
-- **Deep Potential (DP)**: Fast energy and force predictions.
-- **Deep Wannier (DW)**: Predicting Wannier centers associated with atoms.
-- **DP Long Range (DPLR)**: Explicit long-range Coulomb interactions.
-- **Hybrid ab initio and empirical DP**: Empirical-observable training ([link to article](https://arxiv.org/abs/2511.14352)).
-- **Classical MD and PIMD**: Built-in `NVE`, `NVT`, `NVT_langevin`, and `NPT` simulation, including NVT/NPT path-integral MD. Adapted from [jax-md](https://github.com/jax-md/jax-md)-based routines. Simulations can run on **multiple GPUs**.
 
-You can also try the [**DP-MP**](https://pubs.rsc.org/en/content/articlehtml/2024/cp/d4cp01483a) architecture for enhanced accuracy.
-
-DeepMD-jax is a separate package from [DeepMD-kit](https://github.com/deepmodeling/deepmd-kit).
+- **Deep Potential (DP)**: Fast energy and force predictions for molecular dynamics and materials simulation.
+- **Enhanced Accuracy** — optional [DP-MP](https://pubs.rsc.org/en/content/articlehtml/2024/cp/d4cp01483a) message-passing architecture for enhanced accuracy.
+- **Atom-wise vector/tensor** prediction — [Deep Wannier](https://doi.org/10.1103/PhysRevB.102.041121)-style models for atom-wise observables such as dipoles/Wannier centers and polarizability tensors.
+- **Long-range electrostatics** — [DPLR](https://doi.org/10.1063/5.0083669)-style explicit long-range Coulomb interactions for systems where short-range models are not enough.
+- **Hybrid ab initio + empirical training** — Empirical-observable training ([article](https://arxiv.org/abs/2511.14352)).
+- Built-in **MD and PIMD** engine — end-to-end `NVE`, `NVT`, `NVT_langevin`, and `NPT` workflows, including NVT/NPT path-integral MD, implemented in JAX with inspiration from [jax-md](https://github.com/jax-md/jax-md).
+- **Multi-GPU** simulation support — automatic multi-GPU MD, no manual configuration.
 
 ## Installation
 ```
@@ -25,7 +31,7 @@ pip install -e .
 
 ## Hardware Requirements
 
-It is recommended to have one GPU for training and one or more GPUs for simulation. The RTX 4090/5090 is recommended based on cost-effectiveness for most fp32 jobs.
+It is recommended to have one GPU for training and one or more GPUs for simulation. For common `float32` jobs, the RTX 4090/5090 is most cost-effective.
 
 ## Quick Start
 
@@ -50,7 +56,7 @@ The default values for the other arguments in [`train()`](https://github.com/Spa
 
 ### Step 3: Perform a Simulation
 
-Prepare numpy arrays for `initial_position` `(n, 3)`, `box` `()`, `(1,)`, `(3,)`, or `(3, 3)`, and `type_idx` `(n,)`. For DeepMD-format models, `type_idx` uses type indices matching `type.raw`; for extxyz-trained models, it can use atomic numbers. `mass` is per model type, following stored `chemical_types` order for extxyz models.
+Prepare numpy arrays for `initial_position` `(n, 3)`, `box` `()`, `(1,)`, `(3,)`, or `(3, 3)`, and `type_idx` `(n,)`. `mass` gives one mass per atom type.
 
 ```python
 from deepmd_jax.md import Simulation
@@ -59,7 +65,7 @@ sim = Simulation(
     model_path='model.pkl',
     box=box,
     type_idx=type_idx,
-    mass=[15.9994, 1.0078],
+    mass=[15.9994, 1.0078],            # ordered by type.raw if type 0=O,1=H; extxyz chemical_types=(1,8) would use [1.0078,15.9994]
     routine='NVT',                     # 'NVE', 'NVT', 'NVT_langevin', or 'NPT'
     dt=0.5,                            # femtoseconds
     initial_position=initial_position, # Angstroms
@@ -78,13 +84,11 @@ Routine choices:
 - `NVT_langevin`: BAOAB Langevin thermostat, with friction `1/tau_t`.
 - `NPT`: Nose-Hoover thermostat/barostat; set `pressure` in bar. `couple_axes` controls isotropic, semi-isotropic, or anisotropic orthorhombic box fluctuations.
 
-For PIMD, use the same `Simulation(...)` setup and set `n_bead > 1` with `routine='NVT'` or `routine='NPT'`:
+For PIMD, use the same setup and set `n_bead > 1` with `routine='NVT'` or `routine='NPT'`:
 
 ```python
 sim = Simulation(
     ...,
-    routine='NVT',
-    temperature=300,
     n_bead=16,  # number of ring-polymer beads
 )
 ```
@@ -221,7 +225,7 @@ For XYZ output, pass `type_symbols=[...]` to `Simulation` unless the model was t
 
 To-do list:
 - [ ] Model deviation API.
-- [ ] Non-orthorhombic neighbor list.
+- [ ] Transfer learning API.
 - [ ] Enhanced sampling.
 
 This project is in active development, and if you encounter any issues, please feel free to contact me or open an issue on the GitHub page. You are also welcome to make custom modifications and pull requests. Have fun! 🚀
