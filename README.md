@@ -95,20 +95,19 @@ sim = Simulation(
 
 ### Testing a Model
 
-Use `test()` to evaluate a model on a dataset:
+Use `test()` to evaluate a model on one or more datasets:
 ```python
 from deepmd_jax.train import test
-error_metrics, test_results = test(model_path, data_path)
+error_metrics, test_results = test(model_path, data_paths)
 ```
-
+`test_results` contains a list of configs containing the predicted and true values for each configuration.
 ### Evaluating a Model
 
-Use `evaluate()` on a batch of configurations where no ground truth is needed:
+Use `evaluate()` on a batch of configurations with the same `type_idx`, where no ground truth is needed:
 ```python
 from deepmd_jax.train import evaluate
 predictions = evaluate(model_path, coords, boxes, type_idx)
 ```
-API: `test()` returns `(error_metrics, test_results)`; `evaluate()` returns concatenated arrays.
 
 ### Loss Metrics
 

@@ -596,6 +596,7 @@ def test(
 
             static_args = nn.FrozenDict({'type_idx': type_idx, 'lattice': lattice_args})
             pred = evaluate_fn(variables, batch['coord'], batch['box'], static_args)
+            source_index = batch.get('_source_index')
 
             if model.params['type'] in ('energy', 'dplr'):
                 E_pred, F_pred = pred
@@ -623,6 +624,8 @@ def test(
                     if model.params['type'] == 'dplr':
                         result['long_range_energy'] = float(np.asarray(E_lr[i]))
                         result['long_range_force'] = np.asarray(F_lr[i]).copy()
+                    if source_index is not None:
+                        result['_source_index'] = int(np.asarray(source_index[i]))
                     test_results.append(result)
 
                 natoms = F_pred.shape[1]
@@ -647,13 +650,16 @@ def test(
 
                 type_idx_arr = np.asarray(type_idx, dtype=int)
                 for i in range(pred_val.shape[0]):
-                    test_results.append({
+                    result = {
                         'box': np.asarray(batch['box'][i]).copy(),
                         'type_idx': type_idx_arr.copy(),
                         'atomic_data_prefix': key,
                         'predicted_atomic': np.asarray(pred_val[i]).copy(),
                         'true_atomic': np.asarray(true_val[i]).copy(),
-                    })
+                    }
+                    if source_index is not None:
+                        result['_source_index'] = int(np.asarray(source_index[i]))
+                    test_results.append(result)
 
                 diff = pred_val - true_val
                 stats[key]['sq'] += (diff**2).sum()
@@ -679,6 +685,11 @@ def test(
         rmse[key] = (stats[key]['sq'] / stats[key]['count'])**0.5
         mae[key] = stats[key]['abs'] / stats[key]['count']
         l1_mixed[key] = stats['l1_sum'] / stats['l1_count']
+
+    if test_results and '_source_index' in test_results[0]:
+        test_results.sort(key=lambda result: result['_source_index'])
+        for result in test_results:
+            del result['_source_index']
 
     error_metrics = {
         'rmse': rmse,

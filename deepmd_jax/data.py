@@ -292,7 +292,7 @@ class ExtXYZDataset(DatasetGroup):
             for atoms in atoms_list:
                 zs = np.asarray(atoms.get_atomic_numbers(), dtype=int)
                 all_zs.update(zs.tolist())
-                entry = {'_zs': zs}
+                entry = {'_zs': zs, '_source_index': len(raw_frames)}
                 for l in labels:
                     if l == 'box':
                         entry['box'] = np.asarray(atoms.get_cell().array, dtype=np.float32)
@@ -335,6 +335,7 @@ class ExtXYZDataset(DatasetGroup):
         for grp in groups.values():
             frames = grp['frames']
             data = {l: np.stack([f[l] for f in frames]) for l in labels}
+            data['_source_index'] = np.asarray([f['_source_index'] for f in frames], dtype=np.int64)
             subsets.append(DatasetLeaf(labels, params or {}, grp['type'], data))
 
         super().__init__(subsets, chemical_types=chemical_types)
