@@ -8,7 +8,7 @@ Welcome to **DeepMD-jax v0.2.1**!
 
 > 🧪 **Lean and research-hackable.** All Python. Both the *neural networks* and the *MD engine*. Customize your own routines.
 >
-> ⚡ **Blistering throughput.** A default DeepMD-jax-implemented [Deep Potential](https://doi.org/10.1103/PhysRevLett.120.143001) model benchmarks at **1.1 million MD steps/day** for a **100k-atom** liquid-water system on a single **RTX 4090 GPU** — all without giving up source-level control.
+> ⚡ **Blistering throughput.** A default DeepMD-jax-implemented [Deep Potential](https://doi.org/10.1103/PhysRevLett.120.143001) model benchmarks at **2.2 million MD steps/day** for a **100k-atom** liquid-water system on a single **RTX 4090 GPU** — all without giving up source-level control.
 
 DeepMD-jax is separate from [DeepMD-kit](https://github.com/deepmodeling/deepmd-kit).
 
