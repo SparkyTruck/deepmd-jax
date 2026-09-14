@@ -3,6 +3,7 @@ import jax
 from jax import lax, vmap, jacfwd
 import numpy as np
 import flax.linen as nn
+import hashlib
 import pickle, os
 from scipy.interpolate import PPoly, BPoly
 from jax.sharding import PartitionSpec as PSpec
@@ -224,12 +225,55 @@ def get_p3mlr_fn(box3_ref, beta, M=None, resolution=5): # PPPM long range with T
         return E
     return p3mlr_fn
 
+def _atomic_write_bytes(path, payload):
+    path = os.fspath(path)
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    tmp = os.path.join(parent, '.%s.tmp.%d' % (os.path.basename(path), os.getpid()))
+    try:
+        with open(tmp, 'wb') as file:
+            file.write(payload)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _write_sha256_sidecar(path, digest):
+    sidecar = os.fspath(path) + '.sha256'
+    line = '%s  %s\n' % (digest, os.path.basename(os.fspath(path)))
+    _atomic_write_bytes(sidecar, line.encode('ascii'))
+
+
+def _verify_sha256_sidecar(path, required=False):
+    path = os.fspath(path)
+    sidecar = path + '.sha256'
+    if not os.path.isfile(sidecar):
+        if required:
+            raise ValueError("Missing SHA256 sidecar for '%s'." % path)
+        return None
+    with open(sidecar, encoding='ascii') as file:
+        fields = file.read().strip().split()
+    if len(fields) < 1 or len(fields[0]) != 64:
+        raise ValueError("Malformed SHA256 sidecar for '%s'." % path)
+    with open(path, 'rb') as file:
+        actual = hashlib.sha256(file.read()).hexdigest()
+    if actual != fields[0]:
+        raise ValueError("SHA256 mismatch for '%s'." % path)
+    return actual
+
+
 def save_model(path, model, variables):
-    with open(path, 'wb') as file:
-        pickle.dump({'model':model, 'variables':variables}, file)
+    payload = pickle.dumps({'model':model, 'variables':jax.device_get(variables)},
+                           protocol=pickle.HIGHEST_PROTOCOL)
+    _atomic_write_bytes(path, payload)
+    _write_sha256_sidecar(path, hashlib.sha256(payload).hexdigest())
     print('# Model saved to \'%s\'.' % path)
 
 def load_model(path, replicate=True):
+    _verify_sha256_sidecar(path, required=False)
     with open(path, 'rb') as file:
         m = pickle.load(file)
     print('# Model loaded from \'%s\'.' % path)
