@@ -406,11 +406,16 @@ class Simulation:
             E = model.apply(variables, coord, box, self._static_args, nbrs_nm)[0]
             if model.params['type'] == 'dplr':
                 wc = wc_model.wc_predict(wc_variables, coord, box, self._static_args, nbrs_nm)
-                E = E + p3mlr_fn(
-                    jnp.concatenate([coord, wc]),
-                    jnp.concatenate([qatoms, qwc]),
-                    jnp.diag(box),
-                )
+                pos, q = jnp.concatenate([coord, wc]), jnp.concatenate([qatoms, qwc])
+                if jax.device_count() > 1:
+                    # each device spreads its share of the charges and the partial grids are
+                    # summed, so every device holds the same grid; zero charges pad the split
+                    pad = -q.shape[0] % jax.device_count()
+                    pos = jnp.concatenate([pos, jnp.zeros((pad, 3), pos.dtype)])
+                    q = jnp.concatenate([q, jnp.zeros((pad,), q.dtype)])
+                    pos = jax.lax.with_sharding_constraint(pos, PSpec('atom', None))
+                    q = jax.lax.with_sharding_constraint(q, PSpec('atom'))
+                E = E + p3mlr_fn(pos, q, jnp.diag(box))
             return E
 
         def energy_fn(coord, nbrs_nm, perturbation=1., **kwargs):
