@@ -179,3 +179,5 @@ debug_issue*/
 tests/
 *.pkl
 test*
+!tests/
+!tests/*.py

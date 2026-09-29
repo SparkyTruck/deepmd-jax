@@ -21,7 +21,7 @@ def _flatten_paths(paths):
             yield p
 
 
-def Dataset(paths, labels, params=None, chemical_types=None):
+def Dataset(paths, labels, params=None, chemical_types=None, rng=None):
     """
     Create a dataset object from file paths.
 
@@ -54,21 +54,24 @@ def Dataset(paths, labels, params=None, chemical_types=None):
     Constraints:
     - Mixing DP directories and extxyz files in the same paths list is not supported.
     """
+    rng = np.random.default_rng() if rng is None else rng
     flat_paths = [paths] if isinstance(paths, str) else list(_flatten_paths(paths))
     if len(flat_paths) == 1:
         path = flat_paths[0]
         if _classify_path(path) == 'extxyz':
-            return ExtXYZDataset([path], labels, params, chemical_types)
-        return DPDataset(path, labels, params, chemical_types)
+            return ExtXYZDataset([path], labels, params, chemical_types, rng=rng)
+        return DPDataset(path, labels, params, chemical_types, rng=rng)
 
     formats = {_classify_path(p) for p in flat_paths}
     if len(formats) > 1:
         raise ValueError('Mixing DP and extxyz paths is not supported: %s' % (paths,))
 
     if formats == {'extxyz'}:
-        return ExtXYZDataset(flat_paths, labels, params, chemical_types)
-    leaves = [DPDataset(p, labels, params, chemical_types) for p in flat_paths]
-    return DatasetGroup(leaves, chemical_types)
+        return ExtXYZDataset(flat_paths, labels, params, chemical_types, rng=rng)
+    leaves = [DPDataset(p, labels, params, chemical_types,
+                        rng=np.random.default_rng(rng.integers(0, 2**63)))
+              for p in flat_paths]
+    return DatasetGroup(leaves, chemical_types, rng=rng)
 
 
 class DatasetLeaf:
@@ -78,13 +81,15 @@ class DatasetLeaf:
     Data is stored in the input atom order. The model receives ``type_idx`` and
     handles type sorting internally.
     """
-    def __init__(self, labels, params, type_arr, data, paths=None):
+    def __init__(self, labels, params, type_arr, data, paths=None, rng=None):
         self.chemical_types = getattr(self, 'chemical_types', None)
         self.type_idx = np.array(type_arr, dtype=int)
         self.type = self.type_idx
         self.data = data
         self.natoms = len(self.type_idx)
         self.nframes = len(self.data['coord'])
+        self.rng = np.random.default_rng() if rng is None else rng
+        self.order = np.arange(self.nframes, dtype=np.int64)
         for l in labels:
             assert self.data[l].shape[0] == self.nframes, \
                 f"{l}.npy has {self.data[l].shape[0]} frames, expected {self.nframes}"
@@ -161,15 +166,34 @@ class DatasetLeaf:
             batch_size = int(batch_size / self.nlabels + 1)
         if self.pointer + batch_size > self.nframes:
             self.pointer = 0
-            perm = np.random.permutation(self.nframes)
-            self.data = {l: self.data[l][perm] for l in self.data}
+            self.order = self.rng.permutation(self.nframes)
+        indices = self.order[self.pointer:min(self.pointer + batch_size, self.nframes)]
         batch = {
             'atomic' if 'atomic' in l else l:
-            self.data[l][self.pointer:min(self.pointer + batch_size, self.nframes)]
+            self.data[l][indices]
             for l in self.data
         }
-        self.pointer += batch_size
+        self.pointer += len(indices)
         return batch, tuple(self.type_idx), self.lattice_args
+
+    def get_sampler_state(self):
+        return {
+            'pointer': int(self.pointer),
+            'order': self.order.copy(),
+            'rng_state': self.rng.bit_generator.state,
+        }
+
+    def set_sampler_state(self, state):
+        order = np.asarray(state['order'], dtype=np.int64)
+        if order.shape != (self.nframes,) or not np.array_equal(np.sort(order),
+                                                                 np.arange(self.nframes)):
+            raise ValueError('Invalid dataset sampler order in checkpoint.')
+        pointer = int(state['pointer'])
+        if pointer < 0 or pointer > self.nframes:
+            raise ValueError('Invalid dataset sampler pointer in checkpoint.')
+        self.order = order.copy()
+        self.pointer = pointer
+        self.rng.bit_generator.state = state['rng_state']
 
     def compute_lattice_candidate(self, rcut, use_neighbor_list_when_possible=True, mp=False):
         self.lattice_args = compute_lattice_candidate(self.data['box'], rcut)
@@ -228,14 +252,14 @@ class DPDataset(DatasetLeaf):
     Loads data from DP training directories containing type.raw and set.*/ subdirs
     with .npy files. Concatenates data across all sets in the directory.
     """
-    def __init__(self, path, labels, params=None, chemical_types=None):
+    def __init__(self, path, labels, params=None, chemical_types=None, rng=None):
         self.chemical_types = tuple(chemical_types) if chemical_types else None
         type_arr = np.genfromtxt(path + '/type.raw').astype(int)
         data = {
             l: np.concatenate([np.load(s + l + '.npy') for s in sorted(glob(path + '/set.*/'))])
             for l in labels
         }
-        super().__init__(labels, params or {}, type_arr, data, paths=[path])
+        super().__init__(labels, params or {}, type_arr, data, paths=[path], rng=rng)
 
 
 def get_atomic_scalar_stats(dataset, atomic_sel):
@@ -260,8 +284,9 @@ class DatasetGroup:
     subsets is weighted by subset size, stored in self.prob, so larger subsets are
     selected more often during batch generation.
     """
-    def __init__(self, subsets, chemical_types=None):
+    def __init__(self, subsets, chemical_types=None, rng=None):
         self.subsets = subsets
+        self.rng = np.random.default_rng() if rng is None else rng
         self.chemical_types = tuple(chemical_types) if chemical_types else None
         self.nframes = sum([subset.nframes for subset in self.subsets])
         self.ntypes = max([subset.ntypes for subset in self.subsets])
@@ -300,8 +325,21 @@ class DatasetGroup:
         return self.params
 
     def get_batch(self, batch_size, type='frame'):
-        subset = np.random.choice(len(self.subsets), p=self.prob)
+        subset = self.rng.choice(len(self.subsets), p=self.prob)
         return self.subsets[subset].get_batch(batch_size, type)
+
+    def get_sampler_state(self):
+        return {
+            'rng_state': self.rng.bit_generator.state,
+            'subsets': [subset.get_sampler_state() for subset in self.subsets],
+        }
+
+    def set_sampler_state(self, state):
+        if len(state['subsets']) != len(self.subsets):
+            raise ValueError('Dataset subset count does not match checkpoint.')
+        self.rng.bit_generator.state = state['rng_state']
+        for subset, subset_state in zip(self.subsets, state['subsets']):
+            subset.set_sampler_state(subset_state)
 
     def compute_lattice_candidate(self, rcut, use_neighbor_list_when_possible=True, mp=False):
         for subset in self.subsets:
@@ -333,7 +371,8 @@ class ExtXYZDataset(DatasetGroup):
     Parses frames using ASE and groups them by composition before constructing
     internal DatasetLeaf subsets. Each composition group becomes one leaf.
     """
-    def __init__(self, paths, labels, params=None, chemical_types=None):
+    def __init__(self, paths, labels, params=None, chemical_types=None, rng=None):
+        rng = np.random.default_rng() if rng is None else rng
         raw_frames = []
         all_zs = set()
         for path in paths:
@@ -387,9 +426,11 @@ class ExtXYZDataset(DatasetGroup):
             frames = grp['frames']
             data = {l: np.stack([f[l] for f in frames]) for l in labels}
             data['_source_index'] = np.asarray([f['_source_index'] for f in frames], dtype=np.int64)
-            subsets.append(DatasetLeaf(labels, params or {}, grp['type'], data))
+            subsets.append(DatasetLeaf(
+                labels, params or {}, grp['type'], data,
+                rng=np.random.default_rng(rng.integers(0, 2**63))))
 
-        super().__init__(subsets, chemical_types=chemical_types)
+        super().__init__(subsets, chemical_types=chemical_types, rng=rng)
         print('# Dataset loaded (extxyz): %d frames in %d composition group(s). Path:'
               % (len(raw_frames), len(subsets)),
               ''.join(['\n# \t\'%s\'' % abspath(p) for p in paths]))

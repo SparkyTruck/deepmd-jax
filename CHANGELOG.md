@@ -1,5 +1,19 @@
 # Changelog
 
+## Local reliability branch (2026-09-01)
+
+### Added
+- Atomic, SHA256-bound model and training-state writes.
+- Exact segmented checkpoint/resume for model, optimizer, learning-rate step,
+  training/validation samplers, NumPy generators, and JSON history.
+- Deterministic dataset sampling controlled by the public training seed.
+- Fail-closed checkpoint checksum and training-contract validation.
+- Regression tests for uninterrupted/resumed identity, corruption rejection,
+  contract rejection, and DP-MP train/save/reload/test operation.
+
+### Changed
+- `step` now means exactly that many optimizer updates rather than `step + 1`.
+
 ## 0.2.1
 
 ### Added

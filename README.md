@@ -54,6 +54,38 @@ train(
 
 The default values for the other arguments in [`train()`](https://github.com/SparkyTruck/deepmd-jax/blob/main/deepmd_jax/train.py) like learning rate, batch size, model width, etc. are usually a solid baseline. The one parameter you may want to change is `mp=True` to enable DP-MP for better accuracy.
 
+### Reliable segmented training in this local branch
+
+`step` is the exact total optimizer-update target. A run can checkpoint and
+stop after a bounded number of updates, then resume without changing its
+optimizer, learning-rate, RNG, validation sampler, or training sampler state:
+
+```python
+common = dict(
+    model_type='energy',
+    rcut=6.0,
+    train_data_path=train_paths,
+    val_data_path=validation_paths,
+    save_path='dpmp.pkl',
+    step=500_000,
+    seed=20260901,
+    mp=True,
+    checkpoint_path='dpmp.train.pkl',
+    checkpoint_every=1_000,
+    max_updates_per_run=20_000,
+)
+
+status = train(**common)
+while not status['completed']:
+    status = train(**common, resume=True)
+```
+
+Checkpoints and final models are written atomically with adjacent SHA256
+sidecars. A checkpoint records complete model/optimizer state, the exact
+learning-rate update, all dataset pointers and permutations, and dataset RNG
+states. Resume fails closed on a checksum error or changed training contract.
+The atomic JSON history defaults to `save_path + '.history.json'`.
+
 ### Step 3: Perform a Simulation
 
 Prepare numpy arrays for `initial_position` `(n, 3)`, `box` `()`, `(1,)`, `(3,)`, or `(3, 3)`, and `type_idx` `(n,)`. `mass` gives one mass per atom type.
