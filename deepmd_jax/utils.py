@@ -215,8 +215,9 @@ def get_p3mlr_fn(box3_ref, beta, M=None, resolution=5): # PPPM long range with T
                             0.75 - r_3N**2,
                             (r_3N+0.5)**2/2]) # TSC assignment
         fr_27N = (fr_33N[:,None,None,0,:]*fr_33N[:,None,1,:]*fr_33N[:,2,:]).reshape(27,-1)
-        all_idx = (center_idx_3N[:,None] + cube_idx[:,:,None]).reshape(3,-1) % M3[:,None]
-        grid = grid.at[tuple(all_idx)].add((q_N*fr_27N).reshape(-1))
+        # flatten charge-major so a device-partitioned charge axis stays contiguous
+        all_idx = ((center_idx_3N[:,:,None] + cube_idx[:,None,:]) % M3[:,None,None]).reshape(3,-1)
+        grid = grid.at[tuple(all_idx)].add((q_N[:,None]*fr_27N.T).reshape(-1))
 
         skfactor = jnp.fft.fftn(grid)
         # the following step may cause a bit speed loss under multi-gpu, but I haven't figured out why
