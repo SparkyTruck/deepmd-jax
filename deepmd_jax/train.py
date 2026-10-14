@@ -334,7 +334,7 @@ def train(
     static_args = _get_static_args(type_idx, lattice_args)
     if seed is None:
         seed = np.random.randint(65536)
-    variables = model.init(
+    variables = jax.jit(model.init, static_argnums=3)(
                     jax.random.PRNGKey(seed),
                     batch['coord'][0],
                     batch['box'][0],

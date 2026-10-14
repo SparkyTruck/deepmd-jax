@@ -396,7 +396,7 @@ def npt_langevin_pimd(
         vel_c = vel.mean(axis=0)
         dR_c = (R_c * (jnp.exp(x) - 1)
                 + dt_step * vel_c * jnp.exp(x_2) * sinh_factor)
-        return unwrap_step_position(R, shift_fn(R, dR_c[None], box=box, **kwargs), box)
+        return shift_fn(R, dR_c[None], box=box, **kwargs)
 
     def exact_internal_ring_step(R, P, mass, box, step_dt):
         """Exact free propagation of non-centroid ring-polymer modes."""

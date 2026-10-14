@@ -3,10 +3,29 @@ import jax
 import jax.numpy as jnp
 from jax import vmap
 from glob import glob
+from functools import partial
+from flax.core import FrozenDict
 from os.path import abspath
 from time import time
 from ase.io import read
 from .utils import shift, get_relative_coord, get_neighbor_list, get_max_nbrs, neighborlist_is_efficient, sr
+
+
+@partial(jax.jit, static_argnums=(2,3,4,5))
+def _get_stats_batch(coord, box, type_idx, type_count, rcut, lattice_args):
+    def one_frame(coord, box):
+        nbrs_nm = get_neighbor_list(coord, box, type_idx, type_count, rcut,
+                                    lattice_args['max_nbrs'], lattice_args['ortho']) \
+                   if lattice_args['use_neighborlist'] else None
+        coord = coord[np.argsort(type_idx, kind='stable')]
+        r_nm = get_relative_coord(coord, box, type_count, lattice_args, nbrs_nm, K=1)[1]
+        sr_nM = [sr(jnp.concatenate(r, axis=-1), rcut) for r in r_nm]
+        sr_sum = jnp.array([s.sum() for s in sr_nM])
+        sr_sum2 = jnp.array([(s**2).sum() for s in sr_nM])
+        sr_count = jnp.array([(s > 1e-15).sum() for s in sr_nM])
+        Nnbrs = (jnp.concatenate(sr_nM, axis=0) > 0).sum(1).mean() + 1
+        return jnp.array([sr_sum, sr_sum2, sr_count, Nnbrs*jnp.ones_like(sr_sum)])
+    return jax.lax.map(lambda x: one_frame(*x), (coord, box))
 
 
 def _classify_path(p):
@@ -126,22 +145,8 @@ class DatasetLeaf:
         if not hasattr(self, 'lattice_args'):
             raise AttributeError("lattice_args not set. Call compute_lattice_candidate(rcut) before get_stats.")
         batch = self.get_batch(bs)[0]
-        type_idx, type_count = tuple(self.type_idx), tuple(self.type_count)
-        def one_frame(coord, box):
-            nbrs_nm = get_neighbor_list(coord, box, type_idx, type_count, rcut,
-                                        self.lattice_args['max_nbrs'],
-                                        self.lattice_args['ortho']) \
-                       if self.lattice_args['use_neighborlist'] else None
-            coord = coord[np.argsort(type_idx, kind='stable')]
-            r_nm = get_relative_coord(coord, box, type_count, self.lattice_args, nbrs_nm, K=1)[1]
-            sr_nM = [sr(jnp.concatenate(r, axis=-1), rcut) for r in r_nm]
-            sr_sum = jnp.array([s.sum() for s in sr_nM])
-            sr_sum2 = jnp.array([(s**2).sum() for s in sr_nM])
-            sr_count = jnp.array([(s > 1e-15).sum() for s in sr_nM])
-            Nnbrs = (jnp.concatenate(sr_nM, axis=0) > 0).sum(1).mean() + 1
-            return jnp.array([sr_sum, sr_sum2, sr_count, Nnbrs*jnp.ones_like(sr_sum)])
-        s = np.array(jax.jit(lambda coord, box: jax.lax.map(lambda x: one_frame(*x), (coord, box)))
-                     (batch['coord'], batch['box']))
+        s = np.array(_get_stats_batch(batch['coord'], batch['box'], tuple(self.type_idx),
+                                      tuple(self.type_count), rcut, FrozenDict(self.lattice_args)))
         return np.concatenate([s[:,:3].sum(0), s[:,3:].mean(0)], axis=0)
 
     def get_stats(self, rcut, bs):
@@ -178,9 +183,8 @@ class DatasetLeaf:
         if use_neighborlist:
             type_idx, type_count = tuple(self.type_idx), tuple(self.type_count)
             tic = time()
-            max_nbrs = jax.jit(lambda coord, box:
-                get_max_nbrs(coord, box, type_idx, type_count, rcut,
-                             self.lattice_args['ortho']))(self.data['coord'], self.data['box'])
+            max_nbrs = get_max_nbrs(self.data['coord'], self.data['box'], type_idx,
+                                  type_count, rcut, self.lattice_args['ortho'])
             max_nbrs = tuple(map(int, np.array(max_nbrs)))
             print('# Neighborlist max neighbors per type:', max_nbrs,
                   'Time: %.2f s' % (time() - tic))

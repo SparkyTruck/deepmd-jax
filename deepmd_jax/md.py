@@ -12,7 +12,7 @@ from jax.sharding import PartitionSpec as PSpec
 
 from .data import compute_lattice_candidate
 from .utils import (load_model, norm_ortho_box, get_p3mlr_fn, reorder_by_device, dplr_charges)
-from .md_utils import (typed_neighbor_list, min_image_unwrap, print_run_profile,
+from .md_utils import (typed_neighbor_list, print_run_profile,
             prepare_dumps, write_dump_frame, stack_typed_nbrs_per_bead, iso_pressure)
 # Back-compat re-export; the ASE calculator now lives in ase_calc.py.
 from .ase_calc import DPJaxCalculator  # noqa: F401
@@ -215,7 +215,7 @@ class Simulation:
             self._initial_box = box
         self._current_box = self._initial_box
         self._static_args = self._get_static_args(initial_position, use_neighbor_list_when_possible)
-        self._displacement_fn, shift = jax_md.space.periodic_general(self._initial_box, fractional_coordinates=False)
+        self._displacement_fn, shift = jax_md.space.periodic_general(self._initial_box, fractional_coordinates=False, wrapped=False)
 
         # Create mask for constraining atoms
         mobile = np.ones(self._natoms)
@@ -770,7 +770,6 @@ class Simulation:
                 Performs a single simulation step.
             '''
             state, typed_nbrs, error_code, profile = states
-            previous_state_position = state.position
             current_box = state.box if "NPT" in self._routine else self._initial_box
 
             # soft update neighbor list before a step
@@ -786,9 +785,6 @@ class Simulation:
                                 state,
                                 nbrs_nm=typed_nbrs.nbrs_nm if typed_nbrs else None,
                             )
-            box_now = state.box if "NPT" in self._routine else self._current_box
-            state = state.set(position=min_image_unwrap(
-                previous_state_position, state.position, box_now))
             if self._remove_com_motion:
                 mobile_mass = state.mass * (self._mobile[:, None] if self._mobile is not None else jnp.ones_like(state.mass, dtype=bool))
                 velocity = state.velocity - (state.velocity * mobile_mass).sum(0) / mobile_mass.sum()

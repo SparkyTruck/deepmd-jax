@@ -1,6 +1,7 @@
 import jax.numpy as jnp
 import jax
 from jax import lax, vmap, jacfwd
+from functools import partial
 import numpy as np
 import flax.linen as nn
 import pickle, os
@@ -377,6 +378,7 @@ def get_neighbor_list(coord, box, type_idx, type_count, rcut, max_nbrs, ortho):
     return [list(nbrs_m) for nbrs_m in zip(*nbrs_mn)]
 
 
+@partial(jax.jit, static_argnums=(2,3,4,5))
 def get_max_nbrs(coord, box, type_idx, type_count, rcut, ortho):
     coord, box = jnp.asarray(coord), jnp.asarray(box)
     type_split = np.cumsum((0,) + tuple(type_count))
