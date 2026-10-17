@@ -201,13 +201,10 @@ class DatasetLeaf:
         type_count = type_count[:, self.valid_types]
         return np.linalg.lstsq(type_count, energy_mean, rcond=1e-3)[0].astype(np.float32)
 
-    def get_atomic_label_scale(self):
-        label = [label for label in self.data.keys() if 'atomic' in label][0]
-        return np.std(self.data[label])
-
-    def _get_atomic_scalar_stats(self, atomic_sel):
+    def _get_atomic_stats(self, atomic_sel):
         label = self.data[next(label for label in self.data if 'atomic' in label)]
-        label_types = self.type_idx[np.isin(self.type_idx, atomic_sel)]
+        label_types = np.repeat(self.type_idx[np.isin(self.type_idx, atomic_sel)], np.prod(label.shape[2:], dtype=int))
+        label = label.reshape(len(label), -1)
         ntypes = len(self.type_count)
         return np.array([
             len(label) * np.bincount(label_types, minlength=ntypes),
@@ -242,18 +239,18 @@ class DPDataset(DatasetLeaf):
         super().__init__(labels, params or {}, type_arr, data, paths=[path])
 
 
-def get_atomic_scalar_stats(dataset, atomic_sel):
+def get_atomic_stats(dataset, atomic_sel):
     if not atomic_sel or any(t < 0 or t >= dataset.ntypes for t in atomic_sel):
         raise ValueError('atomic_sel must contain types present in the training dataset.')
-    count, label_sum, label_sum2 = sum(leaf._get_atomic_scalar_stats(atomic_sel) for leaf in dataset.get_leaves())
+    count, label_sum, label_sum2 = sum(leaf._get_atomic_stats(atomic_sel) for leaf in dataset.get_leaves())
     if not count.all():
-        raise ValueError('No atomic scalar labels found for selected type(s) %s.'
+        raise ValueError('No atomic labels found for selected type(s) %s.'
                          % np.asarray(atomic_sel)[count == 0].tolist())
     Ebias = np.zeros(dataset.ntypes, dtype=np.float32)
     Ebias[atomic_sel] = label_sum / count
-    variance = (label_sum2 - label_sum**2 / count).sum() / count.sum()
-    out_norm = np.sqrt(max(variance, 0.))
-    return Ebias, np.float32(out_norm if out_norm > 0 else 1.)
+    out_norm = np.ones(dataset.ntypes, dtype=np.float32)
+    out_norm[atomic_sel] = np.sqrt(np.maximum(label_sum2 / count - (label_sum / count)**2, 0.))
+    return Ebias, np.where(out_norm > 0, out_norm, 1.).astype(np.float32)
 
 
 class DatasetGroup:
@@ -316,9 +313,6 @@ class DatasetGroup:
         type_count, energy_mean = [np.array(x) for x in zip(*energy_stats)]
         type_count = type_count[:, self.valid_types]
         return np.linalg.lstsq(type_count, energy_mean, rcond=1e-3)[0].astype(np.float32)
-
-    def get_atomic_label_scale(self):
-        return (np.array([subset.get_atomic_label_scale() for subset in self.subsets]) * np.array(self.prob)).sum()
 
     def _get_energy_stats(self):
         return sum([subset._get_energy_stats() for subset in self.subsets], [])

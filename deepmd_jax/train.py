@@ -6,7 +6,7 @@ import time, datetime
 import flax.linen as nn
 from functools import partial
 from .utils import get_p3mlr_fn, get_p3mlr_grid_size, load_model, save_model, compress_model, dplr_charges, get_max_nbrs, neighborlist_is_efficient
-from .data import Dataset, compute_lattice_candidate, get_atomic_scalar_stats
+from .data import Dataset, compute_lattice_candidate, get_atomic_stats
 from .dpmodel import DPModel
 from typing import Union, List
 import tempfile
@@ -297,7 +297,7 @@ def train(
                                     use_neighbor_list_when_possible=use_neighbor_list_when_possible)
         print(' Done. Time: %d s' % (time.time() - tic_sr))
 
-    scalar_stats = get_atomic_scalar_stats(train_data, atomic_sel) if model_type == 'atomic_scalar' else None
+    atomic_stats = get_atomic_stats(train_data, atomic_sel) if 'atomic' in model_type else None
 
     # construct model
     params = {
@@ -307,14 +307,14 @@ def train(
         'embedMP_widths': embed_widths[-1:] + embed_mp_widths if mp else None,
         'fit_widths': fit_widths,
         'axis': axis_neurons,
-        'Ebias': scalar_stats[0] if model_type == 'atomic_scalar' else (None if 'atomic' in model_type else train_data.fit_energy()),
+        'Ebias': atomic_stats[0] if model_type == 'atomic_scalar' else (None if 'atomic' in model_type else train_data.fit_energy()),
         'rcut': rcut,
         'use_2nd': True,
         'use_mp': mp,
         'atomic': 'atomic' in model_type,
         'hybrid': hybrid,
         'nsel': atomic_sel if 'atomic' in model_type else None,
-        'out_norm': scalar_stats[1] if model_type == 'atomic_scalar' else (train_data.get_atomic_label_scale() if 'atomic' in model_type else 1.),
+        'out_norm': atomic_stats[1] if 'atomic' in model_type else 1.,
         **train_data.get_stats(rcut, getstat_bs),
     }
     if model_type == 'dplr':
