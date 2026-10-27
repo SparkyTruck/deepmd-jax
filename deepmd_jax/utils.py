@@ -7,6 +7,7 @@ import flax.linen as nn
 import pickle, os
 from scipy.interpolate import PPoly, BPoly
 from jax.sharding import PartitionSpec as PSpec
+from . import _print as print, mesh
 
 @jax.jit
 def norm_ortho_box(coord, box):
@@ -171,8 +172,22 @@ class fitting_net(nn.Module):
 class linear_norm(nn.Module):
     width: int
     @nn.compact
-    def __call__(self, x):
-        return (nn.Dense(self.width, kernel_init=linear_init, use_bias=False)(x) * self.param('norm',ones_init,(1,)))
+    def __call__(self, x, params_only=False):
+        dense = nn.Dense(self.width, kernel_init=linear_init, use_bias=False)
+        y, norm = dense(x), self.param('norm',ones_init,(1,))
+        return (dense.get_variable('params','kernel'), norm) if params_only else y * norm
+
+def mp_neighbor_fields(T_n4C, W_DE, norm_s_1, W_CE, norm_v_1, nbr_nm, L, K):
+    # Communicate compact features; project each shard's VJP back before reducing.
+    def project(T_n4C, W_DE, norm_s_1, W_CE, norm_v_1, nbr_nm):
+        T_nD = (T_n4C[:,:,None]*T_n4C[:,:,:4,None]).sum(1).reshape(-1,4*T_n4C.shape[-1])
+        S_nE, V_n3E = (T_nD @ W_DE)*norm_s_1, (T_n4C[:,1:] @ W_CE)*norm_v_1
+        return (S_nE[nbr_nm], V_n3E[nbr_nm]) if nbr_nm is not None else (jnp.repeat(S_nE,L,axis=0)[None], jnp.repeat(V_n3E,L,axis=0)[None])
+    if K > 1 and hasattr(lax,'pcast'):
+        def local(T_n4C, *args): return project(lax.pcast(T_n4C,'atom',to='varying'), *args)
+        return jax.shard_map(local, mesh=mesh, in_specs=(PSpec(),)*5+(PSpec('atom'),),
+                             out_specs=(PSpec('atom'),)*2)(T_n4C, W_DE, norm_s_1, W_CE, norm_v_1, nbr_nm)
+    return project(T_n4C, W_DE, norm_s_1, W_CE, norm_v_1, nbr_nm)
 
 def get_p3mlr_grid_size(box3, beta, resolution=5): # resolution=10 for better accuracy
     M = tuple((box3*beta*resolution).astype(int))
@@ -218,12 +233,18 @@ def get_p3mlr_fn(box3_ref, beta, M=None, resolution=5): # PPPM long range with T
         fr_27N = (fr_33N[:,None,None,0,:]*fr_33N[:,None,1,:]*fr_33N[:,2,:]).reshape(27,-1)
         # flatten charge-major so a device-partitioned charge axis stays contiguous
         all_idx = ((center_idx_3N[:,:,None] + cube_idx[:,None,:]) % M3[:,None,None]).reshape(3,-1)
-        grid = grid.at[tuple(all_idx)].add((q_N[:,None]*fr_27N.T).reshape(-1))
+        grid = grid.at[all_idx[0],all_idx[1],all_idx[2]].add((q_N[:,None]*fr_27N.T).reshape(-1))
 
         skfactor = jnp.fft.fftn(grid)
         # the following step may cause a bit speed loss under multi-gpu, but I haven't figured out why
         E = (kfactor * (skfactor*skfactor.conj()).real).sum()
         return E
+    if jax.process_count() > 1 and hasattr(lax,'pcast'):
+        # Keep the mesh local; reconcile roundoff in both energy and gradients.
+        def replicated(coord_N3, q_N, box3):
+            return lax.pmean(p3mlr_fn(*[lax.pcast(a,'atom',to='varying') for a in (coord_N3,q_N,box3)]),'atom')
+        replicated_fn = jax.shard_map(replicated, mesh=mesh, in_specs=PSpec(), out_specs=PSpec())
+        return lambda coord_N3,q_N,box3: replicated_fn(coord_N3,q_N,box3)
     return p3mlr_fn
 
 def save_model(path, model, variables):
@@ -431,18 +452,18 @@ def atomic_inverse_perm(type_idx, nsel):
         [np.where(type_idx == t)[0] for t in nsel])
     return np.argsort(sorted_nsel, kind='stable')
 
-def get_mask_by_device(type_count):
+def get_mask_by_device(type_count, sharded=True):
     '''
         For multiple-device partitioning, ghost atoms are padded.
-        Returns a binary mask indicating the valid atoms, sharded by device.
+        Returns a binary mask indicating the valid atoms, optionally sharded by device.
     '''
     K = jax.device_count()
-    mask = concat([
-                concat([jnp.ones(count, dtype=bool),
-                        jnp.zeros((-count%K,), dtype=bool)
+    mask = np.concatenate([
+                np.concatenate([np.ones(count, dtype=bool),
+                        np.zeros((-count%K,), dtype=bool)
                         ]).reshape(K,-1)
                 for count in type_count
                 ],
             axis=1).reshape(-1)
-    # ensure mask is sharded by device
-    return jax.lax.with_sharding_constraint(mask, PSpec('atom'))
+    # Keep static closure constants on the host in multi-process JAX.
+    return jax.lax.with_sharding_constraint(mask, PSpec('atom')) if sharded else mask

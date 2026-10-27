@@ -207,16 +207,42 @@ import jax
 jax.config.update('jax_enable_x64', True)
 ```
 
+### Multi-GPU and distributed GPU simulations
+
+Training currently uses only one GPU.
+For a single node with multiple GPUs, simulation uses all visible GPUs automatically.
+For distributed simulations, call `jax.distributed.initialize()` before importing `deepmd_jax`.
+But do import `deepmd_jax` before other JAX GPU computations.
+The following example demonstrates running on two nodes with four GPUs per node:
+
+```python
+import jax
+jax.distributed.initialize(local_device_ids=[0, 1, 2, 3])
+from deepmd_jax.md import Simulation
+sim = Simulation(...)
+sim.run(10000)
+```
+
+```bash
+srun -N 2 -n 2 --ntasks-per-node=1 --gpus-per-task=4 python run.py
+```
+
+Guard your own file writes with `if jax.process_index() == 0`.
+
+Water benchmarks on Perlmutter A100 GPUs, four GPUs per node; one-GPU references extrapolated from smaller cells:
+
+<img src="docs/multi_gpu_scaling.png" width="480" alt="Scaling of DP, DP-MP, DPLR, and 64-bead DP PIMD on Perlmutter">
+
 ### Units
 
 The default units are Angstrom, eV, femtosecond, and their derived units. The only exceptions are the parameters `temperature` (Kelvin), `pressure` (bar), and `mass` (Dalton) when initializing `Simulation()`.
 
 ### Printing Trajectories on the Fly
 
-Pass `dump_prefix` to stream XYZ files instead of keeping the trajectory in memory. When `dump_prefix` is set, sim.run() returns `None` instead of a trajectory dictionary. The default `dump_content="positions"` writes `{prefix}_position.xyz` for classical MD; for PIMD, positions are split by bead as `{prefix}_position_bead0.xyz` etc., and `{prefix}_centroid.xyz` is also written. Use `dump_content="all"` to also write velocities. Existing files are overwritten by default; use `dump_mode='append'` to continue an existing trajectory.
+Pass `dump_prefix` to stream XYZ files instead of keeping the trajectory in memory. When `dump_prefix` is set, `sim.run()` returns `None` instead of a trajectory dictionary. The default `dump_content="positions"` writes `{prefix}_position.xyz` for classical MD; for PIMD, positions are split by bead as `{prefix}_position_bead0.xyz` etc., and `{prefix}_centroid.xyz` is also written. Use `dump_content="all"` to also write velocities. Files are overwritten unless `dump_mode='append'`.
 
 ```python
-# Writes traj_position.xyz every 10 steps; existing files are overwritten;
+# Writes every 10 steps; overwrites unless dump_mode='append'.
 # under PIMD this writes traj_position_bead*.xyz and traj_centroid.xyz;
 sim.run(100000, dump_prefix="traj", dump_interval=10, dump_mode="append")
 ```

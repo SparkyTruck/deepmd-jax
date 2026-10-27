@@ -14,6 +14,7 @@ import numpy as np
 from ase import Atoms
 from jax.sharding import PartitionSpec as PSpec
 
+from . import _print as print
 from .utils import split, reorder_by_device, get_mask_by_device
 
 
@@ -129,11 +130,13 @@ def _write_xyz_frame(path, atoms, data, cell, step=None):
     comment.append(f'pbc="{_format_pbc(atoms.get_pbc())}"')
 
     lines = [f'{len(symbols)}\n', ' '.join(comment) + '\n']
-    lines.extend(
-        line_fmt % (symbol, xyz[0], xyz[1], xyz[2])
-        for symbol, xyz in zip(symbols, data))
     with open(path, 'a', encoding='utf-8') as handle:
         handle.write(''.join(lines))
+        for start in range(0, len(data), 16384):
+            stop = min(start+16384, len(data))
+            fields_n4 = np.empty((stop-start, 4), dtype=object)
+            fields_n4[:,0], fields_n4[:,1:] = symbols[start:stop], data[start:stop]
+            handle.write((line_fmt * len(fields_n4)) % tuple(fields_n4.ravel()))
 
 
 def iso_pressure(energy_fn, position, box, n_atoms, kT, **kwargs):
@@ -211,7 +214,7 @@ def prepare_dumps(type_idx, type_symbols, n_bead, default_interval,
     dumps = []
     for kind, path in requested.items():
         split_beads = is_pimd and kind != 'centroid'
-        if dump_mode == 'overwrite':
+        if dump_mode == 'overwrite' and jax.process_index() == 0:
             _remove_dump_target(path, bead_split=split_beads)
         if split_beads:
             for bead in range(n_bead):
@@ -233,6 +236,8 @@ def write_dump_frame(dumps, pos_frame, vel_frame, centroid_frame, box_frame, ste
 
     When provided, ``step`` is written into the XYZ comment/metadata line.
     '''
+    if jax.process_index() != 0:
+        return
     if box_frame.shape == (3,):
         cell = np.concatenate([np.array(box_frame), [90, 90, 90]])
     else:
@@ -293,7 +298,7 @@ def get_type_mask_fns(type_count):
     '''
     type_mask_fns = []
     K = jax.device_count()
-    full_mask = get_mask_by_device(type_count)
+    full_mask = get_mask_by_device(type_count, sharded=False)
     type_count_each = -(-np.array(type_count)//K)        # type_count for each device after padding
     type_idx_each = np.cumsum([0] + list(type_count_each)) # type_idx for each device after padding
     N_each = type_idx_each[-1] # number of atoms for each device after padding
@@ -316,8 +321,8 @@ def get_idx_mask_fn(type_count):
     '''
         Returned idx_mask_fn that filters out ghost atoms from nbrs.idx.
     '''
-    full_mask = get_mask_by_device(type_count)
-    idx_mask_out = np.arange(len(full_mask))[~np.array(full_mask)]
+    full_mask = get_mask_by_device(type_count, sharded=False)
+    idx_mask_out = np.arange(len(full_mask))[~full_mask]
     def idx_mask_fn(idx):
         idx = jax.lax.with_sharding_constraint(idx, PSpec('atom'))
         filter = full_mask[:,None] * jnp.isin(idx, idx_mask_out, invert=True)
@@ -413,6 +418,7 @@ def typed_neighbor_list(box, type_idx, type_count, rcut, buffer_ratio=1.2):
                                               capacity_multiplier=total_buffer_ratio * 1.1,
                                               custom_mask_function=idx_mask_fn
                                             ).allocate(coord)
+        nbrs = nbrs.set(idx=jax.lax.with_sharding_constraint(nbrs.idx, PSpec('atom')))
         nbrs_nm, overflow = get_nm(nbrs, knbr)
         return TypedNeighborList(nbrs=nbrs,
                                  knbr=knbr,

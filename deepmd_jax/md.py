@@ -10,6 +10,7 @@ import gc
 from time import time
 from jax.sharding import PartitionSpec as PSpec
 
+from . import _print as print
 from .data import compute_lattice_candidate
 from .utils import (load_model, norm_ortho_box, get_p3mlr_fn, reorder_by_device, dplr_charges)
 from .md_utils import (typed_neighbor_list, print_run_profile,
@@ -197,6 +198,7 @@ class Simulation:
         self._debug = debug
         # Chunk memory budget ~ chunk_size * n_bead * natoms.
         self._step_chunk_size = max(10, min(100, 100000 // (self._natoms * self._n_bead)))
+        self._step_chunk_size = max(n for n in (10, 20, 50, 100) if n <= self._step_chunk_size)
         self._model_deviation_paths = model_deviation_paths
         self._use_model_deviation = len(model_deviation_paths) > 0
         self._remove_com_motion = remove_com_motion
@@ -408,8 +410,8 @@ class Simulation:
                 wc = wc_model.wc_predict(wc_variables, coord, box, self._static_args, nbrs_nm)
                 pos, q = jnp.concatenate([coord, wc]), jnp.concatenate([qatoms, qwc])
                 if jax.device_count() > 1:
-                    # each device spreads its share of the charges and the partial grids are
-                    # summed, so every device holds the same grid; zero charges pad the split
+                    # Keep charge cotangents partitioned through the Wannier VJP;
+                    # zero-charge padding also supports the original partial-grid path.
                     pad = -q.shape[0] % jax.device_count()
                     pos = jnp.concatenate([pos, jnp.zeros((pad, 3), pos.dtype)])
                     q = jnp.concatenate([q, jnp.zeros((pad,), q.dtype)])
@@ -702,6 +704,7 @@ class Simulation:
             test reduces across beads and the stacked pytree is updated jointly.
         '''
         rcut_static = self._model.params['rcut']
+        nbr_spec = PSpec(None, 'atom') if self._is_pimd else PSpec('atom')
 
         def _drift_per_bead(typed_nbrs_single, position_N3, box):
             scale = typed_nbrs_single.reference_box / box
@@ -741,6 +744,8 @@ class Simulation:
                 lambda: update_fn(typed_nbrs, position, box),
                 lambda: typed_nbrs,
             )
+            typed_nbrs = typed_nbrs.set(nbrs=typed_nbrs.nbrs.set(idx=jax.lax.with_sharding_constraint(typed_nbrs.idx, nbr_spec)),
+                                      nbrs_nm=jax.lax.with_sharding_constraint(typed_nbrs.nbrs_nm, nbr_spec))
             return typed_nbrs, profile
 
         return soft_update_nbrs
@@ -800,7 +805,9 @@ class Simulation:
             '''
                 states = (state, typed_nbrs, error_code, profile)
             '''
-            return jax.lax.scan(inner_step, states, length=length)
+            states, traj = jax.lax.scan(inner_step, states, length=length)
+            state, typed_nbrs, error_code, profile = states
+            return (state, typed_nbrs, error_code | self._check_hard_overflow(state, typed_nbrs), profile), traj
 
         return multiple_inner_step
 
@@ -872,6 +879,41 @@ class Simulation:
         self._print_report()
         self._is_initial_state = False
 
+    def _record_pending(self):
+        '''Record the preceding accepted chunk; failed appends must not replay.'''
+        if self._pending_trajectory is not None:
+            idx_l, idx_r, frames = self._pending_trajectory
+            if self._has_dumps:
+                self._pending_trajectory = None # An append must not be replayed if writing raises.
+                frames = [np.asarray(f) if f is not None else None for f in frames]
+                for i, frame_step in enumerate(range(idx_l+1, idx_r+1, self._write_interval)):
+                    write_dump_frame(self._dumps,
+                        frames[0][i] if self._writes_position else None,
+                        frames[1][i] if self._writes_velocity else None,
+                        frames[3][i] if self._writes_centroid else None,
+                        frames[2][i], step=frame_step)
+            else:
+                self._position_trajectory[idx_l:idx_r] = frames[0]
+                self._velocity_trajectory[idx_l:idx_r] = frames[1]
+                self._box_trajectory[idx_l:idx_r] = frames[2]
+                if self._is_pimd:
+                    self._centroid_trajectory[idx_l:idx_r] = frames[3]
+                self._pending_trajectory = None
+
+    def _queue_trajectory(self, traj, next_chunk):
+        '''Select and prefetch accepted frames before dispatching the next chunk.'''
+        if self._has_dumps:
+            first = (-self.step-1) % self._write_interval
+            if first < next_chunk:
+                frames = [f[first::self._write_interval] if use else None for f,use in zip(traj,
+                          (self._writes_position, self._writes_velocity, True, self._writes_centroid))]
+                for f in frames:
+                    if f is not None: f.copy_to_host_async()
+                self._pending_trajectory = (self.step+first, self.step+next_chunk, frames)
+        else:
+            idx_l, idx_r = self.step - self._offset, self.step - self._offset + next_chunk
+            self._pending_trajectory = (idx_l, idx_r, traj if self._is_pimd else traj[:3])
+
     def run(self, steps,
             dump_interval: Optional[int] = None,
             dump_prefix: Optional[str] = None,
@@ -892,64 +934,55 @@ class Simulation:
                              dump_content=dump_content,
                              dump_mode=dump_mode)
 
+        self._pending_trajectory = None
         remaining_steps = steps
-        while remaining_steps > 0:
+        try:
+            while remaining_steps > 0:
 
-            # run the simulation for a jit-compiled chunk of steps
-            next_chunk = min(self.report_interval - self.step % self.report_interval,
-                             self._step_chunk_size,
-                             remaining_steps)
-            states = (self._state,
-                      self._typed_nbrs if self._static_args['use_neighbor_list'] else None,
-                      self._error_code,
-                      self._neighbor_update_profile)
-            states_new, traj = self._multiple_inner_step_fn(states, next_chunk)
-            state_new, typed_nbrs_new, error_code, profile = states_new
-            self._error_code |= error_code
+                # run the simulation for a jit-compiled chunk of steps
+                next_chunk = min(self.report_interval - self.step % self.report_interval,
+                                 self._step_chunk_size,
+                                 remaining_steps)
+                states = (self._state,
+                          self._typed_nbrs if self._static_args['use_neighbor_list'] else None,
+                          self._error_code,
+                          self._neighbor_update_profile)
+                states_new, traj = self._multiple_inner_step_fn(states, next_chunk)
+                self._record_pending() # Record the preceding accepted chunk while this one computes.
+                state_new, typed_nbrs_new, error_code, profile = states_new
+                self._error_code |= error_code
 
-            if self._error_code & 16:
-                print("# Warning: Nan or Inf encountered in simulation. Terminating.")
-                remaining_steps = 0
+                if self._error_code & 16:
+                    print("# Warning: Nan or Inf encountered in simulation. Terminating.")
+                    remaining_steps = 0
 
-            # If there is any hard overflow, we have to re-run the chunk
-            if not (self._error_code == 0 or self._error_code == 4 or self._error_code == 16):
-                self._resolve_error_code()
-                continue
+                # If there is any hard overflow, we have to re-run the chunk
+                if not (self._error_code == 0 or self._error_code == 4 or self._error_code == 16):
+                    self._resolve_error_code()
+                    continue
 
-            # If nothing overflows, update the tracked state and record the trajectory
-            self._keep_nbr_or_lattice_up_to_date()
-            self._state = state_new
-            self._typed_nbrs = typed_nbrs_new
-            self._neighbor_update_profile = profile
-            if "NPT" in self._routine:
-                self._current_box = self._state.box
-            pos_traj, vel_traj, box_traj, centroid_traj = traj
-            if self._has_dumps:
-                base = int(self.step)
-                for i in range(next_chunk):
-                    frame_step = base + i + 1
-                    if frame_step % self._write_interval == 0:
-                        write_dump_frame(
-                            self._dumps,
-                            np.asarray(pos_traj[i]) if self._writes_position else None,
-                            np.asarray(vel_traj[i]) if self._writes_velocity else None,
-                            np.asarray(centroid_traj[i]) if self._writes_centroid else None,
-                            np.asarray(box_traj[i]),
-                            step=frame_step,
-                        )
-            else:
-                idx_l, idx_r = self.step - self._offset, self.step - self._offset + next_chunk
-                self._position_trajectory[idx_l:idx_r] = pos_traj
-                self._velocity_trajectory[idx_l:idx_r] = vel_traj
-                self._box_trajectory[idx_l:idx_r] = box_traj
-                if self._is_pimd:
-                    self._centroid_trajectory[idx_l:idx_r] = centroid_traj
-            self.step += next_chunk
-            remaining_steps -= next_chunk
+                # If nothing overflows, update the tracked state and record the trajectory
+                self._state = state_new
+                self._typed_nbrs = typed_nbrs_new
+                self._neighbor_update_profile = profile
+                if "NPT" in self._routine:
+                    self._current_box = self._state.box
+                self._error_code = 0 # A successful chunk clears the previous retry flag.
+                self._queue_trajectory(traj, next_chunk)
+                del traj
+                self.step += next_chunk
+                remaining_steps -= next_chunk
 
-            # Report at preset regular intervals
-            if self.step % self.report_interval == 0 or remaining_steps == 0:
-                self._print_report()
+                # Report at preset regular intervals
+                if self.step % self.report_interval == 0 or remaining_steps == 0:
+                    if self._has_dumps: self._record_pending()
+                    self._keep_nbr_or_lattice_up_to_date()
+                    self._print_report()
+        finally:
+            try:
+                self._record_pending()
+            finally:
+                self._pending_trajectory = None
 
         self._print_run_profile(steps, time() - self._tic_of_this_run)
         self._keep_nbr_or_lattice_up_to_date()
@@ -1037,6 +1070,9 @@ class Simulation:
         """
         if seed is None:
             seed = np.random.randint(1, 1e6)
+            if jax.process_count() > 1:
+                from jax.experimental.multihost_utils import broadcast_one_to_all
+                seed = int(broadcast_one_to_all(np.asarray(seed)))
         key = jax.random.PRNGKey(seed)
         kT = temperature * TEMP_UNIT_CONVERSION
         velocity = jax.random.normal(key,

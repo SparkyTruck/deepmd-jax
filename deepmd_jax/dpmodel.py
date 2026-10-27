@@ -65,16 +65,14 @@ class DPModel(nn.Module):
                         / self.params['Nnbrs'] for SR,R4 in zip(sr_centernorm_nm,R_n4m)] for _ in range(2)]
             T_2_nD = [[(t[:,:,None]*t[:,:,:4,None]).sum(1).reshape(-1,4*C) for t in T] for T in T_2_n4C]
             T_2_n3C = [[t[:,1:] for t in T] for T in T_2_n4C]
-            if K > 1:
-                T_2_nD, T_2_n3C = lax.with_sharding_constraint([T_2_nD, T_2_n3C], PSpec())
-            F_nselmE = [[(linear_norm(E)(T_2_nD[0][i])[:,None]
-                      + (linear_norm(E)(T_2_nD[1][j])[nbrs_nm[i][j]] if nbrs_nm is not None else
-                         jnp.repeat(linear_norm(E)(T_2_nD[1][j]),L,axis=0))
-                      + (R_n3m[i][j][...,None] * (linear_norm(E)(T_2_n3C[0][i])[:,:,None]
-                          + (linear_norm(E)(T_2_n3C[1][j])[nbrs_nm[i][j]].transpose(0,2,1,3) if nbrs_nm is not None else
-                            jnp.repeat(linear_norm(E)(T_2_n3C[1][j]),L,axis=0).transpose(1,0,2)))).sum(1)
-                      + emb) * (self.param('layer_norm_%d_%d'%(i,j), ones_init, (1,))**2 if self.params['atomic'] else 1)
-                        for j,emb in enumerate(EMB)] for i,EMB in zip(nsel,embed_nselmE)]
+            def get_F_nmE(i,j,embed_nmE):
+                S_n1E = linear_norm(E)(T_2_nD[0][i])[:,None]
+                W_DE, norm_s_1 = linear_norm(E)(T_2_nD[1][j], params_only=True)
+                V_n31E = linear_norm(E)(T_2_n3C[0][i])[:,:,None]
+                W_CE, norm_v_1 = linear_norm(E)(T_2_n3C[1][j], params_only=True)
+                S_nmE, V_nm3E = mp_neighbor_fields(T_2_n4C[1][j], W_DE, norm_s_1, W_CE, norm_v_1, nbrs_nm[i][j] if nbrs_nm is not None else None, L, K)
+                return (S_n1E + S_nmE + (R_n3m[i][j][...,None] * (V_n31E + V_nm3E.transpose(0,2,1,3))).sum(1) + embed_nmE) * (self.param('layer_norm_%d_%d'%(i,j), ones_init, (1,))**2 if self.params['atomic'] else 1)
+            F_nselmE = [[get_F_nmE(i,j,emb) for j,emb in enumerate(EMB)] for i,EMB in zip(nsel,embed_nselmE)]
             T_NselXW = concat([sum([embedding_net(self.params['embedMP_widths'], in_bias_only=True,
                         dt_layers=range(2,len(self.params['embedMP_widths'])))(f, reducer=rx)
                         for f,rx in zip(F,RX)]) for F,RX in zip(F_nselmE, R_nselXm)],K=K) / self.params['Nnbrs'] 
