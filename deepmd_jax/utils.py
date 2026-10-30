@@ -338,10 +338,9 @@ def periodic_replicate(n_copy, coord, box, type_idx=None, force=None, velocity=N
     else:
         return_box = np.diag(n_copy) @ box
     for d in range(3):
-        coord = np.concatenate([(coord + i*box[:,d])[None]
+        coord = np.concatenate([(coord + i*box[d])[None]
                                 for i in range(n_copy[d])]
                                ).reshape(-1,3)
-    box = box * n_copy
     ret = [coord, return_box]
     if type_idx is not None:
         ret.append(np.tile(type_idx, n_copy.prod()))

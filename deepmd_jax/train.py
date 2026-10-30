@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import time, datetime
 import flax.linen as nn
 from functools import partial
-from .utils import get_p3mlr_fn, get_p3mlr_grid_size, load_model, save_model, compress_model, dplr_charges, get_max_nbrs, neighborlist_is_efficient
+from .utils import get_p3mlr_fn, get_p3mlr_grid_size, load_model, save_model, compress_model, dplr_charges, get_max_nbrs, neighborlist_is_efficient, assert_type_idx_in_valid_types
 from .data import Dataset, compute_lattice_candidate, get_atomic_stats
 from .dpmodel import DPModel
 from typing import Union, List
@@ -19,9 +19,9 @@ def _get_static_args(type_idx, lattice_args):
                           'max_nbrs': lattice_args['max_nbrs']})
 
 def train(
-    model_type: str,
-    rcut: float,
-    train_data_path: Union[str, List[str]],
+    model_type: str = None,
+    rcut: float = None,
+    train_data_path: Union[str, List[str]] = None,
     val_data_path: Union[str, List[str]] = None,
     save_path: str = 'model.pkl',
     step: int = 1000000,
@@ -65,6 +65,8 @@ def train(
     obs_target: Union[float, str, list, None] = None,
     obs_step_every: int = 1,
     use_neighbor_list_when_possible: bool = True,
+    init_model_path: str = None,
+    fitting_only: bool = False,
 ):
     '''
         Entry point for training deepmd-jax models.
@@ -114,6 +116,8 @@ def train(
                     'l1-mixed': MAE over configs/atoms, but RMS within each force/atomic vector; more robust to data outliers.
                     'l2': MSE over all entries. This was the old default.
             use_neighbor_list_when_possible: use a simple training neighborlist when the lattice candidate count is one.
+            init_model_path: initialize from a saved model, retaining its architecture, type mapping, statistics, and biases; architecture arguments are ignored. Starts a new optimizer.
+            fitting_only: train only fitting networks; requires init_model_path. Otherwise all network parameters are trained.
         --- Input arguments specific for hybrid ab initio and empirical models:
             hybrid: whether to train hybrid ab initio and empirical models.
             obs_train_data_path: paths to training data with trajectories with observable values.
@@ -129,36 +133,48 @@ def train(
     if jax.device_count() > 1:
         print('# Note: Currently only one device will be used for training.')
 
-    # width check
-    if fit_widths is None:
-        if model_type not in ('atomic', 'atomic_t2'):
-            fit_widths = [128, 128, 128]
-        else:
-            width = embed_mp_widths[-1] if mp else embed_widths[-1]
-            fit_widths = [width, width, width]
-    for i in range(len(embed_widths)-1):
-        if embed_widths[i+1] % embed_widths[i] != 0:
-            raise ValueError('embed_widths[i] must divide embed_widths[i+1]')
-    if mp:
-        if embed_widths[-1] != embed_mp_widths[0]:
-            raise ValueError('embed_widths[-1] must equal embed_mp_widths[0].')
-        for i in range(len(embed_mp_widths)-1):
-            if embed_mp_widths[i+1] % embed_mp_widths[i] != 0 and embed_mp_widths[i+1] % embed_widths[i] != 0:
-                raise ValueError('embed_mp_widths[i] must divide or be divisible by embed_mp_widths[i+1]')
-    for i in range(len(fit_widths)-1):
-        if fit_widths[i+1] != fit_widths[i] != 0:
-            print('# Warning: it is recommended to use the same width for all layers in the fitting network.')
-    if model_type in ('atomic', 'atomic_t2'):
+    params = {}
+    if init_model_path is not None:
+        model, variables = load_model(init_model_path, replicate=False)
+        params = dict(model.params)
+        model_type, rcut, mp = params['type'], params['rcut'], params.get('use_mp', False)
+        atomic_sel = list(params['nsel']) if params['atomic'] else None
+    if model_type is None or rcut is None or train_data_path is None:
+        raise ValueError('Provide train_data_path, and model_type and rcut unless init_model_path is set.')
+    if fitting_only and init_model_path is None:
+        raise ValueError('fitting_only requires init_model_path.')
+
+    if init_model_path is None:
+        # width check
+        if fit_widths is None:
+            if model_type not in ('atomic', 'atomic_t2'):
+                fit_widths = [128, 128, 128]
+            else:
+                width = embed_mp_widths[-1] if mp else embed_widths[-1]
+                fit_widths = [width, width, width]
+        for i in range(len(embed_widths)-1):
+            if embed_widths[i+1] % embed_widths[i] != 0:
+                raise ValueError('embed_widths[i] must divide embed_widths[i+1]')
         if mp:
-            if embed_mp_widths[-1] != fit_widths[-1]:
-                raise ValueError('For atomic mp models, embed_mp_widths[-1] must equal fit_widths[-1].')
-        else:
-            if embed_widths[-1] != fit_widths[-1]:
-                raise ValueError('For atomic models, embed_widths[-1] must equal fit_widths[-1].')
+            if embed_widths[-1] != embed_mp_widths[0]:
+                raise ValueError('embed_widths[-1] must equal embed_mp_widths[0].')
+            for i in range(len(embed_mp_widths)-1):
+                if embed_mp_widths[i+1] % embed_mp_widths[i] != 0 and embed_mp_widths[i+1] % embed_widths[i] != 0:
+                    raise ValueError('embed_mp_widths[i] must divide or be divisible by embed_mp_widths[i+1]')
+        for i in range(len(fit_widths)-1):
+            if fit_widths[i+1] != fit_widths[i] != 0:
+                print('# Warning: it is recommended to use the same width for all layers in the fitting network.')
+        if model_type in ('atomic', 'atomic_t2'):
+            if mp:
+                if embed_mp_widths[-1] != fit_widths[-1]:
+                    raise ValueError('For atomic mp models, embed_mp_widths[-1] must equal fit_widths[-1].')
+            else:
+                if embed_widths[-1] != fit_widths[-1]:
+                    raise ValueError('For atomic models, embed_widths[-1] must equal fit_widths[-1].')
     assert loss in ('l1-mixed', 'l2'), 'loss must be "l1-mixed" or "l2"'
     # load dataset
     if 'atomic' in model_type and atomic_data_prefix is None:
-        atomic_data_prefix = {'atomic':'atomic_dipole', 'atomic_t2':'atomic_polarizability', 'atomic_scalar':'atomic_energy'}[model_type]
+        atomic_data_prefix = params.get('atomic_data_prefix') or {'atomic':'atomic_dipole', 'atomic_t2':'atomic_polarizability', 'atomic_scalar':'atomic_energy'}[model_type]
     if model_type in ('energy', 'dplr'):
         labels = ['coord', 'box', 'force', 'energy']
     elif 'atomic' in model_type:
@@ -170,8 +186,17 @@ def train(
     data_params = {'atomic_sel':atomic_sel, 'atomic_scalar':model_type == 'atomic_scalar'}
     train_data = Dataset(train_data_path,
                            labels,
-                           data_params)
-    train_data.compute_lattice_candidate(rcut, use_neighbor_list_when_possible, mp)
+                           data_params, chemical_types=params.get('chemical_types'))
+    ntypes = params.get('ntypes', train_data.ntypes)
+    def prepare_data(data):
+        if init_model_path is not None:
+            for leaf in data.get_leaves():
+                assert_type_idx_in_valid_types(leaf.type_idx, params['valid_types'])
+        data.fill_type(ntypes)
+        data.compute_lattice_candidate(rcut, use_neighbor_list_when_possible, mp)
+    if params and train_data.chemical_types is not None and params.get('chemical_types') is None:
+        raise ValueError('init_model_path has no chemical_types; use DeepMD data with the original type indices.')
+    prepare_data(train_data)
     chemical_types = train_data.chemical_types
 
     # Setup for hybrid training
@@ -254,8 +279,7 @@ def train(
                                         labels_obs,
                                         data_params,
                                         chemical_types=chemical_types)
-            single_data_obs.fill_type(train_data.ntypes)
-            single_data_obs.compute_lattice_candidate(rcut, use_neighbor_list_when_possible, mp)
+            prepare_data(single_data_obs)
             train_data_obs.append(single_data_obs)
 
     use_val_data = val_data_path is not None
@@ -264,21 +288,23 @@ def train(
                              labels,
                              data_params,
                              chemical_types=chemical_types)
-        val_data.fill_type(train_data.ntypes)
-        val_data.compute_lattice_candidate(rcut, use_neighbor_list_when_possible, mp)
+        prepare_data(val_data)
     else:
         val_data = None
 
     # for dplr, convert dataset to short-range
     if model_type == 'dplr':
 
-        if type(dplr_wannier_model_path) is not str:
+        if init_model_path is not None:
+            dplr_q_atoms, dplr_q_wc = params['dplr_q_atoms'], params['dplr_q_wc']
+            dplr_beta, dplr_resolution = params['dplr_beta'], params['dplr_resolution']
+        elif type(dplr_wannier_model_path) is not str:
             raise ValueError('Must properly provide dplr_wannier_model_path (path to your trained Wannier model) for model_type "dplr".')
         if type(dplr_q_atoms) is not list:
             raise ValueError('Must properly provide dplr_q_atoms for model_type "dplr".')
         if type(dplr_q_wc) is not list:
             raise ValueError('Must properly provide dplr_q_wc for model_type "dplr".')
-        wc_model, wc_variables = load_model(dplr_wannier_model_path, replicate=False)
+        wc_model, wc_variables = params['dplr_wannier_model_and_variables'] if init_model_path is not None else load_model(dplr_wannier_model_path, replicate=False)
         if len(dplr_q_wc) != len(wc_model.params['nsel']):
             raise ValueError('dplr_q_wc must correspond to atomic_sel of the Wannier model.')
         subsets = train_data.get_flattened_data()
@@ -297,49 +323,53 @@ def train(
                                     use_neighbor_list_when_possible=use_neighbor_list_when_possible)
         print(' Done. Time: %d s' % (time.time() - tic_sr))
 
-    atomic_stats = get_atomic_stats(train_data, atomic_sel) if 'atomic' in model_type else None
+    if init_model_path is None:
+        atomic_stats = get_atomic_stats(train_data, atomic_sel) if 'atomic' in model_type else None
 
-    # construct model
-    params = {
-        'type': model_type,
-        'atomic_data_prefix': atomic_data_prefix if 'atomic' in model_type else None,
-        'embed_widths': embed_widths[:-1] if mp else embed_widths,
-        'embedMP_widths': embed_widths[-1:] + embed_mp_widths if mp else None,
-        'fit_widths': fit_widths,
-        'axis': axis_neurons,
-        'Ebias': atomic_stats[0] if model_type == 'atomic_scalar' else (None if 'atomic' in model_type else train_data.fit_energy()),
-        'rcut': rcut,
-        'use_2nd': True,
-        'use_mp': mp,
-        'atomic': 'atomic' in model_type,
-        'hybrid': hybrid,
-        'nsel': atomic_sel if 'atomic' in model_type else None,
-        'out_norm': atomic_stats[1] if 'atomic' in model_type else 1.,
-        **train_data.get_stats(rcut, getstat_bs),
-    }
-    if model_type == 'dplr':
-        dplr_params = {
-            'dplr_wannier_model_and_variables': (wc_model, wc_variables),
-            'dplr_q_atoms': dplr_q_atoms,
-            'dplr_q_wc': dplr_q_wc,
-            'dplr_beta': dplr_beta,
-            'dplr_resolution': dplr_resolution,
+        # construct model
+        params = {
+            'type': model_type,
+            'atomic_data_prefix': atomic_data_prefix if 'atomic' in model_type else None,
+            'embed_widths': embed_widths[:-1] if mp else embed_widths,
+            'embedMP_widths': embed_widths[-1:] + embed_mp_widths if mp else None,
+            'fit_widths': fit_widths,
+            'axis': axis_neurons,
+            'Ebias': atomic_stats[0] if model_type == 'atomic_scalar' else (None if 'atomic' in model_type else train_data.fit_energy()),
+            'rcut': rcut,
+            'use_2nd': True,
+            'use_mp': mp,
+            'atomic': 'atomic' in model_type,
+            'hybrid': hybrid,
+            'nsel': atomic_sel if 'atomic' in model_type else None,
+            'out_norm': atomic_stats[1] if 'atomic' in model_type else 1.,
+            **train_data.get_stats(rcut, getstat_bs),
         }
-        params.update(dplr_params)
-    model = DPModel(params)
-    print('# Model params:', {k:v for k,v in model.params.items() if k != 'dplr_wannier_model_and_variables'})
+        if model_type == 'dplr':
+            params.update({
+                'dplr_wannier_model_and_variables': (wc_model, wc_variables),
+                'dplr_q_atoms': dplr_q_atoms,
+                'dplr_q_wc': dplr_q_wc,
+                'dplr_beta': dplr_beta,
+                'dplr_resolution': dplr_resolution,
+            })
+        model = DPModel(params)
 
-    # initialize model variables
-    batch, type_idx, lattice_args = train_data.get_batch(1)
-    static_args = _get_static_args(type_idx, lattice_args)
-    if seed is None:
-        seed = np.random.randint(65536)
-    variables = jax.jit(model.init, static_argnums=3)(
-                    jax.random.PRNGKey(seed),
-                    batch['coord'][0],
-                    batch['box'][0],
-                    static_args,
-                )
+        # initialize model variables
+        batch, type_idx, lattice_args = train_data.get_batch(1)
+        static_args = _get_static_args(type_idx, lattice_args)
+        if seed is None:
+            seed = np.random.randint(65536)
+        variables = jax.jit(model.init, static_argnums=3)(
+                        jax.random.PRNGKey(seed),
+                        batch['coord'][0],
+                        batch['box'][0],
+                        static_args,
+                    )
+    else:
+        model = DPModel(dict(params, is_compressed=False, hybrid=hybrid, atomic_data_prefix=atomic_data_prefix))
+        variables = {'params': variables['params']}
+        print('# Training %s.' % ('fitting networks only' if fitting_only else 'all network parameters'))
+    print('# Model params:', {k:v for k,v in model.params.items() if k != 'dplr_wannier_model_and_variables'})
     print('# Model initialized with parameter count %d.' %
            sum(i.size for i in jax.tree_util.tree_flatten(variables)[0]))
     
@@ -357,6 +387,9 @@ def train(
                     )
     optimizer = optax.adam(learning_rate = lr_scheduler,
                            b2 = beta2)
+    if fitting_only:
+        labels = jax.tree_util.tree_map_with_path(lambda path, _: 'fit' if path[1].key.startswith('fitting_net_') else 'freeze', variables)
+        optimizer = optax.multi_transform({'fit': optimizer, 'freeze': optax.set_to_zero()}, labels)
     opt_state = optimizer.init(variables)
 
     # define training step

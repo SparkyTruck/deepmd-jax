@@ -21,6 +21,7 @@ from .routine import *
 from .routine import _parse_couple_axes
 from . import pimd as _pimd
 from functools import partial
+from concurrent.futures import ThreadPoolExecutor
 
 MASS_UNIT_CONVERSION = 1.036427e2 # from Dalton to eV * fs^2 / Å^2
 TEMP_UNIT_CONVERSION = 8.617333e-5 # from Kelvin to eV
@@ -766,6 +767,12 @@ class Simulation:
         velocity = self._state.velocity - (self._state.velocity * mobile_mass).sum(0) / mobile_mass.sum()
         self.setVelocity(velocity)
         
+    def _trajectory_frame(self, state, box):
+        frame = dict(position=state.position, velocity=state.velocity, box=box)
+        if self._is_pimd:
+            frame['centroid'] = _pimd.centroid(state.position, box)
+        return frame
+
     def _get_inner_step(self):
         '''
             Returns a jitted function that performs multiple simulation steps.
@@ -795,10 +802,7 @@ class Simulation:
                 velocity = state.velocity - (state.velocity * mobile_mass).sum(0) / mobile_mass.sum()
                 state = state.set(momentum=state.mass * velocity)
             box_now = state.box if "NPT" in self._routine else self._initial_box
-            # Under PIMD, emit the centroid with a minimum-image reduction.
-            centroid_frame = _pimd.centroid(state.position, box_now) if self._is_pimd else state.position
-            return ((state, typed_nbrs, error_code, profile),
-                    (state.position, state.velocity, box_now, centroid_frame))
+            return (state, typed_nbrs, error_code, profile), self._trajectory_frame(state, box_now)
 
         @partial(jax.jit, static_argnums=(1,))
         def multiple_inner_step(states, length):
@@ -827,10 +831,7 @@ class Simulation:
             dump_prefix=dump_prefix, dump_content=dump_content,
             dump_mode=dump_mode)
         self._has_dumps = len(self._dumps) > 0
-        self._dump_kinds = {entry[0] for entry in self._dumps}
-        self._writes_position = 'position' in self._dump_kinds
-        self._writes_velocity = 'velocity' in self._dump_kinds
-        self._writes_centroid = 'centroid' in self._dump_kinds
+        self._dump_kinds = {entry[0] for entry in self._dumps} | {'box'}
 
         run_message = f'# Running {steps} steps'
         if self._has_dumps:
@@ -839,21 +840,15 @@ class Simulation:
         traj_length = steps + int(self._is_initial_state)
         self._offset = self.step - int(self._is_initial_state)
         traj_dtype = np.float64 if jax.config.read('jax_enable_x64') else np.float32
+        frame = self._trajectory_frame(self._state, self._current_box)
         if not self._has_dumps:
             # preallocate space for trajectory
-            frame_shape = ((self._n_bead, self._natoms, 3) if self._is_pimd
-                           else (self._natoms, 3))
-            centroid_shape = (self._natoms, 3)
             natoms_eff = self._n_bead * self._natoms
             try:
                 safe_buffer = np.zeros((traj_length, 5*natoms_eff, 3), dtype=traj_dtype)
                 del safe_buffer
                 gc.collect()
-                self._position_trajectory = np.zeros((traj_length,) + frame_shape, dtype=traj_dtype)
-                self._velocity_trajectory = np.zeros((traj_length,) + frame_shape, dtype=traj_dtype)
-                self._box_trajectory = np.zeros((traj_length,) + self._current_box.shape, dtype=traj_dtype)
-                if self._is_pimd:
-                    self._centroid_trajectory = np.zeros((traj_length,) + centroid_shape, dtype=traj_dtype)
+                self._trajectory = {k: np.zeros((traj_length,) + f.shape, dtype=traj_dtype) for k,f in frame.items()}
             except MemoryError:
                 raise MemoryError("Trajectory too large to fit in CPU RAM. Please pass dump_prefix=... to stream to disk, or split into multiple shorter runs.")
             try:
@@ -861,58 +856,53 @@ class Simulation:
             except MemoryError:
                 print("# Warning: A long trajectory may exhaust CPU RAM. Consider dump_prefix=... to stream to disk.")
             if self._is_initial_state:
-                self._position_trajectory[0] = self.getPosition()
-                self._velocity_trajectory[0] = self.getVelocity()
-                self._box_trajectory[0] = self.getBox()
-                if self._is_pimd:
-                    self._centroid_trajectory[0] = self.getCentroidPosition()
-        else:
-            if self._is_initial_state and (self.step % self._write_interval == 0):
-                write_dump_frame(self._dumps,
-                                 self.getPosition() if self._writes_position else None,
-                                 self.getVelocity() if self._writes_velocity else None,
-                                 self.getCentroidPosition() if self._writes_centroid else None,
-                                 self._current_box, step=self.step)
+                for k,f in frame.items(): self._trajectory[k][0] = f
+        elif self._is_initial_state and self.step % self._write_interval == 0:
+            write_dump_frame(self._dumps, frame, step=self.step)
         self._tic_of_this_run = time()
         self._tic_between_report = time()
         self._error_code = 0
         self._print_report()
         self._is_initial_state = False
 
-    def _record_pending(self):
+    def _write_dump_chunk(self, idx_l, idx_r, frames):
+        for i, frame_step in enumerate(range(idx_l+1, idx_r+1, self._write_interval)):
+            write_dump_frame(self._dumps, {k:f[i] for k,f in frames.items()}, step=frame_step)
+
+    def _finish_dump(self):
+        if self._dump_future is not None:
+            future, self._dump_future = self._dump_future, None
+            try:
+                future.result()
+            except BaseException:
+                self._pending_trajectory = None
+                raise
+
+    def _record_pending(self, wait=False):
         '''Record the preceding accepted chunk; failed appends must not replay.'''
         if self._pending_trajectory is not None:
+            self._finish_dump()
             idx_l, idx_r, frames = self._pending_trajectory
             if self._has_dumps:
                 self._pending_trajectory = None # An append must not be replayed if writing raises.
-                frames = [np.asarray(f) if f is not None else None for f in frames]
-                for i, frame_step in enumerate(range(idx_l+1, idx_r+1, self._write_interval)):
-                    write_dump_frame(self._dumps,
-                        frames[0][i] if self._writes_position else None,
-                        frames[1][i] if self._writes_velocity else None,
-                        frames[3][i] if self._writes_centroid else None,
-                        frames[2][i], step=frame_step)
+                frames = {k:np.asarray(f) for k,f in frames.items()}
+                self._dump_future = self._dump_executor.submit(self._write_dump_chunk, idx_l, idx_r, frames)
             else:
-                self._position_trajectory[idx_l:idx_r] = frames[0]
-                self._velocity_trajectory[idx_l:idx_r] = frames[1]
-                self._box_trajectory[idx_l:idx_r] = frames[2]
-                if self._is_pimd:
-                    self._centroid_trajectory[idx_l:idx_r] = frames[3]
+                for k,f in frames.items(): self._trajectory[k][idx_l:idx_r] = f
                 self._pending_trajectory = None
+        if wait: self._finish_dump()
 
     def _queue_trajectory(self, traj, next_chunk):
         '''Select and prefetch accepted frames before dispatching the next chunk.'''
         if self._has_dumps:
             first = (-self.step-1) % self._write_interval
             if first < next_chunk:
-                frames = [f[first::self._write_interval] if use else None for f,use in zip(traj,
-                          (self._writes_position, self._writes_velocity, True, self._writes_centroid))]
-                for f in frames:
-                    if f is not None: f.copy_to_host_async()
+                frames = {k:f[first::self._write_interval] for k,f in traj.items() if k in self._dump_kinds}
+                for f in frames.values(): f.copy_to_host_async()
                 self._pending_trajectory = (self.step+first, self.step+next_chunk, frames)
         else:
             idx_l, idx_r = self.step - self._offset, self.step - self._offset + next_chunk
-            self._pending_trajectory = (idx_l, idx_r, traj if self._is_pimd else traj[:3])
+            self._pending_trajectory = (idx_l, idx_r, traj)
 
     def run(self, steps,
             dump_interval: Optional[int] = None,
@@ -935,6 +925,8 @@ class Simulation:
                              dump_mode=dump_mode)
 
         self._pending_trajectory = None
+        self._dump_future = None
+        self._dump_executor = ThreadPoolExecutor(max_workers=1) if self._has_dumps else None
         remaining_steps = steps
         try:
             while remaining_steps > 0:
@@ -975,27 +967,21 @@ class Simulation:
 
                 # Report at preset regular intervals
                 if self.step % self.report_interval == 0 or remaining_steps == 0:
-                    if self._has_dumps: self._record_pending()
+                    if self._has_dumps: self._record_pending(wait=True)
                     self._keep_nbr_or_lattice_up_to_date()
                     self._print_report()
         finally:
             try:
-                self._record_pending()
+                self._record_pending(wait=True)
             finally:
                 self._pending_trajectory = None
+                if self._dump_executor is not None: self._dump_executor.shutdown(wait=True)
 
         self._print_run_profile(steps, time() - self._tic_of_this_run)
         self._keep_nbr_or_lattice_up_to_date()
         if self._has_dumps:
             return None
-        trajectory = {
-            'position': self._position_trajectory,
-            'velocity': self._velocity_trajectory,
-            'box': self._box_trajectory,
-        }
-        if self._is_pimd:
-            trajectory['centroid'] = self._centroid_trajectory
-        return trajectory
+        return self._trajectory
 
     def _print_run_profile(self, steps, elapsed_time):
         print_run_profile(steps, elapsed_time, self._natoms * self._n_bead, self._dt)

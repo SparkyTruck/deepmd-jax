@@ -13,6 +13,7 @@ setup(
         'optax',
         'jax-md',
         'ase',
+        'joblib>=1.3',
         'matplotlib',
         'gpustat',
         'ipykernel',

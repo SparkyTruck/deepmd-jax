@@ -20,7 +20,7 @@ DeepMD-jax is separate from [DeepMD-kit](https://github.com/deepmodeling/deepmd-
 - **Long-range electrostatics** — [DPLR](https://doi.org/10.1063/5.0083669)-style explicit long-range Coulomb interactions for systems where short-range models are not enough.
 - **Hybrid ab initio + empirical training** — Empirical-observable training ([article](https://arxiv.org/abs/2511.14352)).
 - Built-in **MD and PIMD** engine — end-to-end `NVE`, `NVT`, `NVT_langevin`, and `NPT` workflows, including NVT/NPT path-integral MD, implemented in JAX with inspiration from [jax-md](https://github.com/jax-md/jax-md).
-- **Multi-GPU** simulation support — automatic multi-GPU MD, no manual configuration.
+- **Multi-GPU and distributed** simulation support — automatic multi-GPU MD, no manual configuration.
 
 ## Installation
 ```
@@ -97,6 +97,18 @@ sim = Simulation(
 
 ## More Features and Usages
 
+### Fine-tuning a Model
+
+```python
+train(
+    init_model_path='pretrained_model.pkl',
+    fitting_only=True,  # omit to train all network parameters
+    # ...
+)
+```
+
+Adjust `step`, `lr`, `lr_limit`, and loss prefactors such as `s_pref_e`, `l_pref_e`, `s_pref_f`, and `l_pref_f` for your task.
+
 ### Testing a Model
 
 Use `test()` to evaluate a model on one or more datasets:
@@ -122,10 +134,11 @@ an RMS reduction inside each force or atomic vector; this makes training less
 sensitive to outlier vector components. You can instead pass `loss="l2"` to
 train with the conventional mean-squared loss. Testing reports `l1_mixed`, `rmse` (l2), and `mae` (l1) in `error_metrics`.
 
-### Atom-wise vector prediction (Deep Wannier/Polarizability)
+### Atom-wise quantity prediction (Deep Wannier/Polarizability)
+
 ```python
 train(
-      model_type='atomic',                   # Model type, 'atomic' for 3-vector (Wannier centroid), 'atomic-t2' for 9-vector (polarizability)
+      model_type='atomic',                   # Model type
       rcut=6.0,                              # Cutoff radius
       atomic_sel=[0],                        # indicating Wannier centers are associated to atoms of type 0
       save_path='wannier.pkl',               # Path to save the trained model
@@ -133,9 +146,14 @@ train(
       step=100000,                           # Number of training steps
 )
 ```
-This model predicts an O(3)-equivariant 3-vector or 9-vector (as a flattened symmetric 3x3 matrix) for each atom within the selected type (`atomic_sel`). For `model_type='atomic'`, the argument `atomic_data_prefix` in `train()` is set to `'atomic_dipole'` by default, meaning `"atomic_dipole.npy"` is the expected label filename in your DeepMD-kit format dataset. For `model_type='atomic_t2'`, it defaults to `'atomic_polarizability'`. If you need to specify a different prefix, it needs to be `'atomic_*'`.
 
-For an invariant scalar on each selected atom, use `model_type='atomic_scalar'`. Its label prefix defaults to `atomic_energy` with data shape `(nframes, n_selected_atoms)`.
+| `model_type` | Prediction per<br>selected atom | Default label file | Label shape |
+| --- | --- | --- | --- |
+| `atomic` | O(3)-equivariant<br>3-vector<br>e.g. Wannier centroid | `atomic_dipole.npy` | `(nframes, n_selected_atoms, 3)` |
+| `atomic_t2` | O(3)-equivariant<br>Symmetric 3×3 tensor<br>e.g. polarizability | `atomic_polarizability.npy` | `(nframes, n_selected_atoms, 9)` |
+| `atomic_scalar` | Invariant scalar<br>e.g. atomic energy | `atomic_energy.npy` | `(nframes, n_selected_atoms)` |
+
+Use `atomic_sel` to select atom types and `atomic_data_prefix` to override the `atomic_*` label prefix. Flattened per-frame labels are also accepted.
 
 ### Training a DPLR Model
 ```python

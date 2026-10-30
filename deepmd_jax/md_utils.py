@@ -5,6 +5,7 @@ pull in jax_md. Everything here is internal infrastructure for Simulation.
 """
 import glob
 import os
+from joblib import Parallel, delayed, cpu_count, parallel_config
 from typing import Callable
 
 import jax
@@ -129,14 +130,22 @@ def _write_xyz_frame(path, atoms, data, cell, step=None):
         comment.append(f'step={int(step)}')
     comment.append(f'pbc="{_format_pbc(atoms.get_pbc())}"')
 
+    # Local function: subprocesses must not import DeepMD/JAX to format text.
+    def format_block(symbols_n, data_n3):
+        fields_n4 = np.empty((len(data_n3), 4), dtype=object)
+        fields_n4[:,0], fields_n4[:,1:] = symbols_n, data_n3
+        return (line_fmt * len(fields_n4)) % tuple(fields_n4.ravel())
+    n_jobs = min(8, cpu_count(only_physical_cores=True), max(1, len(data)//32768))
+    blocks = ((symbols[start:start+16384], data[start:start+16384]) for start in range(0, len(data), 16384))
     lines = [f'{len(symbols)}\n', ' '.join(comment) + '\n']
     with open(path, 'a', encoding='utf-8') as handle:
         handle.write(''.join(lines))
-        for start in range(0, len(data), 16384):
-            stop = min(start+16384, len(data))
-            fields_n4 = np.empty((stop-start, 4), dtype=object)
-            fields_n4[:,0], fields_n4[:,1:] = symbols[start:stop], data[start:stop]
-            handle.write((line_fmt * len(fields_n4)) % tuple(fields_n4.ravel()))
+        if n_jobs == 1:
+            handle.writelines(format_block(*block) for block in blocks)
+        else:
+            with parallel_config(backend='loky', inner_max_num_threads=1), Parallel(
+                    n_jobs=n_jobs, return_as='generator', batch_size=1, pre_dispatch=n_jobs, max_nbytes=None) as parallel:
+                handle.writelines(parallel(delayed(format_block)(*block) for block in blocks))
 
 
 def iso_pressure(energy_fn, position, box, n_atoms, kT, **kwargs):
@@ -216,35 +225,27 @@ def prepare_dumps(type_idx, type_symbols, n_bead, default_interval,
         split_beads = is_pimd and kind != 'centroid'
         if dump_mode == 'overwrite' and jax.process_index() == 0:
             _remove_dump_target(path, bead_split=split_beads)
-        if split_beads:
-            for bead in range(n_bead):
-                bead_path = _bead_dump_path(path, bead)
-                atoms = Atoms(symbols=list(symbols_N),
-                              positions=np.zeros((len(symbols_N), 3)),
-                              pbc=True)
-                dumps.append((kind, bead_path, atoms, bead))
-        else:
+        for bead in range(n_bead) if split_beads else (None,):
             atoms = Atoms(symbols=list(symbols_N),
                           positions=np.zeros((len(symbols_N), 3)),
                           pbc=True)
-            dumps.append((kind, path, atoms, None))
+            dumps.append((kind, _bead_dump_path(path, bead) if split_beads else path, atoms, bead))
     return dumps, interval
 
 
-def write_dump_frame(dumps, pos_frame, vel_frame, centroid_frame, box_frame, step=None):
+def write_dump_frame(dumps, frame, step=None):
     '''Append one frame to each dump file.
 
     When provided, ``step`` is written into the XYZ comment/metadata line.
     '''
     if jax.process_index() != 0:
         return
-    if box_frame.shape == (3,):
-        cell = np.concatenate([np.array(box_frame), [90, 90, 90]])
+    if frame['box'].shape == (3,):
+        cell = np.concatenate([np.array(frame['box']), [90, 90, 90]])
     else:
-        cell = np.array(box_frame)
-    sources = {'position': pos_frame, 'velocity': vel_frame, 'centroid': centroid_frame}
+        cell = np.array(frame['box'])
     for kind, path, atoms, bead in dumps:
-        data = sources[kind]
+        data = frame.get(kind)
         if data is None:
             raise ValueError(f"Missing {kind} frame for XYZ dump.")
         data = np.asarray(data)

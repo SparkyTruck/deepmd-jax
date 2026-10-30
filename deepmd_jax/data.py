@@ -116,6 +116,8 @@ class DatasetLeaf:
             self.nsel = [i for i in self.nsel if i in range(self.ntypes)]
         if any(['atomic' in l for l in labels]):
             self.nlabels = sum(self.type_count[self.nsel])
+            if not self.nlabels:
+                raise ValueError('atomic_sel must select at least one atom in every dataset subset.')
         else:
             self.nlabels = self.natoms
         for l in labels:
@@ -396,7 +398,7 @@ class ExtXYZDataset(DatasetGroup):
 def compute_lattice_candidate(boxes, rcut, print_info=True, disable_ortho=False):
     N = 2  # This algorithm is heuristic and subject to change. Increase N in case of missing neighbors.
     ortho = not vmap(lambda box: box - jnp.diag(jnp.diag(box)))(boxes).any()
-    recp_norm = jnp.linalg.norm((jnp.linalg.inv(boxes)), axis=-1)
+    recp_norm = jnp.linalg.norm((jnp.linalg.inv(boxes)), axis=-2)
     n = np.ceil(rcut * recp_norm - 0.5).astype(int).max(0)
     lattice_cand = jnp.stack(
         np.meshgrid(range(-n[0], n[0] + 1), range(-n[1], n[1] + 1), range(-n[2], n[2] + 1), indexing='ij'),
